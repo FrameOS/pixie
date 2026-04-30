@@ -394,6 +394,8 @@ type
 when defined(release):
   {.push checks: off.}
 
+const maxCompositeGlyphRecursion = 64
+
 template eofCheck(buf: string, readTo: int) =
   if readTo > buf.len:
     raise newException(PixieError, "Unexpected error reading font data, EOF")
@@ -2180,7 +2182,7 @@ proc hasGlyph*(opentype: OpenType, rune: Rune): bool =
   rune in opentype.cmap.runeToGlyphId
 
 proc parseGlyfGlyph(
-  opentype: OpenType, glyphId: uint16
+  opentype: OpenType, glyphId: uint16, recursionDepth = 0
 ): Path {.raises: [PixieError], gcsafe.}
 
 proc parseGlyphPath(
@@ -2318,7 +2320,9 @@ proc parseGlyphPath(
 
     result.closePath()
 
-proc parseCompositeGlyph(opentype: OpenType, offset: int): Path =
+proc parseCompositeGlyph(
+  opentype: OpenType, offset, recursionDepth: int
+): Path =
   result = newPath()
 
   var
@@ -2402,7 +2406,10 @@ proc parseCompositeGlyph(opentype: OpenType, offset: int): Path =
     # elif (flags and 0b1000000000000) != 0: # UNSCALED_COMPONENT_OFFSET
     #   discard
 
-    var subPath = opentype.parseGlyfGlyph(component.glyphId)
+    var subPath = opentype.parseGlyfGlyph(
+      component.glyphId,
+      recursionDepth + 1
+    )
     subPath.transform(mat3(
       component.xScale, component.scale10, 0.0,
       component.scale01, component.yScale, 0.0,
@@ -2413,7 +2420,11 @@ proc parseCompositeGlyph(opentype: OpenType, offset: int): Path =
 
     moreComponents = (flags and 0b100000) != 0
 
-proc parseGlyfGlyph(opentype: OpenType, glyphId: uint16): Path =
+proc parseGlyfGlyph(
+  opentype: OpenType, glyphId: uint16, recursionDepth: int
+): Path =
+  if recursionDepth > maxCompositeGlyphRecursion:
+    raise newException(PixieError, "Invalid composite glyph recursion")
 
   if glyphId.int >= opentype.glyf.offsets.len:
     raise newException(PixieError, "Invalid glyph ID " & $glyphId)
@@ -2434,7 +2445,7 @@ proc parseGlyfGlyph(opentype: OpenType, glyphId: uint16): Path =
   i += 10
 
   if numberOfContours < 0:
-    opentype.parseCompositeGlyph(i)
+    opentype.parseCompositeGlyph(i, recursionDepth)
   else:
     parseGlyphPath(opentype.buf, i, numberOfContours)
 

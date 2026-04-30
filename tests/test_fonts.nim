@@ -1,4 +1,4 @@
-import os, pixie, strformat, unicode, xrays
+import os, pixie, pixie/fontformats/opentype, strformat, tables, unicode, xrays
 
 proc wh(image: Image): Vec2 =
   ## Return with and height as a size vector.
@@ -1047,6 +1047,52 @@ block:
 block:
   var typeface = readTypeface("tests/fonts/Roboto-Regular_1.ttf")
   doAssert typeface.getKerningAdjustment('T'.Rune, 'e'.Rune) == -99.0
+
+block:
+  proc writeBe16(data: var string, offset, value: int) =
+    data[offset] = char((value shr 8) and 0xff)
+    data[offset + 1] = char(value and 0xff)
+
+  let originalData = readFile("tests/fonts/Roboto-Regular_1.ttf")
+  let original = parseOpenType(originalData)
+
+  var
+    targetRune: Rune
+    targetGlyphId = -1
+    glyphOffset = -1
+
+  for rune, glyphId in original.cmap.runeToGlyphId.pairs:
+    let glyphIndex = glyphId.int
+    if glyphIndex == 0 or glyphIndex + 1 >= original.glyf.offsets.len:
+      continue
+
+    let
+      startOffset = original.glyf.offsets[glyphIndex].int
+      endOffset = original.glyf.offsets[glyphIndex + 1].int
+      glyphLen = endOffset - startOffset
+
+    if glyphLen >= 16:
+      targetRune = rune
+      targetGlyphId = glyphIndex
+      glyphOffset = startOffset
+      break
+
+  doAssert targetGlyphId >= 0
+
+  var mutated = originalData
+  writeBe16(mutated, glyphOffset + 0, 0xffff) # Composite glyph.
+  writeBe16(mutated, glyphOffset + 2, 0)
+  writeBe16(mutated, glyphOffset + 4, 0)
+  writeBe16(mutated, glyphOffset + 6, 0)
+  writeBe16(mutated, glyphOffset + 8, 0)
+  writeBe16(mutated, glyphOffset + 10, 0x0002) # ARGS_ARE_XY_VALUES.
+  writeBe16(mutated, glyphOffset + 12, targetGlyphId)
+  mutated[glyphOffset + 14] = '\0'
+  mutated[glyphOffset + 15] = '\0'
+
+  let font = parseOpenType(mutated)
+  doAssertRaises PixieError:
+    discard font.getGlyphPath(targetRune)
 
 block:
   var font = readFont("tests/fonts/Inter-Regular.ttf")
