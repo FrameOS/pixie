@@ -234,7 +234,7 @@ proc decodeTiff*(data: string): Tiff =
       failInvalid()
     for i in 0 ..< result.data.len:
       let colorMapIndex = decompressed[i].int
-      if colorMapIndex > colorMap.len:
+      if colorMapIndex >= colorMap.len:
         failInvalid()
       result.data[i] = colorMap[colorMapIndex]
 
