@@ -1,10 +1,11 @@
-import bumpy, chroma, flatty/binny, os, pixie/common, pixie/contexts,
-    pixie/fileformats/bmp, pixie/fileformats/gif, pixie/fileformats/jpeg,
-    pixie/fileformats/png, pixie/fileformats/ppm, pixie/fileformats/qoi,
-    pixie/fileformats/svg, pixie/fonts, pixie/images, pixie/internal,
-    pixie/paints, pixie/paths, strutils, vmath
+import
+  std/[os, strutils],
+  bumpy, chroma, flatty/binny, vmath,
+  pixie/[common, contexts, fonts, imagebase64, images, internal, paints, paths],
+  pixie/fileformats/[bmp, gif, jpeg, png, ppm, qoi, svg]
 
-export bumpy, chroma, common, contexts, fonts, images, paints, paths, vmath
+export bumpy, chroma, common, contexts, fonts, imagebase64, images, paints,
+    paths, vmath
 
 type
   FileFormat* = enum
@@ -85,7 +86,9 @@ proc readImage*(filePath: string): Image {.inline, raises: [PixieError].} =
   except IOError as e:
     raise newException(PixieError, e.msg, e)
 
-proc encodeImage*(image: Image, fileFormat: FileFormat): string {.raises: [PixieError].} =
+proc encodeImage*(
+  image: Image, fileFormat: FileFormat
+): string {.raises: [PixieError].} =
   ## Encodes an image into memory.
   case fileFormat:
   of PngFormat:

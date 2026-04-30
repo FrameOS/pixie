@@ -112,6 +112,7 @@ exportRefObject Image:
     newImage(int, int)
   procs:
     writeFile(Image, string)
+    encodeBase64
     copy(Image)
     getColor
     setColor
@@ -291,6 +292,7 @@ exportRefObject Context:
     isPointInStroke(Context, Path, float32, float32)
 
 exportProcs:
+  decodeBase64
   decodeImage
   decodeImageDimensions
   readImage

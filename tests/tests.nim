@@ -1,4 +1,5 @@
 import
+  test_base64,
   test_bmp,
   test_contexts,
   test_fonts,
