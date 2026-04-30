@@ -16,12 +16,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: treeform/setup-nim-action@v6
       - name: Install dependencies
+        shell: bash
         run: |
-          nimby install -g bumpy
-          nimby install -g chroma
-          nimby install -g crunchy
-          nimby install -g flatty
-          nimby install -g nimsimd
-          nimby install -g vmath
-          nimby install -g zippy
+          cd ..
+          nimby install -g pixie/pixie.nimble
       - run: nim r tests/tests.nim
