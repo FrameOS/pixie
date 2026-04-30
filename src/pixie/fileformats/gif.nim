@@ -41,7 +41,7 @@ proc decodeGif*(data: string): Gif {.raises: [PixieError].} =
     bgColorIndex = data.readUint8(11).int
     pixelAspectRatio = data.readUint8(12)
 
-  if bgColorIndex > globalColorTableSize:
+  if bgColorIndex >= globalColorTableSize:
     failInvalid()
 
   if pixelAspectRatio != 0:
