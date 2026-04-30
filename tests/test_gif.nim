@@ -35,3 +35,20 @@ block:
     decodeGif(readFile("tests/fileformats/gif/newtons_cradle.gif"))
   doAssert animatedGif.frames.len == 36
   doAssert animatedGif.intervals.len == animatedGif.frames.len
+
+block:
+  proc addLe16(data: var string, value: int) =
+    data.add(char(value and 0xff))
+    data.add(char((value shr 8) and 0xff))
+
+  var payload = "GIF89a"
+  payload.addLe16(1)
+  payload.addLe16(1)
+  payload.add(char(0x80)) # Global color table present, size = 2 entries.
+  payload.add(char(0x02)) # One past the last valid color table index.
+  payload.add(char(0x00))
+  payload.add("\x00\x00\x00\xff\xff\xff")
+  payload.add(char(0x3b))
+
+  doAssertRaises PixieError:
+    discard decodeGif(payload)
