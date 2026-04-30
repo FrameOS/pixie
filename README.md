@@ -2,19 +2,27 @@
 
 👏 👏 👏 Check out video about the library: [A full-featured 2D graphics library for Nim (NimConf 2021)](https://www.youtube.com/watch?v=8acDfUIwLnk) 👏 👏 👏
 
-# Pixie - A full-featured 2D graphics library for Nim
+# Pixie - A full-featured 2D graphics library for Nim.
 
 Pixie is a 2D graphics library similar to [Cairo](https://www.cairographics.org/) and [Skia](https://skia.org) written entirely in Nim.
 
 This library is being actively developed and we'd be happy for you to use it.
 
-`nimble install pixie`
+`nimby install pixie`
 
 ![Github Actions](https://github.com/treeform/pixie/workflows/Github%20Actions/badge.svg)
+![GitHub release (latest by date)](https://img.shields.io/github/v/release/treeform/pixie)
+![GitHub Repo stars](https://img.shields.io/github/stars/treeform/pixie)
+![GitHub](https://img.shields.io/github/license/treeform/pixie)
+![GitHub issues](https://img.shields.io/github/issues/treeform/pixie)
 
 [API reference](https://treeform.github.io/pixie)
 
 [Pixie Book](https://github.com/treeform/pixiebook)
+
+## About
+
+Pixie includes CPU rasterization, image codecs, text layout, paths, paints, masking, blending, and SIMD-accelerated operations.
 
 ### Videos
 
@@ -111,7 +119,7 @@ To learn how to use Pixie for realtime graphics with GPU, check out [Boxy](https
 
 ## Testing
 
-`nimble test`
+`nim r tests/tests.nim`
 
 ## Examples
 

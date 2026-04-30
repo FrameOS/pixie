@@ -5,14 +5,14 @@ license     = "MIT"
 
 srcDir = "src"
 
-requires "nim >= 1.4.8"
+requires "nim >= 2.0.0"
 requires "vmath >= 3.0.0"
-requires "chroma >= 0.2.6"
-requires "zippy >= 0.10.3"
+requires "chroma >= 1.0.0"
+requires "zippy >= 0.10.16"
 requires "flatty >= 0.3.4"
-requires "nimsimd >= 1.2.4"
+requires "nimsimd >= 1.3.2"
 requires "bumpy >= 1.1.3"
-requires "crunchy >= 0.1.0"
+requires "crunchy >= 0.1.11"
 
 task bindings, "Generate bindings":
 
