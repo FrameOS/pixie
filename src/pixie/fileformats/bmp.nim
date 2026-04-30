@@ -77,8 +77,8 @@ proc decodeDib*(
   if colorPaletteSize < 0 or colorPaletteSize > 256:
     failInvalid()
 
-  if bits == 8 and colorPaletteSize == 0:
-    colorPaletteSize = 256
+  if bits in [1, 4, 8] and colorPaletteSize == 0:
+    colorPaletteSize = 1 shl bits
 
   var colorPalette = newSeq[ColorRGBA](colorPaletteSize)
   if colorPaletteSize > 0:
