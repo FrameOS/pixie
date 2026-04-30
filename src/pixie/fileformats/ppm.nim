@@ -53,15 +53,20 @@ proc decodeHeader(
 
     result.dataOffset = i
 
-proc decodeP6Data(data: string, maxVal: int): seq[ColorRGBX] {.raises: [].} =
+proc decodeP6Data(
+  data: string, maxVal: int
+): seq[ColorRGBX] {.raises: [PixieError].} =
   let needsUint16 = maxVal > 0xFF
-
-  result = newSeq[ColorRGBX](
+  let bytesPerPixel =
     if needsUint16:
-      data.len div 6
+      6
     else:
-      data.len div 3
-  )
+      3
+
+  if data.len mod bytesPerPixel != 0:
+    failInvalid()
+
+  result = newSeq[ColorRGBX](data.len div bytesPerPixel)
 
   # Let's calculate the real maximum value multiplier.
   # rgbx() accepts a maximum value of 255. Most of the time,
@@ -129,15 +134,18 @@ proc decodePpm*(data: string): Image {.raises: [PixieError].} =
   if not (header.version in ppmSignatures):
     failInvalid()
 
-  if 0 > header.maxVal or header.maxVal > 0xFFFF:
+  if header.maxVal <= 0 or header.maxVal > 0xFFFF:
     failInvalid()
 
   result = newImage(header.width, header.height)
-  result.data =
+  let pixels =
     if header.version == "P3":
       decodeP3Data(data[header.dataOffset .. ^1], header.maxVal)
     else:
       decodeP6Data(data[header.dataOffset .. ^1], header.maxVal)
+  if pixels.len != result.data.len:
+    failInvalid()
+  result.data = pixels
 
 proc decodePpmDimensions*(
   data: pointer, len: int

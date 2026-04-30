@@ -1,4 +1,4 @@
-import pixie/fileformats/ppm
+import pixie, pixie/fileformats/ppm
 
 block:
   for format in @["p3", "p6"]:
@@ -23,3 +23,9 @@ block:
   let p6Master = readFile("tests/fileformats/ppm/feep.p6.master.ppm")
   for image in @["p3", "p6", "p3.hidepth"]:
     doAssert readFile("tests/fileformats/ppm/feep." & $image & ".ppm") == p6Master
+
+block:
+  let payload = "P6\n10 10\n255\n" & "\x12\x34\x56"
+
+  doAssertRaises PixieError:
+    discard decodeImage(payload)
