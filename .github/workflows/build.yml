@@ -1,22 +1,23 @@
 name: Github Actions
-on: [push, pull_request]
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        nim-version: ['1.4.x', 'stable']
-
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-
     steps:
-    - uses: actions/checkout@v3
-    - uses: jiro4989/setup-nim-action@v2
-      with:
-        nim-version: ${{ matrix.nim-version }}
-        repo-token: ${{ secrets.GITHUB_TOKEN }}
-    - run: nimble test --gc:arc -d:release -y
-    - run: nimble test --gc:arc -d:release -d:pixieNoSimd -y
-    - run: nimble test --gc:orc -d:release -y
-    - run: nim cpp --gc:orc -d:release -r tests/all.nim
+      - uses: actions/checkout@v5
+      - uses: treeform/setup-nim-action@v6
+      - name: Install dependencies
+        shell: bash
+        run: |
+          cd ..
+          nimby install -g pixie/pixie.nimble
+      - run: nim r tests/tests.nim
