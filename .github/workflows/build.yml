@@ -15,5 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: treeform/setup-nim-action@v6
-      - run: nimby install -g
+      - name: Install dependencies
+        run: |
+          nimby install -g bumpy
+          nimby install -g chroma
+          nimby install -g crunchy
+          nimby install -g flatty
+          nimby install -g nimsimd
+          nimby install -g vmath
+          nimby install -g zippy
       - run: nim r tests/tests.nim
