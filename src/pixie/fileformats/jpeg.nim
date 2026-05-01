@@ -1,5 +1,5 @@
-import chroma, flatty/binny, ../common, ../images, ../internal,
-    ../simd, std/decls, std/sequtils, std/strutils
+import chroma, flatty/binny, ../common, ../images, ../simd, std/decls,
+  std/sequtils, std/strutils
 
 # This JPEG decoder is loosely based on stb_image which is public domain.
 
@@ -38,6 +38,8 @@ const
     0.uint32, 1, 3, 7, 15, 31, 63, 127, 255, 511,
     1023, 2047, 4095, 8191, 16383, 32767, 65535
   ]
+  maxMarkerResync = 64
+  maxRestartResync = 8192
 
 let
   jpegStartOfImage* = [0xFF.uint8, 0xD8]
@@ -69,6 +71,7 @@ type
     bitsBuffered: int
     bitBuffer: uint32
     foundSOF: bool
+    foundSOS: bool
     imageHeight, imageWidth: int
     progressive: bool
     quantizationTables: array[4, array[64, uint8]]
@@ -176,8 +179,46 @@ proc readStr(state: var DecoderState, n: int): string =
 proc skipBytes(state: var DecoderState, n: int) =
   ## Skips a number of bytes.
   if state.pos + n > state.len:
+    if state.foundSOS:
+      state.pos = state.len
+      return
     failInvalid()
   state.pos += n
+
+proc readMarker(state: var DecoderState): uint8 =
+  ## Reads a JPEG marker, resyncing past junk between marker segments.
+  var skipped: int
+  while true:
+    if state.pos >= state.len:
+      failInvalid("missing marker")
+
+    let marker = state.readUint8()
+    if marker != 0xFF:
+      if state.progressive and not state.foundSOS and marker == 0xDA:
+        return 0xDA
+      inc skipped
+      if skipped > maxMarkerResync:
+        if state.foundSOS:
+          return 0xD9
+        failInvalid("invalid chunk marker")
+      continue
+
+    while state.pos < state.len and state.buffer[state.pos] == 0xFF:
+      inc state.pos
+
+    if state.pos >= state.len:
+      failInvalid("missing marker id")
+
+    result = state.readUint8()
+    if result == 0:
+      inc skipped
+      if skipped > maxMarkerResync:
+        if state.foundSOS:
+          return 0xD9
+        failInvalid("invalid chunk marker")
+      continue
+
+    return
 
 proc skipChunk(state: var DecoderState) =
   ## Skips current chunk.
@@ -186,27 +227,51 @@ proc skipChunk(state: var DecoderState) =
 
 proc decodeDRI(state: var DecoderState) =
   ## Decode Define Restart Interval
-  let len = state.readUint16be() - 2
-  if len != 2:
-    failInvalid("invalid DRI length")
+  let len = state.readUint16be().int - 2
+  if len < 2:
+    state.skipBytes(len.int)
+    state.restartInterval = 0
+    return
   state.restartInterval = state.readUint16be().int
+  if len > 2:
+    state.skipBytes(len.int - 2)
 
 proc decodeDQT(state: var DecoderState) =
   ## Decode Define Quantization Table(s)
-  var len = state.readUint16be() - 2
+  var len = state.readUint16be().int - 2
+  let chunkEnd = state.pos + len
+  if chunkEnd > state.len and state.foundSOS:
+    state.pos = state.len
+    return
   while len > 0:
     let
       info = state.readUint8()
       tableId = info and 15
       precision = info shr 4
-    if precision != 0:
-      failInvalid("unsupported quantization table precision")
     if tableId > 3:
+      if state.foundSOS:
+        state.pos = min(chunkEnd, state.len)
+        return
       failInvalid()
-    for i in 0 ..< 64:
-      state.quantizationTables[tableId][deZigZag[i]] = state.readUint8()
-    len -= 65
+    case precision:
+    of 0:
+      for i in 0 ..< 64:
+        state.quantizationTables[tableId][deZigZag[i]] = state.readUint8()
+      len -= 65
+    of 1:
+      for i in 0 ..< 64:
+        let value = state.readUint16be().int
+        state.quantizationTables[tableId][deZigZag[i]] = min(value, 255).uint8
+      len -= 129
+    else:
+      if state.foundSOS:
+        state.pos = min(chunkEnd, state.len)
+        return
+      failInvalid("unsupported quantization table precision")
   if len != 0:
+    if state.foundSOS:
+      state.pos = min(chunkEnd, state.len)
+      return
     failInvalid("DQT table length did not match")
 
 proc buildHuffman(huffman: var Huffman, counts: array[16, uint8]) =
@@ -249,7 +314,11 @@ proc buildHuffman(huffman: var Huffman, counts: array[16, uint8]) =
 
 proc decodeDHT(state: var DecoderState) =
   ## Decode Define Huffman Table
-  var len = state.readUint16be() - 2
+  var len = state.readUint16be().int - 2
+  let chunkEnd = state.pos + len
+  if chunkEnd > state.len and state.foundSOS:
+    state.pos = state.len
+    return
   while len > 0:
     let
       info = state.readUint8()
@@ -257,26 +326,34 @@ proc decodeDHT(state: var DecoderState) =
       tableCurrent = info shr 4 # DC or AC
 
     if tableCurrent > 1 or tableId > 3:
+      if state.foundSOS:
+        state.pos = min(chunkEnd, state.len)
+        return
       failInvalid()
 
     var
       counts: array[16, uint8]
-      numSymbols: uint8
+      numSymbols: int
     for i in 0 ..< 16:
       counts[i] = state.readUint8()
-      numSymbols += counts[i]
+      numSymbols += counts[i].int
+    if numSymbols > 256:
+      failInvalid()
 
     len -= 17
 
     state.huffmanTables[tableCurrent][tableId] = Huffman()
     state.huffmanTables[tableCurrent][tableId].buildHuffman(counts)
 
-    for i in 0.uint8 ..< numSymbols:
+    for i in 0 ..< numSymbols:
       state.huffmanTables[tableCurrent][tableId].symbols[i] = state.readUint8()
 
     len -= numSymbols
 
   if len != 0:
+    if state.foundSOS:
+      state.pos = min(chunkEnd, state.len)
+      return
     failInvalid()
 
 proc decodeSOF0(state: var DecoderState) =
@@ -377,12 +454,19 @@ proc decodeSOF1(state: var DecoderState) =
 proc decodeSOF2(state: var DecoderState) =
   ## Decode Start of Image (Progressive DCT format)
   # Same as SOF0
-  state.decodeSOF0()
   state.progressive = true
+  state.decodeSOF0()
 
 proc decodeExif(state: var DecoderState) =
   ## Decode Exif header
   var len = state.readUint16be().int - 2
+  let chunkEnd = state.pos + len
+  if chunkEnd > state.len:
+    failInvalid()
+
+  template skipInvalidExif() =
+    state.pos = chunkEnd
+    return
 
   let exifHeader = state.readStr(6)
 
@@ -403,13 +487,13 @@ proc decodeExif(state: var DecoderState) =
       elif tiffHeader == 0x4949:
         true
       else:
-        failInvalid("invalid Tiff header")
+        skipInvalidExif()
 
   len -= 2
 
   # Verify we got the endianess right.
   if state.readUint16be().maybeSwap(littleEndian) != 0x002A.uint16:
-    failInvalid("invalid Tiff header endianess")
+    skipInvalidExif()
 
   len -= 2
 
@@ -419,23 +503,28 @@ proc decodeExif(state: var DecoderState) =
   len -= 4
 
   if offsetToFirstIFD < 8:
-    failInvalid("invalid Tiff offset")
+    skipInvalidExif()
+  if state.pos + offsetToFirstIFD - 8 > chunkEnd:
+    skipInvalidExif()
 
   state.skipBytes(offsetToFirstIFD - 8)
 
   len -= (offsetToFirstIFD - 8)
 
   # Read the IFD0 (main image) tags.
+  if state.pos + 2 > chunkEnd:
+    skipInvalidExif()
   let numTags = state.readUint16be().maybeSwap(littleEndian).int
 
   len -= 2
 
   for i in 0 ..< numTags:
-    let
-      tagNumber = state.readUint16be().maybeSwap(littleEndian)
-      dataFormat = state.readUint16be().maybeSwap(littleEndian)
-      numberComponents = state.readUint32be().maybeSwap(littleEndian)
-      dataOffset = state.readUint32be().maybeSwap(littleEndian).int
+    if state.pos + 12 > chunkEnd:
+      skipInvalidExif()
+    let tagNumber = state.readUint16be().maybeSwap(littleEndian)
+    discard state.readUint16be().maybeSwap(littleEndian) # Data format
+    discard state.readUint32be().maybeSwap(littleEndian) # Number of components
+    let dataOffset = state.readUint32be().maybeSwap(littleEndian).int
 
     len -= 12
 
@@ -447,7 +536,7 @@ proc decodeExif(state: var DecoderState) =
         discard
 
   # Skip all of the data we do not want to read, IFD1, thumbnail, etc.
-  state.skipBytes(len) # Skip any remaining len
+  state.pos = chunkEnd # Skip any remaining len
 
 proc reset(state: var DecoderState) =
   ## Rests the decoder state need for restart markers.
@@ -464,15 +553,13 @@ proc reset(state: var DecoderState) =
 
 proc decodeSOS(state: var DecoderState) =
   ## Decode Start of Scan - header before the block data.
-  var len = state.readUint16be() - 2
+  var len = state.readUint16be().int - 2
+  state.foundSOS = true
 
   state.scanComponents = state.readUint8().int
 
-  if state.scanComponents > state.components.len:
+  if state.scanComponents <= 0 or state.scanComponents > state.components.len:
     failInvalid("extra components")
-
-  if cast[uint8](state.scanComponents) notin {1'u8, 3}:
-    failInvalid("unsupported scan component count")
 
   state.componentOrder.setLen(0)
 
@@ -482,9 +569,6 @@ proc decodeSOS(state: var DecoderState) =
       info = state.readUint8()
       huffmanAC = info and 15
       huffmanDC = info shr 4
-
-    if huffmanAC > 3 or huffmanDC > 3:
-      failInvalid()
 
     var component: int
     while component < state.components.len:
@@ -512,6 +596,11 @@ proc decodeSOS(state: var DecoderState) =
       failInvalid()
     if state.successiveApproxHigh > 13 or state.successiveApproxLow > 13:
       failInvalid()
+    if state.successiveApproxHigh != 0 and
+        state.successiveApproxLow != state.successiveApproxHigh - 1:
+      failInvalid("invalid progressive parameters")
+    if state.spectralStart != 0 and state.scanComponents != 1:
+      failInvalid("invalid progressive AC scan component count")
   else:
     if state.spectralStart != 0:
       failInvalid()
@@ -519,12 +608,55 @@ proc decodeSOS(state: var DecoderState) =
       failInvalid()
     state.spectralEnd = 63
 
-  len -= 4 + 2 * state.scanComponents.uint16
+  for component in state.componentOrder:
+    if state.spectralStart == 0 and state.components[component].huffmanDC > 3:
+      failInvalid()
+    if (not state.progressive or state.spectralStart != 0) and
+        state.components[component].huffmanAC > 3:
+      failInvalid()
+
+  if state.scanComponents == state.components.len:
+    for i, component in state.componentOrder:
+      if component != i:
+        failInvalid()
+
+  len -= 4 + 2 * state.scanComponents
 
   if len != 0:
     failInvalid()
 
   state.reset()
+
+proc isEntropyMarker(marker: uint8): bool {.inline.} =
+  marker in {0xC0'u8..0xC2'u8, 0xC4, 0xD0..0xD7, 0xD9, 0xDA, 0xDB,
+    0xDC, 0xDD, 0xE0..0xEF, 0xFE}
+
+proc seekEntropyMarker(state: var DecoderState): bool =
+  ## Finds the next marker after damaged entropy-coded data.
+  var pos = state.pos
+  while pos < state.len - 1:
+    if state.buffer[pos] != 0xFF:
+      inc pos
+      continue
+
+    var markerPos = pos
+    while markerPos < state.len and state.buffer[markerPos] == 0xFF:
+      inc markerPos
+    if markerPos >= state.len:
+      break
+
+    let marker = state.buffer[markerPos]
+    if marker == 0:
+      pos = markerPos + 1
+      continue
+    if marker.isEntropyMarker():
+      state.pos = pos
+      state.hitEnd = true
+      state.bitsBuffered = 0
+      state.bitBuffer = 0
+      return true
+
+    pos = markerPos + 1
 
 proc fillBitBuffer(state: var DecoderState) =
   ## When we are low on bits, we need to call this to populate some more.
@@ -533,15 +665,31 @@ proc fillBitBuffer(state: var DecoderState) =
       if state.hitEnd:
         0.uint32
       else:
-        state.readUint8().uint32
+        if state.pos >= state.len:
+          state.hitEnd = true
+          0.uint32
+        else:
+          state.readUint8().uint32
+    if state.hitEnd:
+      state.bitBuffer = state.bitBuffer or (b shl (24 - state.bitsBuffered))
+      state.bitsBuffered += 8
+      continue
     if b == 0xFF:
-      var c = state.readUint8()
-      while c == 0xFF:
-        c = state.readUint8()
-      if c != 0:
-        state.pos -= 2
+      if state.pos >= state.len:
         state.hitEnd = true
         return
+      var c = state.readUint8()
+      while c == 0xFF:
+        if state.pos >= state.len:
+          state.hitEnd = true
+          return
+        c = state.readUint8()
+      if c != 0:
+        if c.isEntropyMarker():
+          state.pos -= 2
+          state.hitEnd = true
+          return
+        dec state.pos
     state.bitBuffer = state.bitBuffer or (b shl (24 - state.bitsBuffered))
     state.bitsBuffered += 8
 
@@ -558,6 +706,10 @@ proc huffmanDecode(state: var DecoderState, tableCurrent, table: int): uint8 =
   if fast < 255:
     let size = huffman.sizes[fast].int
     if size > state.bitsBuffered:
+      if state.hitEnd:
+        return 0
+      if state.seekEntropyMarker():
+        return 0
       failInvalid()
     state.bitBuffer = state.bitBuffer shl size
     state.bitsBuffered -= size
@@ -572,6 +724,10 @@ proc huffmanDecode(state: var DecoderState, tableCurrent, table: int): uint8 =
     inc i
 
   if i == 17 or i > state.bitsBuffered:
+    if state.hitEnd:
+      return 0
+    if state.seekEntropyMarker():
+      return 0
     failInvalid()
 
   let symbolId = (state.bitBuffer shr (32 - i)).int + huffman.deltas[i]
@@ -597,6 +753,8 @@ proc readBits(state: var DecoderState, n: int): int =
     failInvalid()
   if state.bitsBuffered < n:
     state.fillBitBuffer()
+  if state.bitsBuffered < n and state.hitEnd:
+    state.bitsBuffered = n
   let k = lrot(state.bitBuffer, n)
   result = (k and bitMasks[n]).int
   state.bitBuffer = k and (not bitMasks[n])
@@ -617,9 +775,9 @@ proc decodeRegularBlock(
   state: var DecoderState, component: int, data: var array[64, int16]
 ) =
   ## Decodes a whole block.
-  let t = state.huffmanDecode(0, state.components[component].huffmanDC).int
+  var t = state.huffmanDecode(0, state.components[component].huffmanDC).int
   if t > 15:
-    failInvalid("bad huffman code")
+    t = 0
   let
     diff =
       if t == 0:
@@ -643,7 +801,7 @@ proc decodeRegularBlock(
     else:
       i += r.int
       if i >= 64:
-        failInvalid()
+        break
       let zig = deZigZag[i]
       data[zig] = cast[int16](state.receiveExtend(s.int))
       inc i
@@ -656,9 +814,9 @@ proc decodeProgressiveBlock(
     failInvalid("can't merge dc and ac")
 
   if state.successiveApproxHigh == 0:
-    let t = state.huffmanDecode(0, state.components[component].huffmanDC).int
+    var t = state.huffmanDecode(0, state.components[component].huffmanDC).int
     if t > 15:
-      failInvalid("bad huffman code")
+      t = 0
     let
       diff =
         if t > 0:
@@ -703,11 +861,11 @@ proc decodeProgressiveContinuationBlock(
       else:
         k += r.int
         if k >= 64:
-          failInvalid()
+          break
         let zig = deZigZag[k]
         inc k
         if s >= 15:
-          failInvalid()
+          break
         data[zig] = cast[int16](state.receiveExtend(s.int) * (1 shl shift))
 
   else:
@@ -741,11 +899,13 @@ proc decodeProgressiveContinuationBlock(
             discard
         else:
           if s != 1:
-            failInvalid("bad huffman code")
-          if state.readBit() != 0:
-            s = bit
+            r = 64
+            s = 0
           else:
-            s = -bit
+            if state.readBit() != 0:
+              s = bit
+            else:
+              s = -bit
 
         while k <= state.spectralEnd:
           let zig = deZigZag[k]
@@ -893,17 +1053,57 @@ proc decodeBlock(state: var DecoderState, comp, row, column: int) =
   else:
     state.decodeRegularBlock(comp, data)
 
+proc resyncRestart(state: var DecoderState): bool =
+  ## Leniently resync to the next restart marker after damaged entropy data.
+  let maxPos = min(state.len - 1, state.pos + maxRestartResync)
+  var pos = state.pos
+  while pos < maxPos:
+    if state.buffer[pos] != 0xFF:
+      inc pos
+      continue
+
+    var markerPos = pos
+    while markerPos < state.len and state.buffer[markerPos] == 0xFF:
+      inc markerPos
+    if markerPos >= state.len:
+      break
+
+    let marker = state.buffer[markerPos]
+    if marker in 0xD0'u8 .. 0xD7'u8:
+      state.pos = markerPos + 1
+      state.reset()
+      return true
+
+    pos = markerPos + 1
+
 proc checkRestart(state: var DecoderState) =
   ## Check if we might have run into a restart marker, then deal with it.
   dec state.todoBeforeRestart
   if state.todoBeforeRestart <= 0:
     if state.pos + 1 > state.len:
+      if state.progressive and state.hitEnd:
+        state.todoBeforeRestart = int.high
+        return
       failInvalid()
     # Handle getting a restart marker right at the end.
     if state.buffer[state.pos] == 0xFF and state.buffer[state.pos+1] == 0xD9:
       return
+    if state.progressive and state.hitEnd and state.buffer[state.pos] == 0xFF and
+        state.buffer[state.pos + 1] notin 0xD0'u8 .. 0xD7'u8:
+      state.todoBeforeRestart = int.high
+      return
     if state.buffer[state.pos] != 0xFF or
       state.buffer[state.pos + 1] notin 0xD0'u8 .. 0xD7'u8:
+      if state.resyncRestart():
+        return
+      if state.progressive and state.pos + 16 >= state.len:
+        state.pos = state.len
+        state.hitEnd = true
+        state.todoBeforeRestart = int.high
+        return
+      if state.progressive and state.seekEntropyMarker():
+        state.todoBeforeRestart = int.high
+        return
       failInvalid("did not get expected restart marker")
     state.pos += 2
     state.reset()
@@ -1102,10 +1302,11 @@ proc decodeJpeg*(data: string): Image {.raises: [PixieError].} =
   state.len = data.len
 
   while true:
-    if state.readUint8() != 0xFF:
-      failInvalid("invalid chunk marker")
-
-    let chunkId = state.readUint8()
+    if state.pos >= state.len and state.foundSOS:
+      break
+    let chunkId = state.readMarker()
+    if state.foundSOS and not state.progressive and chunkId != 0xD9:
+      break
     case chunkId:
       of 0xC0:
         # Start Of Frame (Baseline DCT)
@@ -1127,10 +1328,15 @@ proc decodeJpeg*(data: string): Image {.raises: [PixieError].} =
         break
       of 0xD0 .. 0xD7:
         # Restart markers
-        failInvalid("invalid restart marker")
+        discard
       of 0xDB:
         # Define Quantization Table(s)
         state.decodeDQT()
+      of 0xDC:
+        # Define Number of Lines
+        if state.foundSOS and state.pos + 2 > state.len:
+          break
+        state.skipChunk()
       of 0xDD:
         # Define Restart Interval
         state.decodeDRI()
@@ -1169,10 +1375,7 @@ proc decodeJpegDimensions*(
   state.len = len
 
   while true:
-    if state.readUint8() != 0xFF:
-      failInvalid("invalid chunk marker")
-
-    let chunkId = state.readUint8()
+    let chunkId = state.readMarker()
     case chunkId:
       of 0xD8:
         # SOI - Start of Image
@@ -1189,8 +1392,14 @@ proc decodeJpegDimensions*(
       of 0xC4:
         # Define Huffman Table
         state.decodeDHT()
+      of 0xD0..0xD7:
+        # Restart markers
+        discard
       of 0xDB:
         # Define Quantization Table(s)
+        state.skipChunk()
+      of 0xDC:
+        # Define Number of Lines
         state.skipChunk()
       of 0xDD:
         # Define Restart Interval
