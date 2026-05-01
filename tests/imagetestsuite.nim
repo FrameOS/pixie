@@ -240,6 +240,97 @@ m1-e0f25ec3373dfdca79ba7bcc3ad366f3.png
 m3-66ac49ef3f48ac9482049e1ab57a53e9.png
 """
 
+const tiffExpectedFileCount = 166
+
+# Based on the upstream TIFFTestSuite notes and cross-checked with ImageMagick.
+# Files listed in tiffShouldDecode are currently decoded by Pixie. Files listed
+# in tiffShouldNotCrash are identified by ImageMagick but still outside Pixie's
+# supported TIFF subset.
+const tiffShouldDecode = """
+0c84d07e1b22b76f24cccc70d8788e4a.tif
+551adc8ce6c3c9cc59040903b0428f47.tif
+7324fcaff3aad96f27899da51c1bb5d9.tif
+8d8582b004aa2560f5bccffbccf4f3d6.tif
+e45931b568d12c9905b1db1775321972.tif
+f505d8aaa96b8da1a1c92363b898f97a.tif
+m2-108af7a96a2efa82a0cee0f200e6b9a2.tif
+"""
+
+const tiffShouldNotCrash = """
+023c970a2a16794f9e51101f76d3bf4d.tif
+034ed0549f9046b9c370ac26550a60da.tif
+0ceffbda821c7564352b313bed43f7c7.tif
+16f2a7e9adcda96170bc1fa873e275c1.tif
+1af8e95246f4cfa4e5e58f67d6428ea3.tif
+221209eb0a273029efa18f4c61f6628a.tif
+27d40bc5f25d8382b890766accb28cf7.tif
+2b27b742e68d313d5ea4abd7847cbff4.tif
+356a619433db27fb412ec6fef583eded.tif
+362323f81c0160afd677241cd5ce92e9.tif
+401d27e0565674c24a017588b8cd61d2.tif
+434cb1e9680e3b4eda7f4dd430bcd2bf.tif
+48af30b09e42ec73f206ce1ac09a424b.tif
+54743a2a36ef90c7ed8bb5da8b6ebaf4.tif
+5dd2583cd54384e56a769f04ea05c999.tif
+6453732434a8a2358a3c895d962bdce2.tif
+84399cc32c29ac0cf33b96a0f654f379.tif
+89b5888641d5910e92bf451b5e639ad0.tif
+9b286add70871bbbef1601997b429344.tif
+9bd49db0707bb5d7ddeca56b1de28ab8.tif
+a516905c06cbc05e8adac7b0b7e4f514.tif
+b05937c07e0f3ce1bfd2c8c71b0220ec.tif
+b1247c37897d354610a07ddfe17eb669.tif
+b52a2fceb34f9b31cb417379cf8c02ba.tif
+b9bc00e0fb28f2a525c0acfe78251eda.tif
+c0d253443d8d4241035fff993ea0581b.tif
+c16f4894de3142b98e8f3d8fc6b3d23e.tif
+ccd82bb72407d0ca03cac50eb42faf47.tif
+ce50e53224a3b62bb821bc294bf6a588.tif
+d664a73588796b59191ad8628065f04a.tif
+e00804b3169008f1c00bf250edccdae4.tif
+ebad222e9402d00e371c92ab5da86e6b.tif
+ecf22eaecaf11fc75938973745138868.tif
+efb780f70a7d94fa98adfc98d2aa8d50.tif
+f15fca5bfdef640840d8ea30570c8cea.tif
+f4bcc246f3471102a2dea2ee9153b372.tif
+f8179f8f5e566349cf3583a1ff3ea95c.tif
+fa0aa927763ee4c7ebf43a5d05dfebc7.tif
+m10-42c19f8e79e582bef107f372f18a074b.tif
+m11-42c19f8e79e582bef107f372f18a074b.tif
+m12-42c19f8e79e582bef107f372f18a074b.tif
+m1-62804e47400d6a0fd233c32ea8db4e48.tif
+m1-68bc8a1966db7a1da2d3b5946c00d1af.tif
+m17-42c19f8e79e582bef107f372f18a074b.tif
+m1-76d5d8fd02d58b774f2bae6f7b763e3e.tif
+m18-42c19f8e79e582bef107f372f18a074b.tif
+m1-84da94dc7e5469f7849b0a7efdff5462.tif
+m1-93456679a773921d30efafd08f3ad542.tif
+m1-96292a1bd64fec83bb6cdd2480a755b6.tif
+m1-b0d36ed02fc2624ac79d3144e8b1bda2.tif
+m1-b127f0fb89daedea07abb50b9db2dfd9.tif
+m1-d0f86ab189cbe900ec389ca6d7464713.tif
+m1-f0d7bcb90496c323c880a9773dfe93ff.tif
+m1-f228b1103fd7b629c08c1bbba94708e0.tif
+m1-f4830e8d4fa458f78a09fcaaf260569c.tif
+m2-b0d36ed02fc2624ac79d3144e8b1bda2.tif
+m2-b1ab6f4b81e9b8020a90c8f2c9bcfedb.tif
+m2-f0d7bcb90496c323c880a9773dfe93ff.tif
+m2-f228b1103fd7b629c08c1bbba94708e0.tif
+m2-f4830e8d4fa458f78a09fcaaf260569c.tif
+m3-76d5d8fd02d58b774f2bae6f7b763e3e.tif
+m3-f0d7bcb90496c323c880a9773dfe93ff.tif
+m4-d0f86ab189cbe900ec389ca6d7464713.tif
+m5-f0d7bcb90496c323c880a9773dfe93ff.tif
+m6-f0d7bcb90496c323c880a9773dfe93ff.tif
+m7-42c19f8e79e582bef107f372f18a074b.tif
+m7-f0d7bcb90496c323c880a9773dfe93ff.tif
+m8-42c19f8e79e582bef107f372f18a074b.tif
+m8-76c43508fc007bcf5902b6a28e8055a5.tif
+m8-f0d7bcb90496c323c880a9773dfe93ff.tif
+m9-76c43508fc007bcf5902b6a28e8055a5.tif
+m9-f0d7bcb90496c323c880a9773dfe93ff.tif
+"""
+
 proc hasManifestFile(manifest, fileName: string): bool =
   for line in manifest.splitLines:
     let name = line.strip()
@@ -267,6 +358,13 @@ proc expectedFor(kind, path: string): Expectation =
     if pngShouldDecode.hasManifestFile(fileName):
       return shouldDecode
     if pngShouldNotCrash.hasManifestFile(fileName):
+      return shouldNotCrash
+    return shouldReject
+
+  if kind == "tif":
+    if tiffShouldDecode.hasManifestFile(fileName):
+      return shouldDecode
+    if tiffShouldNotCrash.hasManifestFile(fileName):
       return shouldNotCrash
     return shouldReject
 
@@ -310,12 +408,11 @@ proc checkPng(stats: var TestStats, path: string) =
   stats.checkDimensions(path, image.width, image.height, dimensions)
 
 proc checkTiff(stats: var TestStats, path: string) =
+  let data = readFile(path)
   let
-    tiff = decodeTiff(readFile(path))
-    image = newImage(tiff)
-  if image.width != tiff.width or image.height != tiff.height:
-    stats.failures.add(&"{path}: decoded {image.width}x{image.height}, " &
-      &"TIFF {tiff.width}x{tiff.height}")
+    dimensions = decodeTiffDimensions(data)
+    image = decodeTiff(data).convertToImage()
+  stats.checkDimensions(path, image.width, image.height, dimensions)
 
 proc checkOne(kind, path: string) =
   var stats: TestStats
@@ -398,6 +495,12 @@ proc checkFiles(
     raise newException(
       ValueError,
       &"PNG expectation manifest covers {pngExpectedFileCount} files, " &
+        &"found {files.len}"
+    )
+  if kind == "tif" and files.len != tiffExpectedFileCount:
+    raise newException(
+      ValueError,
+      &"TIFF expectation manifest covers {tiffExpectedFileCount} files, " &
         &"found {files.len}"
     )
 
