@@ -37,6 +37,11 @@ block:
   doAssert animatedGif.intervals.len == animatedGif.frames.len
 
 block:
+  var data = readFile("tests/fileformats/gif/3x5.gif")
+  data[12] = char(49) # Pixel aspect ratio is advisory and can be ignored.
+  discard decodeGif(data)
+
+block:
   proc addLe16(data: var string, value: int) =
     data.add(char(value and 0xff))
     data.add(char((value shr 8) and 0xff))
