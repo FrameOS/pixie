@@ -1,4 +1,4 @@
-import chroma, flatty/binny, ../common, ../images, ../internal
+import chroma, flatty/binny, math, ../common, ../images, ../internal
 
 # See: https://qoiformat.org/qoi-specification.pdf
 
@@ -29,10 +29,40 @@ type
 proc hash(p: ColorRGBA): int =
   (p.r.int * 3 + p.g.int * 5 + p.b.int * 7 + p.a.int * 11) mod indexLen
 
+proc srgbToLinear(value: uint8): uint8 {.inline.} =
+  let c = value.float32 / 255
+  let linear =
+    if c <= 0.04045:
+      c / 12.92
+    else:
+      pow((c + 0.055) / 1.055, 2.4)
+  round(linear * 255).uint8
+
+proc srgbToLinear(color: var ColorRGBA) {.inline.} =
+  color.r = color.r.srgbToLinear()
+  color.g = color.g.srgbToLinear()
+  color.b = color.b.srgbToLinear()
+
+proc srgbToLinear(color: var ColorRGBX) {.inline.} =
+  color.r = color.r.srgbToLinear()
+  color.g = color.g.srgbToLinear()
+  color.b = color.b.srgbToLinear()
+
+proc srgbToLinear(data: var seq[ColorRGBX]) =
+  for color in data.mitems:
+    color.srgbToLinear()
+
+proc linearPixel(qoi: Qoi, px: ColorRGBA): ColorRGBA {.inline.} =
+  result = px
+  if qoi.colorspace == sRBG:
+    result.srgbToLinear()
+
 proc newImage*(qoi: Qoi): Image =
   ## Creates a new Image from the QOI.
   result = newImage(qoi.width, qoi.height)
   copyMem(result.data[0].addr, qoi.data[0].addr, qoi.data.len * 4)
+  if qoi.colorspace == sRBG:
+    result.data.srgbToLinear()
   result.data.toPremultipliedAlpha()
 
 proc convertToImage*(qoi: Qoi): Image {.raises: [].} =
@@ -47,6 +77,8 @@ proc convertToImage*(qoi: Qoi): Image {.raises: [].} =
   result.width = qoi.width
   result.height = qoi.height
   result.data = move cast[Movable](qoi).data
+  if qoi.colorspace == sRBG:
+    result.data.srgbToLinear()
   result.data.toPremultipliedAlpha()
 
 proc decodeQoi*(data: string): Qoi {.raises: [PixieError].} =
@@ -166,13 +198,14 @@ proc encodeQoi*(qoi: Qoi): string {.raises: [PixieError].} =
   result.addUint32(qoi.width.uint32.swap())
   result.addUint32(qoi.height.uint32.swap())
   result.addUint8(qoi.channels.uint8)
-  result.addUint8(qoi.colorspace.uint8)
+  result.addUint8(Linear.uint8)
 
   var
     index: Index
     run: uint8
     pxPrev = rgba(0, 0, 0, 255)
-  for off, px in qoi.data:
+  for off, qoiPx in qoi.data:
+    let px = qoi.linearPixel(qoiPx)
     if px == pxPrev:
       inc run
       if run == 62 or off == qoi.data.high:
@@ -231,6 +264,7 @@ proc encodeQoi*(image: Image): string {.raises: [PixieError].} =
   qoi.width = image.width
   qoi.height = image.height
   qoi.channels = 4
+  qoi.colorspace = Linear
   qoi.data.setLen(image.data.len)
 
   copyMem(qoi.data[0].addr, image.data[0].addr, image.data.len * 4)
