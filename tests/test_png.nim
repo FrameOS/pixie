@@ -1,10 +1,19 @@
 import pixie, pixie/fileformats/png, pngsuite, strformat
 
+when defined(writeImages):
+  import write_images
+
+when defined(writeImages):
+  resetOutputDir(pngSuiteOutputDir)
+  echo &"Writing decoded PNGSuite images to {pngSuiteOutputDir}"
+
 for file in pngSuiteFiles:
   let
     original = readFile(&"tests/fileformats/png/pngsuite/{file}.png")
     decoded = decodePng(original)
     encoded = encodePng(decoded)
+  when defined(writeImages):
+    newImage(decoded).writeOutputImage(pngSuiteOutputDir, file)
 
 block:
   let

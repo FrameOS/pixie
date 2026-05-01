@@ -2,6 +2,9 @@ import algorithm, os, osproc, strformat, strutils
 import pixie/common, pixie/fileformats/gif, pixie/fileformats/jpeg,
   pixie/fileformats/png, pixie/fileformats/tiff
 
+when defined(writeImages):
+  import write_images
+
 const imageTestSuitePath = "../imagetestsuite"
 
 type
@@ -385,6 +388,18 @@ proc checkDimensions(
     stats.failures.add(&"{path}: decoded {width}x{height}, dimensions " &
       &"{dimensions.width}x{dimensions.height}")
 
+template writeImageTestSuiteImage(kind, path: string, image: untyped) =
+  when defined(writeImages):
+    let dirName =
+      case kind
+      of "jpg":
+        "jpeg"
+      of "tif":
+        "tiff"
+      else:
+        kind
+    image.writeOutputImage(imageTestSuiteOutputDir / dirName, path)
+
 proc checkGif(stats: var TestStats, path: string) =
   let data = readFile(path)
   let
@@ -392,6 +407,7 @@ proc checkGif(stats: var TestStats, path: string) =
     image = newImage(gif)
     dimensions = decodeGifDimensions(data)
   stats.checkDimensions(path, image.width, image.height, dimensions)
+  writeImageTestSuiteImage("gif", path, image)
 
 proc checkJpeg(stats: var TestStats, path: string) =
   let data = readFile(path)
@@ -399,6 +415,7 @@ proc checkJpeg(stats: var TestStats, path: string) =
     image = decodeJpeg(data)
     dimensions = decodeJpegDimensions(data)
   stats.checkDimensions(path, image.width, image.height, dimensions)
+  writeImageTestSuiteImage("jpg", path, image)
 
 proc checkPng(stats: var TestStats, path: string) =
   let data = readFile(path)
@@ -406,6 +423,7 @@ proc checkPng(stats: var TestStats, path: string) =
     dimensions = decodePngDimensions(data)
     image = decodePng(data).convertToImage()
   stats.checkDimensions(path, image.width, image.height, dimensions)
+  writeImageTestSuiteImage("png", path, image)
 
 proc checkTiff(stats: var TestStats, path: string) =
   let data = readFile(path)
@@ -413,6 +431,7 @@ proc checkTiff(stats: var TestStats, path: string) =
     dimensions = decodeTiffDimensions(data)
     image = decodeTiff(data).convertToImage()
   stats.checkDimensions(path, image.width, image.height, dimensions)
+  writeImageTestSuiteImage("tif", path, image)
 
 proc checkOne(kind, path: string) =
   var stats: TestStats
@@ -533,6 +552,10 @@ if paramCount() == 2:
 if not dirExists(imageTestSuitePath):
   echo &"Skipping imagetestsuite: {imageTestSuitePath} was not found"
 else:
+  when defined(writeImages):
+    resetOutputDir(imageTestSuiteOutputDir)
+    echo &"Writing decoded ImageTestSuite images to {imageTestSuiteOutputDir}"
+
   var stats: TestStats
   stats.checkFiles("gif", "*.gif", "GIF", "gif")
   stats.checkFiles("jpg", "*.jpg", "JPG", "jpg")
