@@ -7,6 +7,20 @@ for file in pngSuiteFiles:
     encoded = encodePng(decoded)
 
 block:
+  let
+    png8 = decodePng(readFile("tests/fileformats/png/pngsuite/basn2c08.png"))
+    png16 = decodePng(readFile("tests/fileformats/png/pngsuite/basn2c16.png"))
+    image16 = png16.convertToImage()
+  doAssert png8.bitDepth == 8
+  doAssert png8.data.len == png8.width * png8.height
+  doAssert png8.data16.len == 0
+  doAssert png16.bitDepth == 16
+  doAssert png16.data.len == 0
+  doAssert png16.data16.len == png16.width * png16.height
+  doAssert image16.width == png16.width
+  doAssert image16.height == png16.height
+
+block:
   for channels in 1 .. 4:
     var data: seq[uint8]
     for x in 0 ..< 16:

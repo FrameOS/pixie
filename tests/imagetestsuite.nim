@@ -154,6 +154,100 @@ const jpgExpectations = [
   ("fddcfc778ada60229380c2493fc4c243.jpg", shouldReject)
 ]
 
+const pngExpectedFileCount = 254
+
+# Based on the upstream PNGTestSuite notes and cross-checked with ImageMagick.
+# Files listed in pngShouldDecode are valid PNGs in Pixie's supported subset.
+# Files listed in pngShouldNotCrash are malformed files ImageMagick still
+# decodes/identifies. Every other PNG in the current suite should reject.
+const pngShouldDecode = """
+0839d93f8e77e21acd0ac40a80b14b7b.png
+1ebd73c1d3fbc89782f29507364128fc.png
+2d641a11233385bb37a524ff010a8531.png
+66ac49ef3f48ac9482049e1ab57a53e9.png
+affc57dfffa5ec448a0795738d456018.png
+b59d7a023a8dcd112da2eb859004199a.png
+ba2b2b6e72ca0e4683bb640e2d5572f8.png
+c636287a4d7cb1a36362f7f236564cef.png
+c-m1-66ac49ef3f48ac9482049e1ab57a53e9.png
+c-m1-e0f25ec3373dfdca79ba7bcc3ad366f3.png
+c-m3-66ac49ef3f48ac9482049e1ab57a53e9.png
+c-m4-6bfb149151f58d124d6fa76eaad75520.png
+d2e515cfdabae699301dcf290382474d.png
+ebfb1cd42314a557e72d4da75c21fc1c.png
+18f9baf3834980f4b80a3e82ad45be48.png
+51a4d21670dc8dfa8ffc9e54afd62f5f.png
+6c853ed9dacd5716bc54eb59cec30889.png
+93e6127b9c4e7a99459c558b81d31bc5.png
+ac6343a98f8edabfcc6e536dd75aacb0.png
+e59ec0cfb8ab64558099543dc19f8378.png
+"""
+
+const pngShouldNotCrash = """
+# Malformed PNGs that ImageMagick still decodes or identifies.
+008b8bb75b8a487dc5aac86c9abb06fb.png
+0132cfdbd8ca323574a2072e7ed5014c.png
+0301fde58080883e938b604cab9768ea.png
+073c98872b81d1004d750f18a4b5f732.png
+0b7d50ac449fd59eb3de00647636d0c9.png
+0d466db9067b719df0b06ef441bf1ee7.png
+138331052d7c6e4acebfaa92af314e12.png
+13f665c09e4b03cdbe2fff3015ec8aa7.png
+18bd8bf75e7a9b40b961dd501654ce0e.png
+1ae14e57b7062597279134ff2eeb39c0.png
+1b9a48cf04466108f6f2d225d100edbf.png
+1bcc34d49e56a2fba38490db206328b8.png
+2a6ff5f8106894b22dad3ce99673481a.png
+31e3bc3eb811cff582b5feee2494fed8.png
+429104334d1fb6a58e17307883c17608.png
+42ec8668adb5dbc6581393f463976510.png
+4389427591c18bf36e748172640862c3.png
+4c5b82ba0a9c12356007bd71e52185b2.png
+4f14b7aab3a41855378c5517342598b9.png
+579294d4d8110fc64980dd72a5066780.png
+5b689479bd7e527c2385a40437272607.png
+5beaadc10dfdbf61124e98fdf8a5c191.png
+5e2b64196b9e014e0ed0a27873cafdb3.png
+611b294df9cf794eeaa1ffcc620bf6a4.png
+6399623892b45aa4901aa6e702c7a62d.png
+64221ffc9050c92b8980326acc0e4194.png
+71714b783e01aec455b5a4a760326ccc.png
+7b9abb94ace0278f943a6df29d0ca652.png
+829b05b759b2977bc3eb970ab256d867.png
+8711007ea5e351755a80cba913d16a32.png
+8905ba870cd5d3327a8310fa437aa076.png
+9540743374e1fdb273b6a6ca625eb7a3.png
+9bd8a9ed81c5a9190f74496197da7249.png
+a1d54c960686558901e320a52a967158.png
+a24a39e69554a701412b3ed0c009e7f6.png
+b3ac9fdb7239f42c734921dfe790291b.png
+bf203e765c98b12f6c2b2c33577c730d.png
+c0a76d267196727887d45de4889bec33.png
+c1a4baf5d7c68d366d4d4f948f7295be.png
+c5c030bf52b9b2d8c45c88988fafff4f.png
+c-5e2b64196b9e014e0ed0a27873cafdb3.png
+d45b0dbbb808df6486f8a13ea44ea174.png
+d92428f3fc9c806b0a4373b54e06785e.png
+dd18aac055d531e0e4ff8979458dbaa3.png
+e76546768d4a8f2f4c39339345c7614c.png
+ed5f2464fcaadd4e0a5e905e3ac41ad5.png
+edf5c1b0aa5b01eea5017290a286a173.png
+f6266c0e9c2f7db9fab0f84562f63b6c.png
+f757de9794666c3d14985210679bc98c.png
+fa9f6aa9bcc679d20e171dbf07a628fd.png
+m1-66ac49ef3f48ac9482049e1ab57a53e9.png
+m1-e0f25ec3373dfdca79ba7bcc3ad366f3.png
+m3-66ac49ef3f48ac9482049e1ab57a53e9.png
+"""
+
+proc hasManifestFile(manifest, fileName: string): bool =
+  for line in manifest.splitLines:
+    let name = line.strip()
+    if name.len == 0 or name.startsWith("#"):
+      continue
+    if name == fileName:
+      return true
+
 proc expectedFor(kind, path: string): Expectation =
   let fileName = path.splitPath.tail
 
@@ -168,6 +262,13 @@ proc expectedFor(kind, path: string): Expectation =
       if fileName == name:
         return expectation
     raise newException(ValueError, "Missing JPG expectation for " & fileName)
+
+  if kind == "png":
+    if pngShouldDecode.hasManifestFile(fileName):
+      return shouldDecode
+    if pngShouldNotCrash.hasManifestFile(fileName):
+      return shouldNotCrash
+    return shouldReject
 
   shouldDecode
 
@@ -293,6 +394,13 @@ proc checkFiles(
   kind: string
 ) =
   let files = sortedFiles(imageTestSuitePath / dir, pattern)
+  if kind == "png" and files.len != pngExpectedFileCount:
+    raise newException(
+      ValueError,
+      &"PNG expectation manifest covers {pngExpectedFileCount} files, " &
+        &"found {files.len}"
+    )
+
   let passedBefore = stats.passed
   let failuresBefore = stats.failures.len
   echo &"{label}: {files.len} files"
