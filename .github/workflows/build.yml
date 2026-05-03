@@ -21,3 +21,4 @@ jobs:
           cd ..
           nimby install -g pixie/pixie.nimble
       - run: nim r tests/tests.nim
+      - run: nim cpp -r tests/tests.nim
