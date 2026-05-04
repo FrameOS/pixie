@@ -1,4 +1,4 @@
-import pixie/fileformats/tiff
+import pixie/common, pixie/fileformats/tiff
 
 let
   data = readFile("tests/fileformats/tiff/pc260001.tif")
