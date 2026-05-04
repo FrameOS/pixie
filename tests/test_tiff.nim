@@ -1,9 +1,55 @@
-import pixie, pixie/fileformats/tiff
+import pixie/common, pixie/fileformats/tiff
 
 let
-  t = decodeTiff(readFile("tests/fileformats/tiff/pc260001.tif"))
+  data = readFile("tests/fileformats/tiff/pc260001.tif")
+  dimensions = decodeTiffDimensions(data)
+  t = decodeTiff(data)
   image = newImage(t)
-# image.writeFile("tests/fileformats/tiff/pc260001.png")
+
+doAssert dimensions.width == t.width
+doAssert dimensions.height == t.height
+doAssert t.dataFormat == tiffRgba
+doAssert t.data.len == t.width * t.height
+doAssert t.dataFloat32.len == 0
+doAssert t.dataGray16.len == 0
+doAssert t.dataGrayInt16.len == 0
+doAssert image.width == t.width
+doAssert image.height == t.height
+
+let
+  gray16Tiff = Tiff(
+    width: 1,
+    height: 1,
+    dataFormat: tiffGray16,
+    dataGray16: @[32768.uint16]
+  )
+  gray16Image = convertToImage(gray16Tiff)
+  grayInt16Tiff = Tiff(
+    width: 3,
+    height: 1,
+    dataFormat: tiffGrayInt16,
+    dataGrayInt16: @[-32768.int16, 0.int16, 32767.int16]
+  )
+  grayInt16Image = convertToImage(grayInt16Tiff)
+  floatTiff = Tiff(
+    width: 1,
+    height: 1,
+    dataFormat: tiffFloat32,
+    dataFloat32: @[0.5'f32]
+  )
+  floatImage = convertToImage(floatTiff)
+
+doAssert gray16Image.width == 1
+doAssert gray16Image.height == 1
+doAssert gray16Image.data[0].r == 127
+doAssert grayInt16Image.width == 3
+doAssert grayInt16Image.height == 1
+doAssert grayInt16Image.data[0].r == 0
+doAssert grayInt16Image.data[1].r == 127
+doAssert grayInt16Image.data[2].r == 255
+doAssert floatImage.width == 1
+doAssert floatImage.height == 1
+doAssert floatImage.data[0].r == 128
 
 block:
   proc addLe16(data: var string, value: int) =

@@ -39,17 +39,13 @@ proc decodeGif*(data: string): Gif {.raises: [PixieError].} =
     hasGlobalColorTable = (globalFlags and 0b10000000) != 0
     globalColorTableSize = 2 ^ ((globalFlags and 0b00000111) + 1)
     bgColorIndex = data.readUint8(11).int
-    pixelAspectRatio = data.readUint8(12)
 
-  if bgColorIndex >= globalColorTableSize:
+  if hasGlobalColorTable and bgColorIndex >= globalColorTableSize:
     failInvalid()
-
-  if pixelAspectRatio != 0:
-    raise newException(PixieError, "Unsupported GIF, pixel aspect ratio")
 
   var pos = 13
 
-  if pos + globalColorTableSize * 3 > data.len:
+  if hasGlobalColorTable and pos + globalColorTableSize * 3 > data.len:
     failInvalid()
 
   var
@@ -79,6 +75,8 @@ proc decodeGif*(data: string): Gif {.raises: [PixieError].} =
         break
 
       pos += subBlockSize
+      if pos > data.len:
+        failInvalid()
 
   var controlExtension: ControlExtension
   while true:
@@ -98,7 +96,7 @@ proc decodeGif*(data: string): Gif {.raises: [PixieError].} =
         imageTopPos = data.readUint16(pos + 2).int
         imageWidth = data.readUint16(pos + 4).int
         imageHeight = data.readUint16(pos + 6).int
-        imageFlags = data.readUint16(pos + 8)
+        imageFlags = data.readUint8(pos + 8)
         hasLocalColorTable = (imageFlags and 0b10000000) != 0
         interlaced = (imageFlags and 0b01000000) != 0
         localColorTableSize = 2 ^ ((imageFlags and 0b00000111) + 1)
@@ -108,7 +106,7 @@ proc decodeGif*(data: string): Gif {.raises: [PixieError].} =
       if imageWidth > screenWidth or imageHeight > screenHeight:
         raise newException(PixieError, "Invalid GIF frame dimensions")
 
-      if pos + localColorTableSize * 3 > data.len:
+      if hasLocalColorTable and pos + localColorTableSize * 3 > data.len:
         failInvalid()
 
       var localColorTable: seq[ColorRGBX]
@@ -129,7 +127,7 @@ proc decodeGif*(data: string): Gif {.raises: [PixieError].} =
       let minCodeSize = data.readUint8(pos).int
       inc pos
 
-      if minCodeSize > 11:
+      if minCodeSize < 2 or minCodeSize > 8:
         failInvalid()
 
       # The image data is contained in a sequence of sub-blocks
