@@ -294,7 +294,7 @@ exportRefObject Context:
 exportProcs:
   decodeBase64
   decodeImage
-  decodeImageDimensions
+  decodeImageDimensions(string)
   readImage
   readImageDimensions
   readTypeface
