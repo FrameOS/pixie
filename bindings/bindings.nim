@@ -34,21 +34,6 @@ proc scale(x, y: float32): Matrix3 =
 proc inverse(m: Matrix3): Matrix3 =
   cast[Matrix3](inverse(cast[Mat3](m)))
 
-proc hasGlyph(typeface: Typeface, rune: int32): bool {.raises: [].} =
-  typeface.hasGlyph(Rune(rune))
-
-proc getGlyphPath(typeface: Typeface, rune: int32): Path {.raises: [].} =
-  try:
-    result = typeface.getGlyphPath(Rune(rune))
-  except:
-    lastError = currentExceptionAsPixieError()
-
-proc getAdvance(typeface: Typeface, rune: int32): float32 {.raises: [].} =
-  typeface.getAdvance(Rune(rune))
-
-proc getKerningAdjustment(typeface: Typeface, left, right: int32): float32 {.raises: [].} =
-  typeface.getKerningAdjustment(Rune(left), Rune(right))
-
 proc parseColor(s: string): Color {.raises: [PixieError]} =
   try:
     result = parseHtmlColor(s)
@@ -208,10 +193,10 @@ exportRefObject Typeface:
     descent
     lineGap
     lineHeight
-    hasGlyph(Typeface, int32)
-    getGlyphPath(Typeface, int32)
-    getAdvance(Typeface, int32)
-    getKerningAdjustment(Typeface, int32, int32)
+    hasGlyph
+    getGlyphPath
+    getAdvance
+    getKerningAdjustment
     newFont
 
 exportRefObject Font:
