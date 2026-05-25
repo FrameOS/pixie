@@ -1,4 +1,4 @@
-import genny, pixie, pixie/internal, unicode
+import genny, pixie, pixie/internal, unicode, bumpy, chroma, vmath
 
 var lastError: ref PixieError
 
@@ -9,30 +9,14 @@ proc takeError(): string =
 proc checkError(): bool =
   result = lastError != nil
 
-type
-  Vector2* {.bycopy.} = object
-    x*, y*: float32
+proc translate(x, y: float32): Mat3 =
+  vmath.translate(vec2(x, y))
 
-  Matrix3* {.bycopy.} = object
-    values*: array[9, float32]
+proc rotate(angle: float32): Mat3 =
+  vmath.rotate(angle)
 
-proc matrix3(): Matrix3 =
-  cast[Matrix3](mat3())
-
-proc mul(a, b: Matrix3): Matrix3 =
-  cast[Matrix3](cast[Mat3](a) * cast[Mat3](b))
-
-proc translate(x, y: float32): Matrix3 =
-  cast[Matrix3](translate(vec2(x, y)))
-
-proc rotate(angle: float32): Matrix3 =
-  cast[Matrix3](rotate(angle))
-
-proc scale(x, y: float32): Matrix3 =
-  cast[Matrix3](scale(vec2(x, y)))
-
-proc inverse(m: Matrix3): Matrix3 =
-  cast[Matrix3](inverse(cast[Mat3](m)))
+proc scale(x, y: float32): Mat3 =
+  vmath.scale(vec2(x, y))
 
 proc parseColor(s: string): Color {.raises: [PixieError]} =
   try:
@@ -72,19 +56,38 @@ exportProcs:
   checkError
   takeError
 
-exportObject Vector2:
-  discard
-
-exportObject Matrix3:
-  constructor:
-    matrix3
+exportObject vmath.Vec2:
+  fields:
+    x: float32
+    y: float32
   procs:
-    mul(Matrix3, Matrix3)
+    `+`(Vec2, Vec2)
+    `-`(Vec2, Vec2)
+    `*`(Vec2, Vec2)
+    `/`(Vec2, Vec2)
+    `*`(Vec2, float32)
+    `/`(Vec2, float32)
+    length(Vec2)
+    normalize(Vec2)
+    dot(Vec2, Vec2)
+    dist(Vec2, Vec2)
 
-exportObject Rect:
+exportObject vmath.Mat3:
+  fields:
+    values: array[9, float32]
+  constructor:
+    mat3()
+  procs:
+    `*`(Mat3, Mat3)
+    `*`(Mat3, Vec2)
+    inverse(Mat3)
+    transpose(Mat3)
+    determinant(Mat3)
+
+exportObject bumpy.Rect:
   discard
 
-exportObject Color:
+exportObject chroma.Color:
   discard
 
 exportObject ColorStop:
@@ -306,7 +309,7 @@ exportProcs:
   translate(float32, float32)
   rotate(float32)
   scale(float32, float32)
-  inverse(Matrix3)
+  inverse(Mat3)
   snapToPixels
   mix(Color, Color, float32)
 
