@@ -1,4 +1,4 @@
-import genny, pixie, pixie/internal, unicode
+import genny, pixie, pixie/internal, unicode, bumpy, chroma
 
 var lastError: ref PixieError
 
@@ -81,10 +81,10 @@ exportObject Matrix3:
   procs:
     mul(Matrix3, Matrix3)
 
-exportObject Rect:
+exportObject bumpy.Rect:
   discard
 
-exportObject Color:
+exportObject chroma.Color:
   discard
 
 exportObject ColorStop:
