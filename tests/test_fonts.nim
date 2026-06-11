@@ -1246,6 +1246,98 @@ block:
   for i, typeface in typefaces:
     echo i, ": ", typeface.name
 
+block: # Color emoji, COLR/CPAL layered vector glyphs
+  var font = readFont("tests/fonts/EmojiColr.ttf")
+  font.size = 64
+  let image = newImage(400, 100)
+  image.fill(rgba(255, 255, 255, 255))
+  image.fillText(font, "😀❤⭐🌙☀")
+  image.xray("tests/fonts/masters/emoji_colr.png")
+
+block: # Color emoji, CBDT/CBLC embedded PNG bitmaps (no outlines at all)
+  var font = readFont("tests/fonts/EmojiCbdt.ttf")
+  font.size = 64
+  let image = newImage(400, 100)
+  image.fill(rgba(255, 255, 255, 255))
+  image.fillText(font, "😀❤⭐🌙☀")
+  image.xray("tests/fonts/masters/emoji_cbdt.png")
+
+block: # Color emoji, sbix embedded PNG bitmaps
+  var font = readFont("tests/fonts/EmojiSbix.ttf")
+  font.size = 64
+  let image = newImage(400, 100)
+  image.fill(rgba(255, 255, 255, 255))
+  image.fillText(font, "😀❤⭐🌙☀")
+  image.xray("tests/fonts/masters/emoji_sbix.png")
+
+block: # Color emoji at a size that does not match the bitmap strike
+  let image = newImage(460, 80)
+  image.fill(rgba(255, 255, 255, 255))
+  var x: float32
+  for file in ["EmojiColr.ttf", "EmojiCbdt.ttf", "EmojiSbix.ttf"]:
+    var font = readFont("tests/fonts/" & file)
+    font.size = 40
+    image.fillText(font, "😀❤⭐", translate(vec2(x, 10)))
+    x += 140
+  image.xray("tests/fonts/masters/emoji_scaled.png")
+
+block: # Color emoji from a fallback typeface, mixed with regular text
+  let
+    typeface = readTypeface("tests/fonts/Roboto-Regular_1.ttf")
+    emojiTypeface = readTypeface("tests/fonts/EmojiColr.ttf")
+  typeface.fallbacks.add(emojiTypeface)
+  var font = newFont(typeface)
+  font.size = 36
+  let image = newImage(380, 60)
+  image.fill(rgba(255, 255, 255, 255))
+  image.fillText(font, "Hey 😀 you ❤⭐!")
+  image.xray("tests/fonts/masters/emoji_fallback.png")
+
+block: # Real-world color emoji, no fallbacks: a subset of Twemoji Mozilla
+  # (COLRv0/CPAL), see generate_emoji_fonts.py for how it is produced.
+  var font = readFont("tests/fonts/TwemojiMozilla-subset.ttf")
+  font.size = 48
+  let image = newImage(520, 130)
+  image.fill(rgba(255, 255, 255, 255))
+  image.fillText(font, "😀😂❤️👍🎉🌍🍕🚀⭐🌙\n☀️🐶🐱🦊🍔⚽🎸💡✅🔥")
+  image.xray("tests/fonts/masters/emoji_real.png")
+
+block: # Emoji from each color font as a fallback for Ubuntu text
+  var spans: seq[Span]
+  for file in ["EmojiColr.ttf", "EmojiCbdt.ttf", "EmojiSbix.ttf"]:
+    let typeface = readTypeface("tests/fonts/Ubuntu-Regular_1.ttf")
+    typeface.fallbacks.add(readTypeface("tests/fonts/" & file))
+    var font = newFont(typeface)
+    font.size = 32
+    spans.add(newSpan("Ubuntu 😀⭐🌙☀❤ " & file & "\n", font))
+  let image = newImage(480, 160)
+  image.fill(rgba(255, 255, 255, 255))
+  image.fillText(typeset(spans))
+  image.xray("tests/fonts/masters/emoji_ubuntu.png")
+
+block: # Variation selectors and zero-width joiners are invisible
+  var font = readFont("tests/fonts/EmojiColr.ttf")
+  font.size = 64
+  # U+2764 alone and U+2764 U+FE0F must lay out identically.
+  doAssert font.layoutBounds("❤") == font.layoutBounds("❤️")
+  # A ZWJ sequence degrades into the individual emoji, no tofu in between.
+  doAssert font.layoutBounds("😀‍😀") == font.layoutBounds("😀😀")
+
+block: # hasColorGlyph
+  for file in ["EmojiColr.ttf", "EmojiCbdt.ttf", "EmojiSbix.ttf"]:
+    let typeface = readTypeface("tests/fonts/" & file)
+    for rune in [0x1F600, 0x2764, 0x2B50, 0x1F319, 0x2600]:
+      doAssert typeface.hasColorGlyph(Rune(rune))
+    doAssert not typeface.hasColorGlyph(Rune('A'.ord))
+  doAssert not readTypeface(
+    "tests/fonts/Roboto-Regular_1.ttf").hasColorGlyph(Rune(0x1F600))
+
+block: # Stroking emoji must not crash, color glyphs are skipped
+  var font = readFont("tests/fonts/EmojiCbdt.ttf")
+  font.size = 64
+  let image = newImage(280, 100)
+  image.strokeText(font, "😀❤")
+
 when defined(windows):
   block:
     let files = @[

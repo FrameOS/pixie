@@ -1,4 +1,4 @@
-import flatty/binny, flatty/encode, math, ../common, ../paths, sets,
+import chroma, flatty/binny, flatty/encode, math, ../common, ../paths, sets,
     strutils, tables, unicode, vmath
 
 ## See https://docs.microsoft.com/en-us/typography/opentype/spec/
@@ -368,6 +368,60 @@ type
     charIndex: seq[(int, int)]
     isCID: bool
 
+  ColrLayer* = object
+    glyphId*: uint16
+    paletteIndex*: uint16
+
+  ColrTable* = ref object
+    ## Layered color glyphs (COLR version 0 records).
+    version*: uint16
+    baseGlyphs*: Table[uint16, seq[ColrLayer]]
+
+  CpalTable* = ref object
+    ## Color palettes used by the COLR table.
+    numPaletteEntries*: uint16
+    palettes*: seq[seq[ColorRGBA]]
+
+  BitmapGlyphRecord = object
+    imageFormat: uint16
+    dataOffset: int ## Absolute offset of the glyph data block in the buffer.
+    dataLen: int
+    hasBigMetrics: bool
+    width, height: int
+    bearingX, bearingY: int
+
+  BitmapStrike = object
+    ppem: int
+    glyphs: Table[uint16, BitmapGlyphRecord]
+
+  CblcTable* = ref object
+    ## Color bitmap (PNG) glyph index, data lives in the CBDT table.
+    strikes: seq[BitmapStrike]
+
+  SbixStrike = object
+    ppem: int
+    offset: int ## Absolute offset of the strike in the buffer.
+    glyphDataOffsets: seq[uint32]
+
+  SbixTable* = ref object
+    ## Apple-style color bitmap (PNG) glyphs.
+    strikes: seq[SbixStrike]
+
+  ColorGlyphLayer* = object
+    ## A single layer of a COLR color glyph.
+    path*: Path        ## Layer outline in font units, y-flipped like getGlyphPath.
+    color*: ColorRGBA
+    useTextColor*: bool ## Layer uses the text fill color instead of a palette color.
+
+  BitmapGlyph* = object
+    ## An embedded color bitmap glyph (CBDT or sbix).
+    png*: string       ## Raw PNG file data.
+    ppem*: float32     ## Pixels per em of the bitmap strike.
+    xOffset*: float32  ## Origin to bitmap left edge, in strike pixels.
+    yOffset*: float32  ## Baseline to bitmap top edge (positive up), in strike
+                       ## pixels. If yOffsetIsBottom, baseline to bottom edge.
+    yOffsetIsBottom*: bool
+
   OpenType* = ref object
     buf*: string
     version*: uint32
@@ -389,7 +443,12 @@ type
     gpos*: GposTable
     post*: PostTable
     cff*: CFFTable
+    colr*: ColrTable
+    cpal*: CpalTable
+    cblc*: CblcTable
+    sbix*: SbixTable
     glyphPaths: Table[Rune, Path]
+    colorGlyphLayers: Table[Rune, seq[ColorGlyphLayer]]
 
 when defined(release):
   {.push checks: off.}
@@ -450,8 +509,8 @@ proc parseCmapTable(buf: string, offset: int): CmapTable =
     encodingRecord.offset = buf.readUint32(i + 4).swap()
     i += 8
 
-    if encodingRecord.platformID == 3:
-      # Windows
+    if encodingRecord.platformID == 3 or encodingRecord.platformID == 0:
+      # Windows and Unicode platforms, the subtable formats are the same.
       var i = offset + encodingRecord.offset.int
       buf.eofCheck(i + 2)
 
@@ -2175,6 +2234,228 @@ proc parsePostTable(buf: string, offset: int): PostTable =
   result.underlineThickness = buf.readInt16(offset + 10).swap()
   result.isFixedPitch = buf.readUint32(offset + 12).swap()
 
+proc parseColrTable(buf: string, offset: int): ColrTable =
+  ## https://learn.microsoft.com/en-us/typography/opentype/spec/colr
+  ## Parses the version 0 base glyph and layer records. These are also
+  ## present in version 1 tables as a fallback for the v1-only features.
+  buf.eofCheck(offset + 14)
+
+  result = ColrTable()
+  result.version = buf.readUint16(offset + 0).swap()
+
+  let
+    numBaseGlyphRecords = buf.readUint16(offset + 2).swap().int
+    baseGlyphRecordsOffset = buf.readUint32(offset + 4).swap().int
+    layerRecordsOffset = buf.readUint32(offset + 8).swap().int
+    numLayerRecords = buf.readUint16(offset + 12).swap().int
+
+  var i = offset + layerRecordsOffset
+  buf.eofCheck(i + numLayerRecords * 4)
+
+  var layers = newSeq[ColrLayer](numLayerRecords)
+  for j in 0 ..< numLayerRecords:
+    layers[j].glyphId = buf.readUint16(i + 0).swap()
+    layers[j].paletteIndex = buf.readUint16(i + 2).swap()
+    i += 4
+
+  i = offset + baseGlyphRecordsOffset
+  buf.eofCheck(i + numBaseGlyphRecords * 6)
+
+  for j in 0 ..< numBaseGlyphRecords:
+    let
+      glyphId = buf.readUint16(i + 0).swap()
+      firstLayerIndex = buf.readUint16(i + 2).swap().int
+      numLayers = buf.readUint16(i + 4).swap().int
+    if firstLayerIndex + numLayers > layers.len:
+      failUnsupported("COLR layer index")
+    if numLayers > 0:
+      result.baseGlyphs[glyphId] =
+        layers[firstLayerIndex ..< firstLayerIndex + numLayers]
+    i += 6
+
+proc parseCpalTable(buf: string, offset: int): CpalTable =
+  ## https://learn.microsoft.com/en-us/typography/opentype/spec/cpal
+  buf.eofCheck(offset + 12)
+
+  result = CpalTable()
+  result.numPaletteEntries = buf.readUint16(offset + 2).swap()
+
+  let
+    numPalettes = buf.readUint16(offset + 4).swap().int
+    numColorRecords = buf.readUint16(offset + 6).swap().int
+    colorRecordsArrayOffset = buf.readUint32(offset + 8).swap().int
+
+  buf.eofCheck(offset + 12 + numPalettes * 2)
+  buf.eofCheck(offset + colorRecordsArrayOffset + numColorRecords * 4)
+
+  for j in 0 ..< numPalettes:
+    let firstColorIndex = buf.readUint16(offset + 12 + j * 2).swap().int
+    if firstColorIndex + result.numPaletteEntries.int > numColorRecords:
+      failUnsupported("CPAL color index")
+    var
+      palette = newSeq[ColorRGBA](result.numPaletteEntries.int)
+      i = offset + colorRecordsArrayOffset + firstColorIndex * 4
+    for k in 0 ..< result.numPaletteEntries.int:
+      # Color records are stored as BGRA.
+      palette[k] = rgba(
+        buf.readUint8(i + 2),
+        buf.readUint8(i + 1),
+        buf.readUint8(i + 0),
+        buf.readUint8(i + 3)
+      )
+      i += 4
+    result.palettes.add(palette)
+
+proc readBigMetrics(
+  buf: string, offset: int, record: var BitmapGlyphRecord
+) =
+  ## Reads the first half of BigGlyphMetrics (the horizontal metrics).
+  buf.eofCheck(offset + 8)
+  record.hasBigMetrics = true
+  record.height = buf.readUint8(offset + 0).int
+  record.width = buf.readUint8(offset + 1).int
+  record.bearingX = buf.readInt8(offset + 2).int
+  record.bearingY = buf.readInt8(offset + 3).int
+
+proc parseCbdtIndexSubTable(
+  buf: string,
+  strike: var BitmapStrike,
+  subTableOffset, cbdtOffset, firstGlyphIndex, lastGlyphIndex: int
+) =
+  buf.eofCheck(subTableOffset + 8)
+
+  let
+    indexFormat = buf.readUint16(subTableOffset + 0).swap()
+    imageFormat = buf.readUint16(subTableOffset + 2).swap()
+    imageDataOffset = buf.readUint32(subTableOffset + 4).swap().int
+
+  if imageFormat notin [17.uint16, 18, 19]:
+    # Only the PNG image formats are supported, skip anything else.
+    return
+
+  let numGlyphsInRange = lastGlyphIndex - firstGlyphIndex + 1
+
+  case indexFormat:
+  of 1, 3: # Offsets array, uint32 or uint16
+    let entrySize = if indexFormat == 1: 4 else: 2
+    var i = subTableOffset + 8
+    buf.eofCheck(i + (numGlyphsInRange + 1) * entrySize)
+    for j in 0 ..< numGlyphsInRange:
+      let (o1, o2) =
+        if indexFormat == 1:
+          (buf.readUint32(i + j * 4).swap().int,
+           buf.readUint32(i + j * 4 + 4).swap().int)
+        else:
+          (buf.readUint16(i + j * 2).swap().int,
+           buf.readUint16(i + j * 2 + 2).swap().int)
+      if o2 > o1:
+        strike.glyphs[(firstGlyphIndex + j).uint16] = BitmapGlyphRecord(
+          imageFormat: imageFormat,
+          dataOffset: cbdtOffset + imageDataOffset + o1,
+          dataLen: o2 - o1
+        )
+  of 2: # All glyphs have the same data size and metrics
+    buf.eofCheck(subTableOffset + 12)
+    let imageSize = buf.readUint32(subTableOffset + 8).swap().int
+    var record = BitmapGlyphRecord(imageFormat: imageFormat, dataLen: imageSize)
+    buf.readBigMetrics(subTableOffset + 12, record)
+    for j in 0 ..< numGlyphsInRange:
+      record.dataOffset = cbdtOffset + imageDataOffset + j * imageSize
+      strike.glyphs[(firstGlyphIndex + j).uint16] = record
+  of 4: # Sparse glyph id and offset pairs
+    buf.eofCheck(subTableOffset + 12)
+    let numGlyphs = buf.readUint32(subTableOffset + 8).swap().int
+    var i = subTableOffset + 12
+    buf.eofCheck(i + (numGlyphs + 1) * 4)
+    for j in 0 ..< numGlyphs:
+      let
+        glyphId = buf.readUint16(i + j * 4).swap()
+        o1 = buf.readUint16(i + j * 4 + 2).swap().int
+        o2 = buf.readUint16(i + j * 4 + 6).swap().int
+      if o2 > o1:
+        strike.glyphs[glyphId] = BitmapGlyphRecord(
+          imageFormat: imageFormat,
+          dataOffset: cbdtOffset + imageDataOffset + o1,
+          dataLen: o2 - o1
+        )
+  of 5: # Sparse glyph ids, same data size and metrics
+    buf.eofCheck(subTableOffset + 24)
+    let imageSize = buf.readUint32(subTableOffset + 8).swap().int
+    var record = BitmapGlyphRecord(imageFormat: imageFormat, dataLen: imageSize)
+    buf.readBigMetrics(subTableOffset + 12, record)
+    let numGlyphs = buf.readUint32(subTableOffset + 20).swap().int
+    var i = subTableOffset + 24
+    buf.eofCheck(i + numGlyphs * 2)
+    for j in 0 ..< numGlyphs:
+      record.dataOffset = cbdtOffset + imageDataOffset + j * imageSize
+      strike.glyphs[buf.readUint16(i + j * 2).swap()] = record
+  else:
+    discard
+
+proc parseCblcTable(buf: string, cblcOffset, cbdtOffset: int): CblcTable =
+  ## https://learn.microsoft.com/en-us/typography/opentype/spec/cblc
+  buf.eofCheck(cblcOffset + 8)
+
+  let numSizes = buf.readUint32(cblcOffset + 4).swap().int
+
+  result = CblcTable()
+
+  var sizeOffset = cblcOffset + 8
+  buf.eofCheck(sizeOffset + numSizes * 48)
+
+  for s in 0 ..< numSizes:
+    let
+      indexSubTableArrayOffset = buf.readUint32(sizeOffset + 0).swap().int
+      numberOfIndexSubTables = buf.readUint32(sizeOffset + 8).swap().int
+      ppemX = buf.readUint8(sizeOffset + 44).int
+
+    var strike = BitmapStrike(ppem: ppemX)
+
+    var arrayOffset = cblcOffset + indexSubTableArrayOffset
+    buf.eofCheck(arrayOffset + numberOfIndexSubTables * 8)
+    for t in 0 ..< numberOfIndexSubTables:
+      let
+        firstGlyphIndex = buf.readUint16(arrayOffset + 0).swap().int
+        lastGlyphIndex = buf.readUint16(arrayOffset + 2).swap().int
+        additionalOffset = buf.readUint32(arrayOffset + 4).swap().int
+      if lastGlyphIndex >= firstGlyphIndex:
+        buf.parseCbdtIndexSubTable(
+          strike,
+          cblcOffset + indexSubTableArrayOffset + additionalOffset,
+          cbdtOffset,
+          firstGlyphIndex,
+          lastGlyphIndex
+        )
+      arrayOffset += 8
+
+    if strike.glyphs.len > 0:
+      result.strikes.add(strike)
+
+    sizeOffset += 48
+
+proc parseSbixTable(buf: string, offset, numGlyphs: int): SbixTable =
+  ## https://learn.microsoft.com/en-us/typography/opentype/spec/sbix
+  buf.eofCheck(offset + 8)
+
+  let numStrikes = buf.readUint32(offset + 4).swap().int
+
+  result = SbixTable()
+
+  buf.eofCheck(offset + 8 + numStrikes * 4)
+
+  for s in 0 ..< numStrikes:
+    let strikeOffset =
+      offset + buf.readUint32(offset + 8 + s * 4).swap().int
+    buf.eofCheck(strikeOffset + 4 + (numGlyphs + 1) * 4)
+    var strike = SbixStrike(
+      ppem: buf.readUint16(strikeOffset + 0).swap().int,
+      offset: strikeOffset
+    )
+    strike.glyphDataOffsets = newSeq[uint32](numGlyphs + 1)
+    for j in 0 .. numGlyphs:
+      strike.glyphDataOffsets[j] = buf.readUint32(strikeOffset + 4 + j * 4).swap()
+    result.strikes.add(strike)
+
 proc getGlyphId(opentype: OpenType, rune: Rune): uint16 =
   result = opentype.cmap.runeToGlyphId.getOrDefault(rune, 0)
 
@@ -2456,13 +2737,19 @@ proc parseCffGlyph(opentype: OpenType, glyphId: uint16): Path =
     charstring = opentype.buf[a ..< b]
   return cff.parseCFFCharstring(charstring, glyphId.int)
 
-proc parseGlyph(opentype: OpenType, rune: Rune): Path {.inline.} =
+proc parseGlyphById(opentype: OpenType, glyphId: uint16): Path =
   if opentype.glyf != nil:
-    opentype.parseGlyfGlyph(opentype.getGlyphId(rune))
+    opentype.parseGlyfGlyph(glyphId)
   elif opentype.cff != nil:
-    opentype.parseCffGlyph(opentype.getGlyphId(rune))
+    opentype.parseCffGlyph(glyphId)
+  elif opentype.cblc != nil or opentype.sbix != nil:
+    # Bitmap-only fonts have no glyph outlines.
+    newPath()
   else:
     raise newException(PixieError, "Invalid glyph storage")
+
+proc parseGlyph(opentype: OpenType, rune: Rune): Path {.inline.} =
+  opentype.parseGlyphById(opentype.getGlyphId(rune))
 
 proc getGlyphPath*(
   opentype: OpenType, rune: Rune
@@ -2472,6 +2759,177 @@ proc getGlyphPath*(
     path.transform(scale(vec2(1, -1)))
     opentype.glyphPaths[rune] = path
   opentype.glyphPaths.getOrDefault(rune, nil) # Never actually returns nil
+
+proc getColorGlyphLayers*(
+  opentype: OpenType, rune: Rune
+): seq[ColorGlyphLayer] {.raises: [PixieError].} =
+  ## The COLR color layers for the rune, or an empty seq if the rune has no
+  ## layered color glyph. Layer paths are in font units, y-flipped like
+  ## getGlyphPath.
+  if opentype.colr == nil or opentype.cpal == nil or
+    opentype.cpal.palettes.len == 0:
+    return
+  if rune in opentype.colorGlyphLayers:
+    return opentype.colorGlyphLayers.getOrDefault(rune, @[])
+
+  let glyphId = opentype.getGlyphId(rune)
+  if glyphId in opentype.colr.baseGlyphs:
+    let palette = opentype.cpal.palettes[0]
+    for colrLayer in opentype.colr.baseGlyphs.getOrDefault(glyphId, @[]):
+      var layer = ColorGlyphLayer()
+      if colrLayer.paletteIndex == 0xFFFF:
+        layer.useTextColor = true
+      elif colrLayer.paletteIndex.int < palette.len:
+        layer.color = palette[colrLayer.paletteIndex.int]
+      else:
+        continue
+      layer.path = opentype.parseGlyphById(colrLayer.glyphId)
+      layer.path.transform(scale(vec2(1, -1)))
+      result.add(layer)
+
+  opentype.colorGlyphLayers[rune] = result
+
+proc sbixGlyph(
+  opentype: OpenType,
+  strike: SbixStrike,
+  glyphId: uint16,
+  bitmap: var BitmapGlyph,
+  recursionDepth = 0
+): bool =
+  ## Reads a glyph record from an sbix strike, following "dupe" records.
+  if glyphId.int + 1 >= strike.glyphDataOffsets.len:
+    return false
+  let
+    o1 = strike.glyphDataOffsets[glyphId].int
+    o2 = strike.glyphDataOffsets[glyphId + 1].int
+  if o2 - o1 <= 8: # No glyph data, header alone is 8 bytes
+    return false
+
+  let dataOffset = strike.offset + o1
+  opentype.buf.eofCheck(strike.offset + o2)
+
+  let graphicType = opentype.buf.readStr(dataOffset + 4, 4)
+  if graphicType == "dupe":
+    if recursionDepth > 4 or o2 - o1 < 10:
+      return false
+    let dupeGlyphId = opentype.buf.readUint16(dataOffset + 8).swap()
+    return opentype.sbixGlyph(strike, dupeGlyphId, bitmap, recursionDepth + 1)
+  if graphicType != "png ":
+    return false
+
+  bitmap.png = opentype.buf[dataOffset + 8 ..< strike.offset + o2]
+  bitmap.ppem = strike.ppem.float32
+  bitmap.xOffset = opentype.buf.readInt16(dataOffset + 0).swap().float32
+  bitmap.yOffset = opentype.buf.readInt16(dataOffset + 2).swap().float32
+  bitmap.yOffsetIsBottom = true
+  true
+
+proc getBitmapGlyph*(
+  opentype: OpenType, rune: Rune, sizePx: float32, bitmap: var BitmapGlyph
+): bool {.raises: [PixieError].} =
+  ## Looks up an embedded color bitmap (PNG) glyph for the rune, picking the
+  ## best strike for the target pixel size. Returns false if the rune has no
+  ## bitmap glyph.
+  if rune notin opentype.cmap.runeToGlyphId:
+    return false
+  let glyphId = opentype.getGlyphId(rune)
+
+  if opentype.cblc != nil:
+    # Pick the smallest strike >= sizePx, otherwise the largest one.
+    var best = -1
+    for i, strike in opentype.cblc.strikes:
+      if glyphId notin strike.glyphs:
+        continue
+      if best == -1:
+        best = i
+        continue
+      let bestPpem = opentype.cblc.strikes[best].ppem
+      if bestPpem.float32 < sizePx:
+        if strike.ppem > bestPpem:
+          best = i
+      elif strike.ppem.float32 >= sizePx and strike.ppem < bestPpem:
+        best = i
+    if best >= 0:
+      let
+        strike = opentype.cblc.strikes[best]
+        record = strike.glyphs.getOrDefault(glyphId, BitmapGlyphRecord())
+      var
+        pngOffset: int
+        pngLen: int
+      case record.imageFormat:
+      of 17: # Small glyph metrics, then PNG data
+        opentype.buf.eofCheck(record.dataOffset + 9)
+        bitmap.xOffset = opentype.buf.readInt8(record.dataOffset + 2).float32
+        bitmap.yOffset = opentype.buf.readInt8(record.dataOffset + 3).float32
+        pngLen = opentype.buf.readUint32(record.dataOffset + 5).swap().int
+        pngOffset = record.dataOffset + 9
+      of 18: # Big glyph metrics, then PNG data
+        opentype.buf.eofCheck(record.dataOffset + 12)
+        bitmap.xOffset = opentype.buf.readInt8(record.dataOffset + 2).float32
+        bitmap.yOffset = opentype.buf.readInt8(record.dataOffset + 3).float32
+        pngLen = opentype.buf.readUint32(record.dataOffset + 8).swap().int
+        pngOffset = record.dataOffset + 12
+      of 19: # Metrics in the CBLC index subtable, only PNG data here
+        if not record.hasBigMetrics:
+          return false
+        opentype.buf.eofCheck(record.dataOffset + 4)
+        bitmap.xOffset = record.bearingX.float32
+        bitmap.yOffset = record.bearingY.float32
+        pngLen = opentype.buf.readUint32(record.dataOffset + 0).swap().int
+        pngOffset = record.dataOffset + 4
+      else:
+        return false
+      opentype.buf.eofCheck(pngOffset + pngLen)
+      bitmap.png = opentype.buf[pngOffset ..< pngOffset + pngLen]
+      bitmap.ppem = strike.ppem.float32
+      bitmap.yOffsetIsBottom = false
+      return true
+
+  if opentype.sbix != nil:
+    var best = -1
+    for i, strike in opentype.sbix.strikes:
+      var candidate: BitmapGlyph
+      if not opentype.sbixGlyph(strike, glyphId, candidate):
+        continue
+      if best == -1:
+        best = i
+        continue
+      let bestPpem = opentype.sbix.strikes[best].ppem
+      if bestPpem.float32 < sizePx:
+        if strike.ppem > bestPpem:
+          best = i
+      elif strike.ppem.float32 >= sizePx and strike.ppem < bestPpem:
+        best = i
+    if best >= 0:
+      return opentype.sbixGlyph(opentype.sbix.strikes[best], glyphId, bitmap)
+
+  false
+
+proc hasColorGlyph*(opentype: OpenType, rune: Rune): bool {.raises: [].} =
+  ## Returns true if the rune has a color (emoji) glyph.
+  if rune notin opentype.cmap.runeToGlyphId:
+    return false
+  let glyphId = opentype.getGlyphId(rune)
+
+  if opentype.colr != nil and opentype.cpal != nil and
+    opentype.cpal.palettes.len > 0 and glyphId in opentype.colr.baseGlyphs:
+    return true
+
+  if opentype.cblc != nil:
+    for strike in opentype.cblc.strikes:
+      if glyphId in strike.glyphs:
+        return true
+
+  if opentype.sbix != nil:
+    for strike in opentype.sbix.strikes:
+      if glyphId.int + 1 < strike.glyphDataOffsets.len:
+        let
+          o1 = strike.glyphDataOffsets[glyphId].int
+          o2 = strike.glyphDataOffsets[glyphId + 1].int
+        if o2 - o1 > 8:
+          return true
+
+  false
 
 proc getLeftSideBearing*(opentype: OpenType, rune: Rune): float32 {.raises: [].} =
   let glyphId = opentype.getGlyphId(rune).int
@@ -2577,6 +3035,22 @@ proc parseOpenType*(buf: string, startLoc = 0): OpenType {.raises: [PixieError].
     result.name = parseNameTable(buf, result.tableRecords["name"].offset.int)
     result.os2 = parseOS2Table(buf, result.tableRecords["OS/2"].offset.int)
 
+    if "COLR" in result.tableRecords and "CPAL" in result.tableRecords:
+      result.colr = parseColrTable(buf, result.tableRecords["COLR"].offset.int)
+      result.cpal = parseCpalTable(buf, result.tableRecords["CPAL"].offset.int)
+
+    if "CBLC" in result.tableRecords and "CBDT" in result.tableRecords:
+      result.cblc = parseCblcTable(
+        buf,
+        result.tableRecords["CBLC"].offset.int,
+        result.tableRecords["CBDT"].offset.int
+      )
+
+    if "sbix" in result.tableRecords:
+      result.sbix = parseSbixTable(
+        buf, result.tableRecords["sbix"].offset.int, result.maxp.numGlyphs.int
+      )
+
     if "loca" in result.tableRecords and "glyf" in result.tableRecords:
       result.loca = parseLocaTable(
         buf, result.tableRecords["loca"].offset.int, result.head, result.maxp
@@ -2586,7 +3060,8 @@ proc parseOpenType*(buf: string, startLoc = 0): OpenType {.raises: [PixieError].
     elif "CFF " in result.tableRecords:
       result.cff = parseCFFTable(buf, result.tableRecords["CFF "].offset.int, result.maxp)
 
-    else:
+    elif result.cblc == nil and result.sbix == nil:
+      # Bitmap-only color fonts (e.g. Noto Color Emoji) have no outlines.
       failUnsupported("glyph outlines")
 
     if "kern" in result.tableRecords:

@@ -1,4 +1,4 @@
-import bumpy, chroma, common, os, fontformats/opentype,
+import bumpy, chroma, common, os, fileformats/png, fontformats/opentype,
     fontformats/svgfont, images, paints, paths,
     strutils, unicode, vmath
 
@@ -13,6 +13,7 @@ type
     svgFont: SvgFont
     filePath*: string
     fallbacks*: seq[Typeface]
+    bitmapGlyphCache: Table[(Rune, int), Image] ## (rune, ppem) -> decoded PNG
 
   Font* = ref object
     typeface*: Typeface
@@ -117,6 +118,10 @@ proc hasGlyph*(typeface: Typeface, rune: Rune): bool {.inline.} =
     typeface.opentype.hasGlyph(rune)
   else:
     typeface.svgFont.hasGlyph(rune)
+
+proc hasColorGlyph*(typeface: Typeface, rune: Rune): bool {.inline, raises: [].} =
+  ## Returns if there is a color (emoji) glyph for this rune.
+  typeface.opentype != nil and typeface.opentype.hasColorGlyph(rune)
 
 proc fallbackTypeface*(typeface: Typeface, rune: Rune): Typeface =
   ## Looks through fallback typefaces to find one that has the glyph.
@@ -253,6 +258,13 @@ proc convertTextCase(runes: var seq[Rune], textCase: TextCase) =
 proc canWrap(rune: Rune): bool {.inline.} =
   rune == Rune(32) or rune.isWhiteSpace()
 
+proc isFormatRune(rune: Rune): bool {.inline.} =
+  ## Zero-width format runes that should not produce a glyph: zero-width
+  ## joiner and variation selectors (commonly used in emoji sequences).
+  rune.uint32 == 0x200D or
+  rune.uint32 in 0xFE00.uint32 .. 0xFE0F.uint32 or
+  rune.uint32 in 0xE0100.uint32 .. 0xE01EF.uint32
+
 proc typeset*(
   spans: openarray[Span],
   bounds = vec2(0, 0),
@@ -278,8 +290,11 @@ proc typeset*(
         runes: seq[Rune]
       while i < span.text.len:
         fastRuneAt(span.text, i, rune, true)
-        # Ignore control runes (0 - 31) except LF for now
-        if rune.uint32 >= SP.uint32 or rune.uint32 == LF.uint32:
+        # Ignore control runes (0 - 31) except LF for now.
+        # Also ignore zero-width format runes (ZWJ, variation selectors) so
+        # emoji sequences degrade gracefully into their individual emoji.
+        if (rune.uint32 >= SP.uint32 or rune.uint32 == LF.uint32) and
+          not rune.isFormatRune():
           runes.add(rune)
 
       if runes.len > 0:
@@ -529,8 +544,15 @@ proc computePaths(arrangement: Arrangement): seq[Path] =
       strikeoutPosition = font.typeface.strikeoutPosition * font.scale
     for runeIndex in start .. stop:
       let
+        rune = arrangement.runes[runeIndex]
         position = arrangement.positions[runeIndex]
-        path = font.typeface.getGlyphPath(arrangement.runes[runeIndex])
+        runeTypeface = font.typeface.fallbackTypeface(rune)
+        path =
+          if runeTypeface != nil and runeTypeface.hasColorGlyph(rune):
+            # Color glyphs are drawn separately, see drawColorGlyphs.
+            newPath()
+          else:
+            font.typeface.getGlyphPath(rune)
       path.transform(
         translate(position) *
         scale(vec2(font.scale))
@@ -563,6 +585,63 @@ proc computePaths(arrangement: Arrangement): seq[Path] =
       spanPath.addPath(path)
     result.add(spanPath)
 
+proc drawColorGlyphs(
+  target: Image,
+  arrangement: Arrangement,
+  spanIndex: int,
+  transform: Mat3
+) {.raises: [PixieError].} =
+  ## Draws the color (emoji) glyphs of a span onto the target image.
+  let
+    font = arrangement.fonts[spanIndex]
+    (start, stop) = arrangement.spans[spanIndex]
+  for runeIndex in start .. stop:
+    let
+      rune = arrangement.runes[runeIndex]
+      typeface = font.typeface.fallbackTypeface(rune)
+    if typeface == nil or not typeface.hasColorGlyph(rune):
+      continue
+
+    let
+      position = arrangement.positions[runeIndex]
+      opentype = typeface.opentype
+
+    let layers = opentype.getColorGlyphLayers(rune)
+    if layers.len > 0:
+      # COLR layered vector glyph.
+      let layerScale = font.size / typeface.scale
+      for layer in layers:
+        let path = newPath()
+        path.addPath(layer.path)
+        path.transform(translate(position) * scale(vec2(layerScale)))
+        let paint = newPaint(SolidPaint)
+        paint.color =
+          if layer.useTextColor:
+            font.paint.color
+          else:
+            layer.color.color
+        target.fillPath(path, paint, transform)
+      continue
+
+    # Embedded PNG bitmap glyph (CBDT or sbix).
+    var bitmap: BitmapGlyph
+    if opentype.getBitmapGlyph(rune, font.size, bitmap):
+      let key = (rune, bitmap.ppem.int)
+      if key notin typeface.bitmapGlyphCache:
+        typeface.bitmapGlyphCache[key] = newImage(decodePng(bitmap.png))
+      let
+        image = typeface.bitmapGlyphCache.getOrDefault(key, nil)
+        bitmapScale = font.size / bitmap.ppem
+        top =
+          if bitmap.yOffsetIsBottom:
+            bitmap.yOffset + image.height.float32
+          else:
+            bitmap.yOffset
+        offset = position + vec2(bitmap.xOffset, -top) * bitmapScale
+      target.draw(
+        image, transform * translate(offset) * scale(vec2(bitmapScale))
+      )
+
 proc textUber(
   target: Image,
   arrangement: Arrangement,
@@ -594,6 +673,7 @@ proc textUber(
       let font = arrangement.fonts[spanIndex]
       for paint in font.paints:
         target.fillPath(path, paint, transform)
+      target.drawColorGlyphs(arrangement, spanIndex, transform)
 
 proc computeBounds*(
   arrangement: Arrangement,
