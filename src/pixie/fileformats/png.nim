@@ -610,6 +610,40 @@ proc convertToImage*(png: Png): Image {.raises: [].} =
     for i, color in png.data16:
       result.data[i] = color.toRgba.rgbx()
 
+proc validateScaledPngTarget(width, height: int) {.raises: [PixieError].} =
+  if width <= 0 or width > int32.high.int:
+    raise newException(PixieError, "Invalid PNG target width")
+  if height <= 0 or height > int32.high.int:
+    raise newException(PixieError, "Invalid PNG target height")
+
+proc validateScaledPngTarget(target: Image) {.raises: [PixieError].} =
+  if target.isNil:
+    raise newException(PixieError, "Invalid PNG target Image")
+  validateScaledPngTarget(target.width, target.height)
+
+proc fillImage*(png: Png, target: Image) {.raises: [PixieError].} =
+  ## Scales a decoded PNG into an existing Image.
+  validateScaledPngTarget(target)
+
+  if png.data.len > 0:
+    for y in 0 ..< target.height:
+      let srcY = min((y * png.height) div target.height, png.height - 1)
+      for x in 0 ..< target.width:
+        let srcX = min((x * png.width) div target.width, png.width - 1)
+        target.unsafe[x, y] = png.data[srcX + srcY * png.width].rgbx()
+  else:
+    for y in 0 ..< target.height:
+      let srcY = min((y * png.height) div target.height, png.height - 1)
+      for x in 0 ..< target.width:
+        let srcX = min((x * png.width) div target.width, png.width - 1)
+        target.unsafe[x, y] = png.data16[srcX + srcY * png.width].toRgba.rgbx()
+
+proc convertToImage*(png: Png, width, height: int): Image {.raises: [PixieError].} =
+  ## Converts a PNG into an Image scaled to the requested dimensions.
+  validateScaledPngTarget(width, height)
+  result = newImage(width, height)
+  png.fillImage(result)
+
 proc decodePngDimensions*(
   data: pointer, len: int
 ): ImageDimensions {.raises: [PixieError].} =
@@ -757,6 +791,56 @@ proc decodePng*(data: pointer, len: int): Png {.raises: [PixieError].} =
 proc decodePng*(data: string): Png {.inline, raises: [PixieError].} =
   ## Decodes the PNG data.
   decodePng(data.cstring, data.len)
+
+proc decodePngScaled*(
+  data: pointer, len, width, height: int
+): Image {.raises: [PixieError].} =
+  ## Decodes the PNG data into an Image scaled to the requested dimensions.
+  decodePng(data, len).convertToImage(width, height)
+
+proc decodePngScaledInto*(
+  data: pointer, len: int, target: Image
+) {.raises: [PixieError].} =
+  ## Decodes the PNG data into an existing Image.
+  decodePng(data, len).fillImage(target)
+
+proc decodePngScaled*(
+  data: string, width, height: int
+): Image {.inline, raises: [PixieError].} =
+  ## Decodes the PNG data into an Image scaled to the requested dimensions.
+  decodePngScaled(data.cstring, data.len, width, height)
+
+proc decodePngScaledInto*(
+  data: string, target: Image
+) {.inline, raises: [PixieError].} =
+  ## Decodes the PNG data into an existing Image.
+  decodePngScaledInto(data.cstring, data.len, target)
+
+proc decodePngScaled*(
+  data: var string, width, height: int
+): Image {.raises: [PixieError].} =
+  ## Decodes the PNG data into a scaled Image and releases the source string
+  ## before allocating the target Image.
+  let png = decodePng(data.cstring, data.len)
+  data = ""
+  try:
+    GC_fullCollect()
+  except Exception:
+    discard
+  png.convertToImage(width, height)
+
+proc decodePngScaledInto*(
+  data: var string, target: Image
+) {.raises: [PixieError].} =
+  ## Decodes the PNG data into an existing Image and releases the source string
+  ## after PNG parsing.
+  let png = decodePng(data.cstring, data.len)
+  data = ""
+  try:
+    GC_fullCollect()
+  except Exception:
+    discard
+  png.fillImage(target)
 
 proc encodePng*(
   width, height, channels: int, data: pointer, len: int

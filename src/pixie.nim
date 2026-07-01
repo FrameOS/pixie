@@ -78,6 +78,135 @@ proc decodeImage*(data: string): Image {.raises: [PixieError].} =
   else:
     raise newException(PixieError, "Unsupported image file format")
 
+proc validateScaledImageTarget(width, height: int) {.raises: [PixieError].} =
+  if width <= 0 or width > int32.high.int:
+    raise newException(PixieError, "Invalid target width")
+  if height <= 0 or height > int32.high.int:
+    raise newException(PixieError, "Invalid target height")
+
+proc validateScaledImageTarget(target: Image) {.raises: [PixieError].} =
+  if target.isNil:
+    raise newException(PixieError, "Invalid target Image")
+  validateScaledImageTarget(target.width, target.height)
+
+proc copyIntoTarget(target, source: Image) {.raises: [PixieError].} =
+  if target.width != source.width or target.height != source.height:
+    raise newException(PixieError, "Image dimensions do not match target")
+  if target.data.len > 0:
+    copyMem(
+      target.data[0].addr,
+      source.data[0].unsafeAddr,
+      target.data.len * sizeof(ColorRGBX)
+    )
+
+proc decodeImageScaled*(
+  data: string, width, height: int
+): Image {.raises: [PixieError].}
+
+proc decodeImageScaled*(
+  data: var string, width, height: int
+): Image {.raises: [PixieError].}
+
+proc decodeImageScaledInto*(
+  data: var string, target: Image
+): Image {.raises: [PixieError].}
+
+proc decodeImageScaled*(
+  data: pointer, len, width, height: int
+): Image {.raises: [PixieError].} =
+  ## Loads an image from memory scaled to the requested dimensions.
+  validateScaledImageTarget(width, height)
+  if len > 8 and equalMem(data, pngSignature[0].unsafeAddr, 8):
+    decodePngScaled(data, len, width, height)
+  elif len > 2 and equalMem(data, jpegStartOfImage[0].unsafeAddr, 2):
+    decodeJpegScaled(data, len, width, height)
+  else:
+    var copy = newString(len)
+    if len > 0:
+      copyMem(addr copy[0], data, len)
+    decodeImageScaled(copy, width, height)
+
+proc decodeImageScaled*(
+  data: string, width, height: int
+): Image {.raises: [PixieError].} =
+  ## Loads an image from memory scaled to the requested dimensions.
+  validateScaledImageTarget(width, height)
+  if data.len > 8 and data.readUint64(0) == cast[uint64](pngSignature):
+    decodePngScaled(data, width, height)
+  elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
+    decodeJpegScaled(data, width, height)
+  else:
+    let image = decodeImage(data)
+    if image.width == width and image.height == height:
+      image
+    else:
+      image.resize(width, height)
+
+proc decodeImageScaled*(
+  data: var string, width, height: int
+): Image {.raises: [PixieError].} =
+  ## Loads an image from memory scaled to the requested dimensions. JPEG
+  ## releases the source buffer before allocating the destination; PNG releases
+  ## it after parsing because the PNG stream must be inflated first.
+  validateScaledImageTarget(width, height)
+  if data.len > 8 and data.readUint64(0) == cast[uint64](pngSignature):
+    decodePngScaled(data, width, height)
+  elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
+    decodeJpegScaled(data, width, height)
+  else:
+    let image = decodeImage(data)
+    data = ""
+    try:
+      GC_fullCollect()
+    except Exception:
+      discard
+    if image.width == width and image.height == height:
+      image
+    else:
+      image.resize(width, height)
+
+proc decodeImageScaledInto*(
+  data: pointer, len: int, target: Image
+): Image {.raises: [PixieError].} =
+  ## Loads an image from memory scaled into an existing target Image.
+  validateScaledImageTarget(target)
+  if len > 8 and equalMem(data, pngSignature[0].unsafeAddr, 8):
+    decodePngScaledInto(data, len, target)
+  elif len > 2 and equalMem(data, jpegStartOfImage[0].unsafeAddr, 2):
+    decodeJpegScaledInto(data, len, target)
+  else:
+    var copy = newString(len)
+    if len > 0:
+      copyMem(addr copy[0], data, len)
+    discard decodeImageScaledInto(copy, target)
+  target
+
+proc decodeImageScaledInto*(
+  data: string, target: Image
+): Image {.raises: [PixieError].} =
+  ## Loads an image from memory scaled into an existing target Image.
+  validateScaledImageTarget(target)
+  if data.len > 8 and data.readUint64(0) == cast[uint64](pngSignature):
+    decodePngScaledInto(data, target)
+  elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
+    decodeJpegScaledInto(data, target)
+  else:
+    target.copyIntoTarget(decodeImageScaled(data, target.width, target.height))
+  target
+
+proc decodeImageScaledInto*(
+  data: var string, target: Image
+): Image {.raises: [PixieError].} =
+  ## Loads an image from memory scaled into an existing target Image.
+  validateScaledImageTarget(target)
+  if data.len > 8 and data.readUint64(0) == cast[uint64](pngSignature):
+    decodePngScaledInto(data, target)
+  elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
+    decodeJpegScaledInto(data, target)
+  else:
+    target.copyIntoTarget(decodeImageScaled(data, target.width, target.height))
+  target
+
 proc readImageDimensions*(
   filePath: string
 ): ImageDimensions {.inline, raises: [PixieError].} =
@@ -91,6 +220,16 @@ proc readImage*(filePath: string): Image {.inline, raises: [PixieError].} =
   ## Loads an image from a file.
   try:
     decodeImage(readFile(filePath))
+  except IOError as e:
+    raise newException(PixieError, e.msg, e)
+
+proc readImageScaled*(
+  filePath: string, width, height: int
+): Image {.inline, raises: [PixieError].} =
+  ## Loads an image from a file scaled to the requested dimensions.
+  try:
+    var data = readFile(filePath)
+    decodeImageScaled(data, width, height)
   except IOError as e:
     raise newException(PixieError, e.msg, e)
 

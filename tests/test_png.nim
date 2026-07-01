@@ -30,6 +30,29 @@ block:
   doAssert image16.height == png16.height
 
 block:
+  let source = newImage(16, 8)
+  let encoded = source.encodePng()
+
+  var scaledData = encoded
+  let scaled = decodePngScaled(scaledData, 4, 2)
+  doAssert scaled.width == 4
+  doAssert scaled.height == 2
+  doAssert scaledData.len == 0
+
+  var genericData = encoded
+  let generic = decodeImageScaled(genericData, 5, 3)
+  doAssert generic.width == 5
+  doAssert generic.height == 3
+  doAssert genericData.len == 0
+
+  var targetData = encoded
+  let target = newImage(3, 2)
+  doAssert decodeImageScaledInto(targetData, target) == target
+  doAssert target.width == 3
+  doAssert target.height == 2
+  doAssert targetData.len == 0
+
+block:
   for channels in 1 .. 4:
     var data: seq[uint8]
     for x in 0 ..< 16:
