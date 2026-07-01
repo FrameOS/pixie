@@ -66,6 +66,7 @@ type
     yScale, xScale: int
     width, height: int
     widthStride, heightStride: int
+    sampleWidth, sampleHeight: int
     huffmanDC, huffmanAC: int
     dcPred: int
     widthCoeff, heightCoeff: int
@@ -97,6 +98,7 @@ type
     eobRun: int
     hitEnd: bool
     streamBaselineBlocks: bool
+    scaledTargetWidth, scaledTargetHeight: int
 
   Mask = ref object
     ## Mask object that holds mask opacity data.
@@ -141,6 +143,15 @@ template `[]=`(view: UnsafeMask, x, y: int, color: uint8) =
 template failInvalid(reason = "unable to load") =
   ## Throw exception with a reason.
   raise newException(PixieError, "Invalid JPEG, " & reason)
+
+proc scaledCeil(value, scale, divisor: int): int {.inline.} =
+  ((value.int64 * scale.int64 + divisor.int64 - 1) div divisor.int64).int
+
+proc useScaledChannels(state: DecoderState): bool {.inline.} =
+  state.streamBaselineBlocks and
+    not state.progressive and
+    state.scaledTargetWidth > 0 and
+    state.scaledTargetHeight > 0
 
 proc clampByte(x: int32): uint8 {.inline.} =
   ## Clamp integer into byte range.
@@ -444,29 +455,55 @@ proc decodeSOF0(state: var DecoderState) =
 
     component.widthStride = state.numMcuWide * component.yScale * 8
     component.heightStride = state.numMcuHigh * component.xScale * 8
+    component.sampleWidth = component.width
+    component.sampleHeight = component.height
+
+    var
+      channelWidth = component.widthStride
+      channelHeight = component.heightStride
+    if state.useScaledChannels():
+      let
+        targetWidth =
+          if state.orientation in {5, 6, 7, 8}: state.scaledTargetHeight
+          else: state.scaledTargetWidth
+        targetHeight =
+          if state.orientation in {5, 6, 7, 8}: state.scaledTargetWidth
+          else: state.scaledTargetHeight
+      component.sampleWidth = max(1,
+        (targetWidth * component.yScale + state.maxYScale - 1) div state.maxYScale
+      )
+      component.sampleHeight = max(1,
+        (targetHeight * component.xScale + state.maxXScale - 1) div state.maxXScale
+      )
+      channelWidth = component.sampleWidth
+      channelHeight = component.sampleHeight
 
     when defined(frameosEmbedded):
       let
         blockColumns = state.numMcuWide * component.yScale
         blockRows = state.numMcuHigh * component.xScale
         blockBytes = blockColumns.int64 * blockRows.int64 * 64'i64 * sizeof(int16).int64
-        maskBytes = component.widthStride.int64 * component.heightStride.int64
+        sourceMaskBytes = component.widthStride.int64 * component.heightStride.int64
+        channelBytes = channelWidth.int64 * channelHeight.int64
+        maskBytes =
+          if state.useScaledChannels(): channelBytes
+          else: sourceMaskBytes
       totalBlockBytes += blockBytes
       totalMaskBytes += maskBytes
       if state.streamBaselineBlocks and not state.progressive:
-        if maskBytes > embeddedMaxStreamingComponentMaskBytes or
+        if channelBytes > embeddedMaxStreamingComponentMaskBytes or
             totalMaskBytes > embeddedMaxStreamingTotalMaskBytes:
           failInvalid(
-            "JPEG source dimensions need " & $(maskBytes div 1024) &
+            "JPEG scaled dimensions need " & $(channelBytes div 1024) &
             "K component and " & $(totalMaskBytes div 1024) &
             "K total channel buffers; too large for embedded streaming decode"
           )
       elif blockBytes > embeddedMaxComponentBlockBytes or
-          maskBytes > embeddedMaxComponentMaskBytes or
+          sourceMaskBytes > embeddedMaxComponentMaskBytes or
           totalBlockBytes + totalMaskBytes > embeddedMaxProgressiveTotalDecodeBytes:
         failInvalid(
           "JPEG source dimensions need " & $(blockBytes div 1024) &
-          "K block, " & $(maskBytes div 1024) &
+          "K block, " & $(sourceMaskBytes div 1024) &
           "K mask, and " & $((totalBlockBytes + totalMaskBytes) div 1024) &
           "K total decode buffers; too large for embedded decode"
         )
@@ -480,7 +517,7 @@ proc decodeSOF0(state: var DecoderState) =
         )
       )
 
-    component.channel = newMask(component.widthStride, component.heightStride)
+    component.channel = newMask(channelWidth, channelHeight)
 
     if state.progressive:
       component.widthCoeff = component.widthStride div 8
@@ -1005,8 +1042,8 @@ template idct1D(s0, s1, s2, s3, s4, s5, s6, s7: int32) =
 
 {.push overflowChecks: off, rangeChecks: off.}
 
-proc idctBlock(component: var Component, offset: int, data: array[64, int16]) =
-  ## Inverse discrete cosine transform whole block.
+proc idctBlockPixels(data: array[64, int16]): array[64, uint8] =
+  ## Inverse discrete cosine transform for one 8x8 block.
   var values: array[64, int32]
   for i in 0 ..< 8:
     if data[i + 8] == 0 and
@@ -1053,7 +1090,7 @@ proc idctBlock(component: var Component, offset: int, data: array[64, int16]) =
   for i in 0 ..< 8:
     let
       valuesPos = i * 8
-      outPos = i * component.widthStride + offset
+      outPos = i * 8
 
     var t0, t1, t2, t3, p1, p2, p3, p4, p5, x0, x1, x2, x3: int32
     idct1D(
@@ -1072,14 +1109,54 @@ proc idctBlock(component: var Component, offset: int, data: array[64, int16]) =
     x2 += 65536 + (128 shl 17)
     x3 += 65536 + (128 shl 17)
 
-    component.channel.data[outPos + 0] = clampByte((x0 + t3) shr 17)
-    component.channel.data[outPos + 7] = clampByte((x0 - t3) shr 17)
-    component.channel.data[outPos + 1] = clampByte((x1 + t2) shr 17)
-    component.channel.data[outPos + 6] = clampByte((x1 - t2) shr 17)
-    component.channel.data[outPos + 2] = clampByte((x2 + t1) shr 17)
-    component.channel.data[outPos + 5] = clampByte((x2 - t1) shr 17)
-    component.channel.data[outPos + 3] = clampByte((x3 + t0) shr 17)
-    component.channel.data[outPos + 4] = clampByte((x3 - t0) shr 17)
+    result[outPos + 0] = clampByte((x0 + t3) shr 17)
+    result[outPos + 7] = clampByte((x0 - t3) shr 17)
+    result[outPos + 1] = clampByte((x1 + t2) shr 17)
+    result[outPos + 6] = clampByte((x1 - t2) shr 17)
+    result[outPos + 2] = clampByte((x2 + t1) shr 17)
+    result[outPos + 5] = clampByte((x2 - t1) shr 17)
+    result[outPos + 3] = clampByte((x3 + t0) shr 17)
+    result[outPos + 4] = clampByte((x3 - t0) shr 17)
+
+proc idctBlock(component: var Component, offset: int, data: array[64, int16]) =
+  ## Inverse discrete cosine transform whole block into the source channel.
+  let pixels = idctBlockPixels(data)
+  for y in 0 ..< 8:
+    let
+      sourcePos = y * 8
+      outPos = y * component.widthStride + offset
+    for x in 0 ..< 8:
+      component.channel.data[outPos + x] = pixels[sourcePos + x]
+
+proc idctBlockScaled(component: var Component, row, column: int, data: array[64, int16]) =
+  ## Inverse discrete cosine transform whole block into a scaled channel.
+  let
+    pixels = idctBlockPixels(data)
+    sourceX0 = row * 8
+    sourceY0 = column * 8
+    sourceX1 = min(sourceX0 + 8, component.width)
+    sourceY1 = min(sourceY0 + 8, component.height)
+
+  if sourceX0 >= component.width or sourceY0 >= component.height:
+    return
+
+  let
+    targetX0 = scaledCeil(sourceX0, component.sampleWidth, component.width)
+    targetY0 = scaledCeil(sourceY0, component.sampleHeight, component.height)
+    targetX1 = min(component.sampleWidth, scaledCeil(sourceX1, component.sampleWidth, component.width))
+    targetY1 = min(component.sampleHeight, scaledCeil(sourceY1, component.sampleHeight, component.height))
+
+  for targetY in targetY0 ..< targetY1:
+    let
+      sourceY = min((targetY * component.height) div component.sampleHeight, component.height - 1)
+      localY = sourceY - sourceY0
+      sourcePos = localY * 8
+      outPos = targetY * component.channel.width
+    for targetX in targetX0 ..< targetX1:
+      let
+        sourceX = min((targetX * component.width) div component.sampleWidth, component.width - 1)
+        localX = sourceX - sourceX0
+      component.channel.data[outPos + targetX] = pixels[sourcePos + localX]
 
 {.pop.}
 
@@ -1106,10 +1183,13 @@ proc dequantizeAndIDCTBlock(
   state: var DecoderState, comp, row, column: int, data: var array[64, int16]
 ) =
   state.dequantizeBlock(comp, data)
-  state.components[comp].idctBlock(
-    state.components[comp].widthStride * column * 8 + row * 8,
-    data
-  )
+  if state.useScaledChannels():
+    state.components[comp].idctBlockScaled(row, column, data)
+  else:
+    state.components[comp].idctBlock(
+      state.components[comp].widthStride * column * 8 + row * 8,
+      data
+    )
 
 proc decodeRegularBlockIntoChannel(
   state: var DecoderState, comp, row, column: int
@@ -1336,8 +1416,14 @@ proc channelAt(
   sourceX, sourceY, sourceWidth, sourceHeight: int
 ): uint8 {.inline.} =
   let
-    x = min((sourceX * component.width) div sourceWidth, component.width - 1)
-    y = min((sourceY * component.height) div sourceHeight, component.height - 1)
+    sampleWidth =
+      if component.sampleWidth > 0: component.sampleWidth
+      else: component.width
+    sampleHeight =
+      if component.sampleHeight > 0: component.sampleHeight
+      else: component.height
+    x = min((sourceX * sampleWidth) div sourceWidth, sampleWidth - 1)
+    y = min((sourceY * sampleHeight) div sourceHeight, sampleHeight - 1)
   component.channel.data[component.channel.dataIndex(x, y)]
 
 proc fillImage(state: var DecoderState, result: Image) =
@@ -1482,12 +1568,18 @@ proc buildImage(state: var DecoderState): Image =
     failInvalid("invalid orientation")
 
 proc decodeJpegState(
-  data: pointer, len: int, streamBaselineBlocks = false
+  data: pointer,
+  len: int,
+  streamBaselineBlocks = false,
+  scaledTargetWidth = 0,
+  scaledTargetHeight = 0
 ): DecoderState {.raises: [PixieError].} =
   var state = DecoderState()
   state.buffer = cast[ptr UncheckedArray[uint8]](data)
   state.len = len
   state.streamBaselineBlocks = streamBaselineBlocks
+  state.scaledTargetWidth = scaledTargetWidth
+  state.scaledTargetHeight = scaledTargetHeight
 
   while true:
     if state.pos >= state.len and state.foundSOS:
@@ -1564,7 +1656,9 @@ proc decodeJpegScaled*(
   var state = decodeJpegState(
     data,
     len,
-    when defined(frameosEmbedded): true else: false
+    true,
+    width,
+    height
   )
   state.buildImage(width, height)
 
@@ -1577,7 +1671,9 @@ proc decodeJpegScaledInto*(
   var state = decodeJpegState(
     data,
     len,
-    when defined(frameosEmbedded): true else: false
+    true,
+    target.width,
+    target.height
   )
   state.fillImage(target)
 
@@ -1589,7 +1685,9 @@ proc decodeJpegScaled*(
   var state = decodeJpegState(
     data.cstring,
     data.len,
-    when defined(frameosEmbedded): true else: false
+    true,
+    width,
+    height
   )
   data = ""
   state.buildImage(width, height)
@@ -1604,7 +1702,9 @@ proc decodeJpegScaledInto*(
   var state = decodeJpegState(
     data.cstring,
     data.len,
-    when defined(frameosEmbedded): true else: false
+    true,
+    target.width,
+    target.height
   )
   data = ""
   state.fillImage(target)
