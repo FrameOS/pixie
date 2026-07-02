@@ -31,6 +31,12 @@ type
   ImageDimensions* = object
     width*, height*: int
 
+  ScaledDecodeFit* = enum
+    ## How a scaled decode maps the source onto the target image.
+    fitStretch ## fill the whole target, ignoring aspect ratio
+    fitCover   ## fill the whole target, cropping the source centered
+    fitContain ## fit the whole source centered, leaving target borders untouched
+
   Image* = ref object
     ## Image object that holds bitmap data in premultiplied alpha RGBA format.
     width*, height*: int

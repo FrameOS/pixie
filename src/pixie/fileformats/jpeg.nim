@@ -1,5 +1,5 @@
-import chroma, flatty/binny, ../common, ../images, ../simd, std/decls,
-  std/sequtils, std/strutils
+import chroma, flatty/binny, ../common, ../decodebudget, ../images, ../simd,
+  std/decls, std/math, std/sequtils, std/strutils
 
 # This JPEG decoder is loosely based on stb_image which is public domain.
 
@@ -40,14 +40,8 @@ const
   ]
   maxMarkerResync = 64
   maxRestartResync = 8192
-
-when defined(frameosEmbedded):
-  const
-    embeddedMaxComponentBlockBytes = 2 * 1024 * 1024
-    embeddedMaxComponentMaskBytes = 1200 * 1024
-    embeddedMaxProgressiveTotalDecodeBytes = 3 * 1024 * 1024
-    embeddedMaxStreamingComponentMaskBytes = 4 * 1024 * 1024
-    embeddedMaxStreamingTotalMaskBytes = 5 * 1024 * 1024
+  jpegStreamWindowSize = 32 * 1024
+  jpegStreamKeepBehind = 64
 
 let
   jpegStartOfImage* = [0xFF.uint8, 0xD8]
@@ -70,13 +64,25 @@ type
     huffmanDC, huffmanAC: int
     dcPred: int
     widthCoeff, heightCoeff: int
+    channelWidth, channelHeight: int
     coeff, lineBuf: seq[uint8]
     blocks: seq[seq[array[64, int16]]]
     channel: Mask
 
+  JpegSourceProc* = proc(
+    dst: pointer, maxBytes: int
+  ): int {.gcsafe, raises: [].}
+    ## Pull callback for streaming decodes: fill `dst` with up to `maxBytes`
+    ## sequential input bytes, returning how many were written (<= 0 on EOF
+    ## or read error — the decode then fails with a catchable PixieError).
+
   DecoderState = object
     buffer: ptr UncheckedArray[uint8]
     len, pos: int
+    readProc: JpegSourceProc ## nil = whole input is in `buffer`
+    window: seq[uint8]       ## sliding window backing `buffer` when streaming
+    windowStart: int         ## absolute input offset of window[0]
+    windowLen: int           ## valid bytes in the window
     bitsBuffered: int
     bitBuffer: uint32
     foundSOF: bool
@@ -99,6 +105,7 @@ type
     hitEnd: bool
     streamBaselineBlocks: bool
     scaledTargetWidth, scaledTargetHeight: int
+    scaledFit: ScaledDecodeFit
 
   Mask = ref object
     ## Mask object that holds mask opacity data.
@@ -148,8 +155,11 @@ proc scaledCeil(value, scale, divisor: int): int {.inline.} =
   ((value.int64 * scale.int64 + divisor.int64 - 1) div divisor.int64).int
 
 proc useScaledChannels(state: DecoderState): bool {.inline.} =
+  ## Scaled (target-sized) channel masks are used whenever a scaled decode
+  ## was requested — including progressive JPEGs, whose coefficient blocks
+  ## must stay source-sized but whose IDCT output can go straight into
+  ## target-sized masks.
   state.streamBaselineBlocks and
-    not state.progressive and
     state.scaledTargetWidth > 0 and
     state.scaledTargetHeight > 0
 
@@ -161,39 +171,97 @@ proc clampByte(x: int32): uint8 {.inline.} =
     value = cast[uint32](x) and (signBit - 1)
   min(value, 255).uint8
 
+proc ensureBytesSlow(state: var DecoderState, absPos, count: int): bool =
+  ## Streaming path of `ensureBytes`: slide the window forward and refill it
+  ## from `readProc` so [absPos, absPos+count) becomes resident.
+  if absPos < state.windowStart:
+    failInvalid("input stream rewound too far")
+  let absEnd = absPos + count
+  var winEnd = state.windowStart + state.windowLen
+
+  # Drop bytes that can no longer be re-read. Never advance past the
+  # stream position (winEnd): readProc is strictly sequential.
+  let keepFrom = max(state.windowStart, min(absPos - jpegStreamKeepBehind, winEnd))
+  if keepFrom > state.windowStart:
+    let keepLen = winEnd - keepFrom
+    if keepLen > 0:
+      moveMem(state.window[0].addr, state.window[keepFrom - state.windowStart].addr, keepLen)
+    state.windowStart = keepFrom
+    state.windowLen = keepLen
+
+  # Grow capacity when a single request spans more than the window.
+  if absEnd - max(state.windowStart, absPos - jpegStreamKeepBehind) > state.window.len:
+    state.window.setLen(absEnd - (absPos - jpegStreamKeepBehind))
+
+  while winEnd < absEnd:
+    if state.windowLen == state.window.len:
+      # Long forward skip: cycle bytes out of the front of the window.
+      let drop = min(state.windowLen, absPos - jpegStreamKeepBehind - state.windowStart)
+      if drop <= 0:
+        failInvalid("stream window exhausted")
+      moveMem(state.window[0].addr, state.window[drop].addr, state.windowLen - drop)
+      state.windowStart += drop
+      state.windowLen -= drop
+    let got = state.readProc(
+      state.window[state.windowLen].addr,
+      min(state.window.len - state.windowLen, state.len - winEnd)
+    )
+    if got <= 0:
+      return false
+    state.windowLen += got
+    winEnd += got
+  state.buffer = cast[ptr UncheckedArray[uint8]](state.window[0].addr)
+  true
+
+proc ensureBytes(state: var DecoderState, absPos, count: int): bool {.inline.} =
+  ## Makes input bytes [absPos, absPos+count) addressable through `at`,
+  ## returning false when the input ends before that.
+  if absPos + count > state.len:
+    return false
+  if state.readProc == nil or
+      (absPos >= state.windowStart and
+       absPos + count <= state.windowStart + state.windowLen):
+    return true
+  ensureBytesSlow(state, absPos, count)
+
+template at(state: DecoderState, absPos: int): uint8 =
+  ## Reads the input byte at an absolute offset; call `ensureBytes` first.
+  state.buffer[absPos - state.windowStart]
+
 proc readUint8(state: var DecoderState): uint8 =
   ## Reads a byte from the input stream.
-  if state.pos >= state.len:
+  if not state.ensureBytes(state.pos, 1):
     failInvalid()
-  result = state.buffer[state.pos]
+  result = state.at(state.pos)
   inc state.pos
 
 proc readUint16be(state: var DecoderState): uint16 =
   ## Reads uint16 big-endian from the input stream.
-  if state.pos + 2 > state.len:
+  if not state.ensureBytes(state.pos, 2):
     failInvalid()
   result =
-    (state.buffer[state.pos].uint16 shl 8) or
-    state.buffer[state.pos + 1]
+    (state.at(state.pos).uint16 shl 8) or
+    state.at(state.pos + 1)
   state.pos += 2
 
 proc readUint32be(state: var DecoderState): uint32 =
   ## Reads uint32 big-endian from the input stream.
-  if state.pos + 4 > state.len:
+  if not state.ensureBytes(state.pos, 4):
     failInvalid()
   result =
-    (state.buffer[state.pos + 0].uint32 shl 24) or
-    (state.buffer[state.pos + 1].uint32 shl 16) or
-    (state.buffer[state.pos + 2].uint32 shl 8) or
-    state.buffer[state.pos + 3]
+    (state.at(state.pos + 0).uint32 shl 24) or
+    (state.at(state.pos + 1).uint32 shl 16) or
+    (state.at(state.pos + 2).uint32 shl 8) or
+    state.at(state.pos + 3)
   state.pos += 4
 
 proc readStr(state: var DecoderState, n: int): string =
   ## Reads n number of bytes as a string.
-  if state.pos + n > state.len:
+  if not state.ensureBytes(state.pos, n):
     failInvalid()
   result.setLen(n)
-  copyMem(result[0].addr, state.buffer[state.pos].addr, n)
+  if n > 0:
+    copyMem(result[0].addr, state.buffer[state.pos - state.windowStart].addr, n)
   state.pos += n
 
 proc skipBytes(state: var DecoderState, n: int) =
@@ -223,7 +291,7 @@ proc readMarker(state: var DecoderState): uint8 =
         failInvalid("invalid chunk marker")
       continue
 
-    while state.pos < state.len and state.buffer[state.pos] == 0xFF:
+    while state.ensureBytes(state.pos, 1) and state.at(state.pos) == 0xFF:
       inc state.pos
 
     if state.pos >= state.len:
@@ -425,10 +493,9 @@ proc decodeSOF0(state: var DecoderState) =
 
   len -= 3 * numComponents
 
-  when defined(frameosEmbedded):
-    var
-      totalBlockBytes: int64
-      totalMaskBytes: int64
+  var
+    totalBlockBytes: int64
+    totalMaskBytes: int64
 
   for component in state.components.mitems:
     state.maxXScale = max(state.maxXScale, component.xScale)
@@ -440,6 +507,53 @@ proc decodeSOF0(state: var DecoderState) =
     (state.imageWidth + state.mcuWidth - 1) div state.mcuWidth
   state.numMcuHigh =
     (state.imageHeight + state.mcuHeight - 1) div state.mcuHeight
+
+  var
+    effectiveTargetWidth = state.scaledTargetWidth
+    effectiveTargetHeight = state.scaledTargetHeight
+  if state.useScaledChannels():
+    if state.scaledFit == fitCover:
+      # Cover crops the source to the target aspect; inflate the sampling
+      # resolution so the cropped region still gets target-density masks.
+      let
+        orientedWidth =
+          if state.orientation in {5, 6, 7, 8}: state.imageHeight
+          else: state.imageWidth
+        orientedHeight =
+          if state.orientation in {5, 6, 7, 8}: state.imageWidth
+          else: state.imageHeight
+      if orientedWidth.int64 * effectiveTargetHeight.int64 >
+          effectiveTargetWidth.int64 * orientedHeight.int64:
+        # Source is wider: the crop discards width, so sample more of it.
+        effectiveTargetWidth = min(orientedWidth, max(1, (
+          effectiveTargetHeight.int64 * orientedWidth.int64 div
+          max(1'i64, orientedHeight.int64)).int))
+      else:
+        effectiveTargetHeight = min(orientedHeight, max(1, (
+          effectiveTargetWidth.int64 * orientedHeight.int64 div
+          max(1'i64, orientedWidth.int64)).int))
+
+    # Clamp the sampling resolution to what the memory budget allows,
+    # trading sharpness for a decode that succeeds.
+    let budget = decodeBudgetBytes()
+    if budget > 0:
+      var blockTotal, maskTotal: int64
+      for component in state.components:
+        if not (state.streamBaselineBlocks and not state.progressive):
+          blockTotal += (state.numMcuWide * component.yScale).int64 *
+            (state.numMcuHigh * component.xScale).int64 * 64 * sizeof(int16)
+        maskTotal +=
+          max(1'i64, (effectiveTargetWidth.int64 * component.yScale.int64 +
+            state.maxYScale - 1) div state.maxYScale) *
+          max(1'i64, (effectiveTargetHeight.int64 * component.xScale.int64 +
+            state.maxXScale - 1) div state.maxXScale)
+      let maskBudget = budget.int64 - blockTotal
+      if maskBudget > 0 and maskTotal > maskBudget:
+        let factor = sqrt(maskBudget.float64 / maskTotal.float64)
+        effectiveTargetWidth = max(64,
+          (effectiveTargetWidth.float64 * factor).int)
+        effectiveTargetHeight = max(64,
+          (effectiveTargetHeight.float64 * factor).int)
 
   for component in state.components.mitems:
     component.width = (
@@ -464,11 +578,11 @@ proc decodeSOF0(state: var DecoderState) =
     if state.useScaledChannels():
       let
         targetWidth =
-          if state.orientation in {5, 6, 7, 8}: state.scaledTargetHeight
-          else: state.scaledTargetWidth
+          if state.orientation in {5, 6, 7, 8}: effectiveTargetHeight
+          else: effectiveTargetWidth
         targetHeight =
-          if state.orientation in {5, 6, 7, 8}: state.scaledTargetWidth
-          else: state.scaledTargetHeight
+          if state.orientation in {5, 6, 7, 8}: effectiveTargetWidth
+          else: effectiveTargetHeight
       component.sampleWidth = max(1,
         (targetWidth * component.yScale + state.maxYScale - 1) div state.maxYScale
       )
@@ -478,46 +592,20 @@ proc decodeSOF0(state: var DecoderState) =
       channelWidth = component.sampleWidth
       channelHeight = component.sampleHeight
 
-    when defined(frameosEmbedded):
+    block:
       let
         blockColumns = state.numMcuWide * component.yScale
         blockRows = state.numMcuHigh * component.xScale
-        blockBytes = blockColumns.int64 * blockRows.int64 * 64'i64 * sizeof(int16).int64
-        sourceMaskBytes = component.widthStride.int64 * component.heightStride.int64
-        channelBytes = channelWidth.int64 * channelHeight.int64
-        maskBytes =
-          if state.useScaledChannels(): channelBytes
-          else: sourceMaskBytes
+        streamsBlocks = state.streamBaselineBlocks and not state.progressive
+        blockBytes =
+          if streamsBlocks: 0'i64
+          else: blockColumns.int64 * blockRows.int64 * 64'i64 * sizeof(int16).int64
+        maskBytes = channelWidth.int64 * channelHeight.int64
       totalBlockBytes += blockBytes
       totalMaskBytes += maskBytes
-      if state.streamBaselineBlocks and not state.progressive:
-        if channelBytes > embeddedMaxStreamingComponentMaskBytes or
-            totalMaskBytes > embeddedMaxStreamingTotalMaskBytes:
-          failInvalid(
-            "JPEG scaled dimensions need " & $(channelBytes div 1024) &
-            "K component and " & $(totalMaskBytes div 1024) &
-            "K total channel buffers; too large for embedded streaming decode"
-          )
-      elif blockBytes > embeddedMaxComponentBlockBytes or
-          sourceMaskBytes > embeddedMaxComponentMaskBytes or
-          totalBlockBytes + totalMaskBytes > embeddedMaxProgressiveTotalDecodeBytes:
-        failInvalid(
-          "JPEG source dimensions need " & $(blockBytes div 1024) &
-          "K block, " & $(sourceMaskBytes div 1024) &
-          "K mask, and " & $((totalBlockBytes + totalMaskBytes) div 1024) &
-          "K total decode buffers; too large for embedded decode"
-        )
 
-    if not (state.streamBaselineBlocks and not state.progressive):
-      # Allocate block data structures.
-      component.blocks = newSeqWith(
-        state.numMcuWide * component.yScale,
-        newSeq[array[64, int16]](
-          state.numMcuHigh * component.xScale
-        )
-      )
-
-    component.channel = newMask(channelWidth, channelHeight)
+    component.channelWidth = channelWidth
+    component.channelHeight = channelHeight
 
     if state.progressive:
       component.widthCoeff = component.widthStride div 8
@@ -526,11 +614,37 @@ proc decodeSOF0(state: var DecoderState) =
   if len != 0:
     failInvalid()
 
+  # Check the whole decode plan against the memory budget before any
+  # image-sized allocation happens, so oversized inputs fail with a
+  # catchable error instead of exhausting memory.
+  if overDecodeBudget(totalBlockBytes + totalMaskBytes):
+    failInvalid(
+      "JPEG decode of " & $state.imageWidth & "x" & $state.imageHeight &
+      (if state.progressive: " (progressive)" else: "") &
+      " needs " & $((totalBlockBytes + totalMaskBytes) div 1024) &
+      "K of decode buffers, over the " &
+      $(decodeBudgetBytes() div 1024) & "K memory budget"
+    )
+
+  for component in state.components.mitems:
+    if not (state.streamBaselineBlocks and not state.progressive):
+      # Allocate block data structures.
+      component.blocks = newSeqWith(
+        state.numMcuWide * component.yScale,
+        newSeq[array[64, int16]](
+          state.numMcuHigh * component.xScale
+        )
+      )
+    component.channel = newMask(component.channelWidth, component.channelHeight)
+
 proc decodeSOF1(state: var DecoderState) =
   failInvalid("unsupported extended sequential DCT format")
 
 proc decodeSOF2(state: var DecoderState) =
   ## Decode Start of Image (Progressive DCT format)
+  if state.readProc != nil:
+    # Progressive scans need random access across the whole entropy stream.
+    failInvalid("progressive JPEG cannot be decoded from a stream")
   # Same as SOF0
   state.progressive = true
   state.decodeSOF0()
@@ -712,18 +826,18 @@ proc isEntropyMarker(marker: uint8): bool {.inline.} =
 proc seekEntropyMarker(state: var DecoderState): bool =
   ## Finds the next marker after damaged entropy-coded data.
   var pos = state.pos
-  while pos < state.len - 1:
-    if state.buffer[pos] != 0xFF:
+  while pos < state.len - 1 and state.ensureBytes(pos, 2):
+    if state.at(pos) != 0xFF:
       inc pos
       continue
 
     var markerPos = pos
-    while markerPos < state.len and state.buffer[markerPos] == 0xFF:
+    while state.ensureBytes(markerPos, 1) and state.at(markerPos) == 0xFF:
       inc markerPos
     if markerPos >= state.len:
       break
 
-    let marker = state.buffer[markerPos]
+    let marker = state.at(markerPos)
     if marker == 0:
       pos = markerPos + 1
       continue
@@ -1213,18 +1327,18 @@ proc resyncRestart(state: var DecoderState): bool =
   ## Leniently resync to the next restart marker after damaged entropy data.
   let maxPos = min(state.len - 1, state.pos + maxRestartResync)
   var pos = state.pos
-  while pos < maxPos:
-    if state.buffer[pos] != 0xFF:
+  while pos < maxPos and state.ensureBytes(pos, 1):
+    if state.at(pos) != 0xFF:
       inc pos
       continue
 
     var markerPos = pos
-    while markerPos < state.len and state.buffer[markerPos] == 0xFF:
+    while state.ensureBytes(markerPos, 1) and state.at(markerPos) == 0xFF:
       inc markerPos
     if markerPos >= state.len:
       break
 
-    let marker = state.buffer[markerPos]
+    let marker = state.at(markerPos)
     if marker in 0xD0'u8 .. 0xD7'u8:
       state.pos = markerPos + 1
       state.reset()
@@ -1236,20 +1350,20 @@ proc checkRestart(state: var DecoderState) =
   ## Check if we might have run into a restart marker, then deal with it.
   dec state.todoBeforeRestart
   if state.todoBeforeRestart <= 0:
-    if state.pos + 1 > state.len:
+    if state.pos + 1 > state.len or not state.ensureBytes(state.pos, 2):
       if state.progressive and state.hitEnd:
         state.todoBeforeRestart = int.high
         return
       failInvalid()
     # Handle getting a restart marker right at the end.
-    if state.buffer[state.pos] == 0xFF and state.buffer[state.pos+1] == 0xD9:
+    if state.at(state.pos) == 0xFF and state.at(state.pos + 1) == 0xD9:
       return
-    if state.progressive and state.hitEnd and state.buffer[state.pos] == 0xFF and
-        state.buffer[state.pos + 1] notin 0xD0'u8 .. 0xD7'u8:
+    if state.progressive and state.hitEnd and state.at(state.pos) == 0xFF and
+        state.at(state.pos + 1) notin 0xD0'u8 .. 0xD7'u8:
       state.todoBeforeRestart = int.high
       return
-    if state.buffer[state.pos] != 0xFF or
-      state.buffer[state.pos + 1] notin 0xD0'u8 .. 0xD7'u8:
+    if state.at(state.pos) != 0xFF or
+      state.at(state.pos + 1) notin 0xD0'u8 .. 0xD7'u8:
       if state.resyncRestart():
         return
       if state.progressive and state.pos + 16 >= state.len:
@@ -1426,12 +1540,66 @@ proc channelAt(
     y = min((sourceY * sampleHeight) div sourceHeight, sampleHeight - 1)
   component.channel.data[component.channel.dataIndex(x, y)]
 
+proc scaledFitRects(
+  state: DecoderState, targetWidth, targetHeight: int
+): tuple[srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH: int] =
+  ## Computes the source crop and target placement rectangles (in oriented
+  ## source space) for the requested fit mode.
+  let oriented = state.orientedDimensions()
+  result = (0, 0, oriented.width, oriented.height, 0, 0, targetWidth, targetHeight)
+  case state.scaledFit
+  of fitStretch:
+    discard
+  of fitCover:
+    if oriented.width.int64 * targetHeight.int64 >
+        targetWidth.int64 * oriented.height.int64:
+      # Source is wider than the target: crop width, centered.
+      let cropW = max(1, (
+        oriented.height.int64 * targetWidth.int64 div
+        max(1'i64, targetHeight.int64)).int)
+      result.srcX = (oriented.width - cropW) div 2
+      result.srcW = cropW
+    else:
+      let cropH = max(1, (
+        oriented.width.int64 * targetHeight.int64 div
+        max(1'i64, targetWidth.int64)).int)
+      result.srcY = (oriented.height - cropH) div 2
+      result.srcH = cropH
+  of fitContain:
+    if oriented.width.int64 * targetHeight.int64 >
+        targetWidth.int64 * oriented.height.int64:
+      # Source is wider than the target: fit width, letterbox height.
+      let fitH = max(1, (
+        targetWidth.int64 * oriented.height.int64 div
+        max(1'i64, oriented.width.int64)).int)
+      result.dstY = (targetHeight - fitH) div 2
+      result.dstH = fitH
+    else:
+      let fitW = max(1, (
+        targetHeight.int64 * oriented.width.int64 div
+        max(1'i64, oriented.height.int64)).int)
+      result.dstX = (targetWidth - fitW) div 2
+      result.dstW = fitW
+
 proc fillImage(state: var DecoderState, result: Image) =
   ## Takes a jpeg image object and fills a target-sized pixie Image from it.
-  let oriented = state.orientedDimensions()
+  ## With fitContain, pixels outside the fitted rectangle keep their current
+  ## contents (callers pre-fill the background).
   let
-    targetWidth = result.width
-    targetHeight = result.height
+    oriented = state.orientedDimensions()
+    rects = state.scaledFitRects(result.width, result.height)
+
+  template orientedYFor(y: int): int =
+    min(
+      rects.srcY + ((y - rects.dstY) * rects.srcH) div rects.dstH,
+      oriented.height - 1
+    )
+
+  template orientedXFor(x: int): int =
+    min(
+      rects.srcX + ((x - rects.dstX) * rects.srcW) div rects.dstW,
+      oriented.width - 1
+    )
 
   case state.components.len:
   of 3:
@@ -1439,11 +1607,11 @@ proc fillImage(state: var DecoderState, result: Image) =
       yComponent = state.components[0]
       cbComponent = state.components[1]
       crComponent = state.components[2]
-    for y in 0 ..< targetHeight:
-      let orientedY = min((y * oriented.height) div targetHeight, oriented.height - 1)
-      for x in 0 ..< targetWidth:
+    for y in rects.dstY ..< rects.dstY + rects.dstH:
+      let orientedY = orientedYFor(y)
+      for x in rects.dstX ..< rects.dstX + rects.dstW:
         let
-          orientedX = min((x * oriented.width) div targetWidth, oriented.width - 1)
+          orientedX = orientedXFor(x)
           source = state.sourceCoords(orientedX, orientedY)
         result.unsafe[x, y] = yCbCrToRgbx(
           yComponent.channelAt(source.x, source.y, state.imageWidth, state.imageHeight),
@@ -1453,11 +1621,11 @@ proc fillImage(state: var DecoderState, result: Image) =
 
   of 1:
     let yComponent = state.components[0]
-    for y in 0 ..< targetHeight:
-      let orientedY = min((y * oriented.height) div targetHeight, oriented.height - 1)
-      for x in 0 ..< targetWidth:
+    for y in rects.dstY ..< rects.dstY + rects.dstH:
+      let orientedY = orientedYFor(y)
+      for x in rects.dstX ..< rects.dstX + rects.dstW:
         let
-          orientedX = min((x * oriented.width) div targetWidth, oriented.width - 1)
+          orientedX = orientedXFor(x)
           source = state.sourceCoords(orientedX, orientedY)
         result.unsafe[x, y] = grayScaleToRgbx(
           yComponent.channelAt(source.x, source.y, state.imageWidth, state.imageHeight)
@@ -1567,12 +1735,15 @@ proc buildImage(state: var DecoderState): Image =
   else:
     failInvalid("invalid orientation")
 
+proc runJpegDecode(state: var DecoderState) {.raises: [PixieError].}
+
 proc decodeJpegState(
   data: pointer,
   len: int,
   streamBaselineBlocks = false,
   scaledTargetWidth = 0,
-  scaledTargetHeight = 0
+  scaledTargetHeight = 0,
+  fit = fitStretch
 ): DecoderState {.raises: [PixieError].} =
   var state = DecoderState()
   state.buffer = cast[ptr UncheckedArray[uint8]](data)
@@ -1580,7 +1751,33 @@ proc decodeJpegState(
   state.streamBaselineBlocks = streamBaselineBlocks
   state.scaledTargetWidth = scaledTargetWidth
   state.scaledTargetHeight = scaledTargetHeight
+  state.scaledFit = fit
+  runJpegDecode(state)
+  state
 
+proc decodeJpegStateStream(
+  readProc: JpegSourceProc,
+  totalLen: int,
+  scaledTargetWidth, scaledTargetHeight: int,
+  fit = fitStretch
+): DecoderState {.raises: [PixieError].} =
+  ## Decodes a baseline JPEG pulled incrementally from `readProc` through a
+  ## small sliding window, never holding the whole input in memory.
+  if readProc == nil or totalLen <= 2:
+    failInvalid("invalid JPEG stream source")
+  var state = DecoderState()
+  state.readProc = readProc
+  state.window = newSeq[uint8](jpegStreamWindowSize)
+  state.buffer = cast[ptr UncheckedArray[uint8]](state.window[0].addr)
+  state.len = totalLen
+  state.streamBaselineBlocks = true
+  state.scaledTargetWidth = scaledTargetWidth
+  state.scaledTargetHeight = scaledTargetHeight
+  state.scaledFit = fit
+  runJpegDecode(state)
+  state
+
+proc runJpegDecode(state: var DecoderState) {.raises: [PixieError].} =
   while true:
     if state.pos >= state.len and state.foundSOS:
       break
@@ -1642,7 +1839,6 @@ proc decodeJpegState(
         failInvalid("invalid chunk " & chunkId.toHex())
 
   state.quantizationAndIDCTPass()
-  state
 
 proc decodeJpeg*(data: string): Image {.raises: [PixieError].} =
   ## Decodes the JPEG into an Image.
@@ -1650,7 +1846,7 @@ proc decodeJpeg*(data: string): Image {.raises: [PixieError].} =
   state.buildImage()
 
 proc decodeJpegScaled*(
-  data: pointer, len, width, height: int
+  data: pointer, len, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Decodes the JPEG directly into a target-sized Image.
   var state = decodeJpegState(
@@ -1658,12 +1854,13 @@ proc decodeJpegScaled*(
     len,
     true,
     width,
-    height
+    height,
+    fit
   )
   state.buildImage(width, height)
 
 proc decodeJpegScaledInto*(
-  data: pointer, len: int, target: Image
+  data: pointer, len: int, target: Image, fit = fitStretch
 ) {.raises: [PixieError].} =
   ## Decodes the JPEG directly into an existing target-sized Image.
   if target.isNil or target.width <= 0 or target.height <= 0:
@@ -1673,12 +1870,13 @@ proc decodeJpegScaledInto*(
     len,
     true,
     target.width,
-    target.height
+    target.height,
+    fit
   )
   state.fillImage(target)
 
 proc decodeJpegScaled*(
-  data: var string, width, height: int
+  data: var string, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Decodes the JPEG directly into a target-sized Image.
   ## The input string is released before allocating the output image.
@@ -1687,13 +1885,14 @@ proc decodeJpegScaled*(
     data.len,
     true,
     width,
-    height
+    height,
+    fit
   )
   data = ""
   state.buildImage(width, height)
 
 proc decodeJpegScaledInto*(
-  data: var string, target: Image
+  data: var string, target: Image, fit = fitStretch
 ) {.raises: [PixieError].} =
   ## Decodes the JPEG directly into an existing target-sized Image.
   ## The input string is released before writing the output image.
@@ -1704,22 +1903,46 @@ proc decodeJpegScaledInto*(
     data.len,
     true,
     target.width,
-    target.height
+    target.height,
+    fit
   )
   data = ""
   state.fillImage(target)
 
 proc decodeJpegScaled*(
-  data: string, width, height: int
+  data: string, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Decodes the JPEG directly into a target-sized Image.
-  decodeJpegScaled(data.cstring, data.len, width, height)
+  decodeJpegScaled(data.cstring, data.len, width, height, fit)
 
 proc decodeJpegScaledInto*(
-  data: string, target: Image
+  data: string, target: Image, fit = fitStretch
 ) {.raises: [PixieError].} =
   ## Decodes the JPEG directly into an existing target-sized Image.
-  decodeJpegScaledInto(data.cstring, data.len, target)
+  decodeJpegScaledInto(data.cstring, data.len, target, fit)
+
+proc decodeJpegStreamScaled*(
+  readProc: JpegSourceProc, totalLen, width, height: int, fit = fitStretch
+): Image {.raises: [PixieError].} =
+  ## Decodes a baseline JPEG pulled from `readProc` into a target-sized
+  ## Image, holding only a small window of the compressed input in memory.
+  ## Progressive JPEGs raise a catchable PixieError; retry from a buffer.
+  var state = decodeJpegStateStream(readProc, totalLen, width, height, fit)
+  state.buildImage(width, height)
+
+proc decodeJpegStreamScaledInto*(
+  readProc: JpegSourceProc, totalLen: int, target: Image, fit = fitStretch
+) {.raises: [PixieError].} =
+  ## Decodes a baseline JPEG pulled from `readProc` directly into an
+  ## existing target-sized Image, holding only a small window of the
+  ## compressed input in memory. Progressive JPEGs raise a catchable
+  ## PixieError; retry from a buffer.
+  if target.isNil or target.width <= 0 or target.height <= 0:
+    raise newException(PixieError, "Target image width and height must be > 0")
+  var state = decodeJpegStateStream(
+    readProc, totalLen, target.width, target.height, fit
+  )
+  state.fillImage(target)
 
 proc decodeJpegDimensions*(
   data: pointer, len: int
@@ -1790,6 +2013,106 @@ proc decodeJpegDimensions*(
 ): ImageDimensions {.raises: [PixieError].} =
   ## Decodes the JPEG dimensions.
   decodeJpegDimensions(data.cstring, data.len)
+
+type
+  JpegInfo* = object
+    ## Cheap header probe used for pre-decode memory planning.
+    width*, height*: int ## oriented (post-EXIF-rotation) dimensions
+    progressive*: bool
+    components*: int
+    maxXScale*, maxYScale*: int
+    componentScales*: seq[tuple[xScale, yScale: int]]
+
+proc decodeJpegInfo*(
+  data: pointer, len: int
+): JpegInfo {.raises: [PixieError].} =
+  ## Probes a JPEG header for dimensions, encoding mode and subsampling
+  ## without decoding any image data.
+  var state = DecoderState()
+  state.buffer = cast[ptr UncheckedArray[uint8]](data)
+  state.len = len
+
+  while true:
+    let chunkId = state.readMarker()
+    case chunkId:
+      of 0xD8, 0xD0 .. 0xD7:
+        discard
+      of 0xC0, 0xC2:
+        result.progressive = chunkId == 0xC2
+        discard state.readUint16be().int # Chunk len
+        discard state.readUint8() # Precision
+        state.imageHeight = state.readUint16be().int
+        state.imageWidth = state.readUint16be().int
+        let numComponents = state.readUint8().int
+        if numComponents notin {1, 3}:
+          failInvalid("unsupported component count")
+        result.components = numComponents
+        for _ in 0 ..< numComponents:
+          discard state.readUint8() # Component id
+          let info = state.readUint8()
+          discard state.readUint8() # Quantization table id
+          let
+            xScale = (info and 15).int
+            yScale = (info shr 4).int
+          result.componentScales.add((xScale: xScale, yScale: yScale))
+          result.maxXScale = max(result.maxXScale, xScale)
+          result.maxYScale = max(result.maxYScale, yScale)
+        break
+      of 0xC1:
+        failInvalid("unsupported extended sequential DCT format")
+      of 0xC4:
+        state.decodeDHT()
+      of 0xE1:
+        state.decodeExif()
+      of 0xDB, 0xDC, 0xDD, 0xE0, 0xE2..0xEF, 0xFE:
+        state.skipChunk()
+      else:
+        failInvalid("invalid chunk " & chunkId.toHex())
+
+  if state.imageWidth <= 0 or state.imageHeight <= 0 or
+      result.maxXScale <= 0 or result.maxYScale <= 0:
+    failInvalid()
+  case state.orientation:
+    of 0, 1, 2, 3, 4:
+      result.width = state.imageWidth
+      result.height = state.imageHeight
+    of 5, 6, 7, 8:
+      result.width = state.imageHeight
+      result.height = state.imageWidth
+    else:
+      failInvalid("invalid orientation")
+
+proc decodeJpegInfo*(data: string): JpegInfo {.raises: [PixieError].} =
+  ## Probes a JPEG header for dimensions, encoding mode and subsampling.
+  decodeJpegInfo(data.cstring, data.len)
+
+proc jpegDecodeIntermediateBytes*(
+  info: JpegInfo, targetWidth, targetHeight: int
+): int64 {.raises: [].} =
+  ## Estimates the decode-intermediate bytes (coefficient blocks + channel
+  ## masks) a scaled decode of this JPEG to targetWidth x targetHeight will
+  ## allocate. Baseline JPEGs stream their blocks, so only target-sized
+  ## masks count; progressive JPEGs additionally hold source-sized
+  ## coefficient blocks for every component.
+  if info.maxXScale <= 0 or info.maxYScale <= 0:
+    return 0
+  let
+    mcuWidth = info.maxYScale * 8
+    mcuHeight = info.maxXScale * 8
+    numMcuWide = (info.width + mcuWidth - 1) div mcuWidth
+    numMcuHigh = (info.height + mcuHeight - 1) div mcuHeight
+  for scale in info.componentScales:
+    if info.progressive:
+      let
+        blockColumns = numMcuWide.int64 * scale.yScale.int64
+        blockRows = numMcuHigh.int64 * scale.xScale.int64
+      result += blockColumns * blockRows * 64 * sizeof(int16).int64
+    let
+      sampleWidth = max(1'i64,
+        (targetWidth.int64 * scale.yScale.int64 + info.maxYScale - 1) div info.maxYScale)
+      sampleHeight = max(1'i64,
+        (targetHeight.int64 * scale.xScale.int64 + info.maxXScale - 1) div info.maxXScale)
+    result += sampleWidth * sampleHeight
 
 when defined(release):
   {.pop.}

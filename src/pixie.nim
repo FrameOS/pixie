@@ -100,41 +100,41 @@ proc copyIntoTarget(target, source: Image) {.raises: [PixieError].} =
     )
 
 proc decodeImageScaled*(
-  data: string, width, height: int
+  data: string, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].}
 
 proc decodeImageScaled*(
-  data: var string, width, height: int
+  data: var string, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].}
 
 proc decodeImageScaledInto*(
-  data: var string, target: Image
+  data: var string, target: Image, fit = fitStretch
 ): Image {.raises: [PixieError].}
 
 proc decodeImageScaled*(
-  data: pointer, len, width, height: int
+  data: pointer, len, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Loads an image from memory scaled to the requested dimensions.
   validateScaledImageTarget(width, height)
   if len > 8 and equalMem(data, pngSignature[0].unsafeAddr, 8):
-    decodePngScaled(data, len, width, height)
+    decodePngScaled(data, len, width, height, fit)
   elif len > 2 and equalMem(data, jpegStartOfImage[0].unsafeAddr, 2):
-    decodeJpegScaled(data, len, width, height)
+    decodeJpegScaled(data, len, width, height, fit)
   else:
     var copy = newString(len)
     if len > 0:
       copyMem(addr copy[0], data, len)
-    decodeImageScaled(copy, width, height)
+    decodeImageScaled(copy, width, height, fit)
 
 proc decodeImageScaled*(
-  data: string, width, height: int
+  data: string, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Loads an image from memory scaled to the requested dimensions.
   validateScaledImageTarget(width, height)
   if data.len > 8 and data.readUint64(0) == cast[uint64](pngSignature):
-    decodePngScaled(data, width, height)
+    decodePngScaled(data, width, height, fit)
   elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
-    decodeJpegScaled(data, width, height)
+    decodeJpegScaled(data, width, height, fit)
   else:
     let image = decodeImage(data)
     if image.width == width and image.height == height:
@@ -143,16 +143,16 @@ proc decodeImageScaled*(
       image.resize(width, height)
 
 proc decodeImageScaled*(
-  data: var string, width, height: int
+  data: var string, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Loads an image from memory scaled to the requested dimensions. JPEG
   ## releases the source buffer before allocating the destination; PNG releases
   ## it after parsing because the PNG stream must be inflated first.
   validateScaledImageTarget(width, height)
   if data.len > 8 and data.readUint64(0) == cast[uint64](pngSignature):
-    decodePngScaled(data, width, height)
+    decodePngScaled(data, width, height, fit)
   elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
-    decodeJpegScaled(data, width, height)
+    decodeJpegScaled(data, width, height, fit)
   else:
     let image = decodeImage(data)
     data = ""
@@ -166,43 +166,43 @@ proc decodeImageScaled*(
       image.resize(width, height)
 
 proc decodeImageScaledInto*(
-  data: pointer, len: int, target: Image
+  data: pointer, len: int, target: Image, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Loads an image from memory scaled into an existing target Image.
   validateScaledImageTarget(target)
   if len > 8 and equalMem(data, pngSignature[0].unsafeAddr, 8):
-    decodePngScaledInto(data, len, target)
+    decodePngScaledInto(data, len, target, fit)
   elif len > 2 and equalMem(data, jpegStartOfImage[0].unsafeAddr, 2):
-    decodeJpegScaledInto(data, len, target)
+    decodeJpegScaledInto(data, len, target, fit)
   else:
     var copy = newString(len)
     if len > 0:
       copyMem(addr copy[0], data, len)
-    discard decodeImageScaledInto(copy, target)
+    discard decodeImageScaledInto(copy, target, fit)
   target
 
 proc decodeImageScaledInto*(
-  data: string, target: Image
+  data: string, target: Image, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Loads an image from memory scaled into an existing target Image.
   validateScaledImageTarget(target)
   if data.len > 8 and data.readUint64(0) == cast[uint64](pngSignature):
-    decodePngScaledInto(data, target)
+    decodePngScaledInto(data, target, fit)
   elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
-    decodeJpegScaledInto(data, target)
+    decodeJpegScaledInto(data, target, fit)
   else:
     target.copyIntoTarget(decodeImageScaled(data, target.width, target.height))
   target
 
 proc decodeImageScaledInto*(
-  data: var string, target: Image
+  data: var string, target: Image, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Loads an image from memory scaled into an existing target Image.
   validateScaledImageTarget(target)
   if data.len > 8 and data.readUint64(0) == cast[uint64](pngSignature):
-    decodePngScaledInto(data, target)
+    decodePngScaledInto(data, target, fit)
   elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
-    decodeJpegScaledInto(data, target)
+    decodeJpegScaledInto(data, target, fit)
   else:
     target.copyIntoTarget(decodeImageScaled(data, target.width, target.height))
   target
@@ -224,12 +224,12 @@ proc readImage*(filePath: string): Image {.inline, raises: [PixieError].} =
     raise newException(PixieError, e.msg, e)
 
 proc readImageScaled*(
-  filePath: string, width, height: int
+  filePath: string, width, height: int, fit = fitStretch
 ): Image {.inline, raises: [PixieError].} =
   ## Loads an image from a file scaled to the requested dimensions.
   try:
     var data = readFile(filePath)
-    decodeImageScaled(data, width, height)
+    decodeImageScaled(data, width, height, fit)
   except IOError as e:
     raise newException(PixieError, e.msg, e)
 

@@ -1,5 +1,5 @@
-import chroma, flatty/binny, ../common, ../images, ../internal,
-    ../simd, zippy, crunchy
+import chroma, flatty/binny, ../common, ../decodebudget, ../images,
+    ../internal, ../simd, zippy, crunchy
 
 # See http://www.libpng.org/pub/png/spec/1.2/PNG-Contents.html
 
@@ -442,9 +442,7 @@ proc decodeImageData(
   if idats.len == 0:
     failInvalid()
 
-  result.setLen(header.width * header.height)
-
-  let uncompressed = uncompressIdats(data, idats)
+  var uncompressed = uncompressIdats(data, idats)
 
   if header.interlaceMethod == 0:
     let
@@ -463,11 +461,16 @@ proc decodeImageData(
       rowBytes,
       header.filterBytesPerPixel
     )
+    # The inflated scanlines are no longer needed; release them before the
+    # pixel seq is allocated to lower the peak footprint.
+    uncompressed = ""
+    result.setLen(header.width * header.height)
     result.writePixels(
       header, palette, transparency, unfiltered,
       header.width, header.height, 0, 0, 1, 1
     )
   else:
+    result.setLen(header.width * header.height)
     const
       startXs = [0, 4, 0, 2, 0, 1, 0]
       startYs = [0, 0, 4, 0, 2, 0, 1]
@@ -516,9 +519,7 @@ proc decodeImageData16(
   if idats.len == 0:
     failInvalid()
 
-  result.setLen(header.width * header.height)
-
-  let uncompressed = uncompressIdats(data, idats)
+  var uncompressed = uncompressIdats(data, idats)
 
   if header.interlaceMethod == 0:
     let
@@ -537,11 +538,16 @@ proc decodeImageData16(
       rowBytes,
       header.filterBytesPerPixel
     )
+    # The inflated scanlines are no longer needed; release them before the
+    # pixel seq is allocated to lower the peak footprint.
+    uncompressed = ""
+    result.setLen(header.width * header.height)
     result.writePixels16(
       header, transparency, unfiltered,
       header.width, header.height, 0, 0, 1, 1
     )
   else:
+    result.setLen(header.width * header.height)
     const
       startXs = [0, 4, 0, 2, 0, 1, 0]
       startYs = [0, 0, 4, 0, 2, 0, 1]
@@ -621,28 +627,78 @@ proc validateScaledPngTarget(target: Image) {.raises: [PixieError].} =
     raise newException(PixieError, "Invalid PNG target Image")
   validateScaledPngTarget(target.width, target.height)
 
-proc fillImage*(png: Png, target: Image) {.raises: [PixieError].} =
-  ## Scales a decoded PNG into an existing Image.
+proc scaledFitRects(
+  png: Png, targetWidth, targetHeight: int, fit: ScaledDecodeFit
+): tuple[srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH: int] =
+  ## Computes the source crop and target placement rectangles for a fit mode.
+  result = (0, 0, png.width, png.height, 0, 0, targetWidth, targetHeight)
+  case fit
+  of fitStretch:
+    discard
+  of fitCover:
+    if png.width.int64 * targetHeight.int64 >
+        targetWidth.int64 * png.height.int64:
+      let cropW = max(1, (
+        png.height.int64 * targetWidth.int64 div
+        max(1'i64, targetHeight.int64)).int)
+      result.srcX = (png.width - cropW) div 2
+      result.srcW = cropW
+    else:
+      let cropH = max(1, (
+        png.width.int64 * targetHeight.int64 div
+        max(1'i64, targetWidth.int64)).int)
+      result.srcY = (png.height - cropH) div 2
+      result.srcH = cropH
+  of fitContain:
+    if png.width.int64 * targetHeight.int64 >
+        targetWidth.int64 * png.height.int64:
+      let fitH = max(1, (
+        targetWidth.int64 * png.height.int64 div
+        max(1'i64, png.width.int64)).int)
+      result.dstY = (targetHeight - fitH) div 2
+      result.dstH = fitH
+    else:
+      let fitW = max(1, (
+        targetHeight.int64 * png.width.int64 div
+        max(1'i64, png.height.int64)).int)
+      result.dstX = (targetWidth - fitW) div 2
+      result.dstW = fitW
+
+proc fillImage*(
+  png: Png, target: Image, fit = fitStretch
+) {.raises: [PixieError].} =
+  ## Scales a decoded PNG into an existing Image. With fitContain, pixels
+  ## outside the fitted rectangle keep their current contents.
   validateScaledPngTarget(target)
 
+  let rects = png.scaledFitRects(target.width, target.height, fit)
+
+  template srcYFor(y: int): int =
+    min(rects.srcY + ((y - rects.dstY) * rects.srcH) div rects.dstH, png.height - 1)
+
+  template srcXFor(x: int): int =
+    min(rects.srcX + ((x - rects.dstX) * rects.srcW) div rects.dstW, png.width - 1)
+
   if png.data.len > 0:
-    for y in 0 ..< target.height:
-      let srcY = min((y * png.height) div target.height, png.height - 1)
-      for x in 0 ..< target.width:
-        let srcX = min((x * png.width) div target.width, png.width - 1)
+    for y in rects.dstY ..< rects.dstY + rects.dstH:
+      let srcY = srcYFor(y)
+      for x in rects.dstX ..< rects.dstX + rects.dstW:
+        let srcX = srcXFor(x)
         target.unsafe[x, y] = png.data[srcX + srcY * png.width].rgbx()
   else:
-    for y in 0 ..< target.height:
-      let srcY = min((y * png.height) div target.height, png.height - 1)
-      for x in 0 ..< target.width:
-        let srcX = min((x * png.width) div target.width, png.width - 1)
+    for y in rects.dstY ..< rects.dstY + rects.dstH:
+      let srcY = srcYFor(y)
+      for x in rects.dstX ..< rects.dstX + rects.dstW:
+        let srcX = srcXFor(x)
         target.unsafe[x, y] = png.data16[srcX + srcY * png.width].toRgba.rgbx()
 
-proc convertToImage*(png: Png, width, height: int): Image {.raises: [PixieError].} =
+proc convertToImage*(
+  png: Png, width, height: int, fit = fitStretch
+): Image {.raises: [PixieError].} =
   ## Converts a PNG into an Image scaled to the requested dimensions.
   validateScaledPngTarget(width, height)
   result = newImage(width, height)
-  png.fillImage(result)
+  png.fillImage(result, fit)
 
 proc decodePngDimensions*(
   data: pointer, len: int
@@ -701,6 +757,22 @@ proc decodePng*(data: pointer, len: int): Png {.raises: [PixieError].} =
   header = decodeHeader(data[pos].addr)
   prevChunkType = "IHDR"
   inc(pos, 13)
+
+  # Check the decode plan against the memory budget before any image-sized
+  # allocation: inflated scanlines + unfiltered scanlines + the pixel seq.
+  block:
+    let
+      pixels = header.width.int64 * header.height.int64
+      scanlines = scanlineBytes(header.width, header).int64 *
+        header.height.int64 + header.height.int64
+      pixelBytes = pixels * (if header.bitDepth == 16: 8 else: 4)
+    if overDecodeBudget(pixelBytes + 2 * scanlines):
+      raise newException(PixieError,
+        "PNG decode of " & $header.width & "x" & $header.height &
+        " needs " & $((pixelBytes + 2 * scanlines) div 1024) &
+        "K of decode buffers, over the " &
+        $(decodeBudgetBytes() div 1024) & "K memory budget"
+      )
 
   let headerCrc = crc32(data[pos - 17].addr, 17)
   if headerCrc != data.readUint32(pos).swap():
@@ -793,31 +865,31 @@ proc decodePng*(data: string): Png {.inline, raises: [PixieError].} =
   decodePng(data.cstring, data.len)
 
 proc decodePngScaled*(
-  data: pointer, len, width, height: int
+  data: pointer, len, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Decodes the PNG data into an Image scaled to the requested dimensions.
-  decodePng(data, len).convertToImage(width, height)
+  decodePng(data, len).convertToImage(width, height, fit)
 
 proc decodePngScaledInto*(
-  data: pointer, len: int, target: Image
+  data: pointer, len: int, target: Image, fit = fitStretch
 ) {.raises: [PixieError].} =
   ## Decodes the PNG data into an existing Image.
-  decodePng(data, len).fillImage(target)
+  decodePng(data, len).fillImage(target, fit)
 
 proc decodePngScaled*(
-  data: string, width, height: int
+  data: string, width, height: int, fit = fitStretch
 ): Image {.inline, raises: [PixieError].} =
   ## Decodes the PNG data into an Image scaled to the requested dimensions.
-  decodePngScaled(data.cstring, data.len, width, height)
+  decodePngScaled(data.cstring, data.len, width, height, fit)
 
 proc decodePngScaledInto*(
-  data: string, target: Image
+  data: string, target: Image, fit = fitStretch
 ) {.inline, raises: [PixieError].} =
   ## Decodes the PNG data into an existing Image.
-  decodePngScaledInto(data.cstring, data.len, target)
+  decodePngScaledInto(data.cstring, data.len, target, fit)
 
 proc decodePngScaled*(
-  data: var string, width, height: int
+  data: var string, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Decodes the PNG data into a scaled Image and releases the source string
   ## before allocating the target Image.
@@ -827,10 +899,10 @@ proc decodePngScaled*(
     GC_fullCollect()
   except Exception:
     discard
-  png.convertToImage(width, height)
+  png.convertToImage(width, height, fit)
 
 proc decodePngScaledInto*(
-  data: var string, target: Image
+  data: var string, target: Image, fit = fitStretch
 ) {.raises: [PixieError].} =
   ## Decodes the PNG data into an existing Image and releases the source string
   ## after PNG parsing.
@@ -840,7 +912,7 @@ proc decodePngScaledInto*(
     GC_fullCollect()
   except Exception:
     discard
-  png.fillImage(target)
+  png.fillImage(target, fit)
 
 proc encodePng*(
   width, height, channels: int, data: pointer, len: int
