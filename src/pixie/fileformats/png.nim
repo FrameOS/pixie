@@ -88,89 +88,6 @@ proc decodePalette(data: pointer, len: int): seq[ColorRGB] =
 
   copyMem(result[0].addr, data, len)
 
-proc unfilterInPlace(
-  uncompressed: var string, height, rowBytes, bpp: int
-) {.raises: [PixieError].} =
-  ## Unfilters non-interlaced scanlines in place, compacting the
-  ## [filter byte][row] stride layout into contiguous unfiltered rows at the
-  ## start of the buffer. Avoids allocating a second scanline-sized buffer,
-  ## which matters on memory-constrained targets.
-  let buf = cast[ptr UncheckedArray[uint8]](uncompressed.cstring)
-  for y in 0 ..< height:
-    let
-      filterType = buf[y * (rowBytes + 1)]
-      src = y * (rowBytes + 1) + 1
-      dst = y * rowBytes
-    # dst + x < src + x for every byte, so reads stay ahead of writes and
-    # left/up/upLeft reads all land in already-compacted rows.
-    case filterType:
-    of 0: # None
-      moveMem(buf[dst].addr, buf[src].addr, rowBytes)
-    of 1: # Sub
-      for x in 0 ..< rowBytes:
-        var value = buf[src + x]
-        if x - bpp >= 0:
-          value += buf[dst + x - bpp]
-        buf[dst + x] = value
-    of 2: # Up
-      if y == 0:
-        moveMem(buf[dst].addr, buf[src].addr, rowBytes)
-      else:
-        var x: int
-        when allowSimd and (defined(amd64) or defined(arm64)):
-          for _ in 0 ..< rowBytes div 16:
-            when defined(amd64):
-              let
-                bytes = mm_loadu_si128(buf[src + x].addr)
-                up = mm_loadu_si128(buf[dst + x - rowBytes].addr)
-              mm_storeu_si128(buf[dst + x].addr, mm_add_epi8(bytes, up))
-            else: # arm64
-              let
-                bytes = vld1q_u8(buf[src + x].addr)
-                up = vld1q_u8(buf[dst + x - rowBytes].addr)
-              vst1q_u8(buf[dst + x].addr, vaddq_u8(bytes, up))
-            x += 16
-        for x in x ..< rowBytes:
-          buf[dst + x] = buf[src + x] + buf[dst + x - rowBytes]
-    of 3: # Average
-      for x in 0 ..< rowBytes:
-        var
-          value = buf[src + x]
-          left, up: uint32
-        if x - bpp >= 0:
-          left = buf[dst + x - bpp]
-        if y - 1 >= 0:
-          up = buf[dst + x - rowBytes]
-        value += ((left + up) div 2).uint8
-        buf[dst + x] = value
-    of 4: # Paeth
-      for x in 0 ..< rowBytes:
-        var
-          value = buf[src + x]
-          left, up, upLeft: int
-        if x - bpp >= 0:
-          left = buf[dst + x - bpp].int
-        if y - 1 >= 0:
-          up = buf[dst + x - rowBytes].int
-        if x - bpp >= 0 and y - 1 >= 0:
-          upLeft = buf[dst + x - rowBytes - bpp].int
-        template paethPredictor(a, b, c: int): int =
-          let
-            p = a + b - c
-            pa = abs(p - a)
-            pb = abs(p - b)
-            pc = abs(p - c)
-          if pa <= pb and pa <= pc:
-            a
-          elif pb <= pc:
-            b
-          else:
-            c
-        value += paethPredictor(up, left, upLeft).uint8
-        buf[dst + x] = value
-    else:
-      raise newException(PixieError, "Invalid PNG row filter")
-
 proc unfilter(
   uncompressed: pointer, len, height, rowBytes, bpp: int
 ): seq[uint8] =
@@ -515,6 +432,108 @@ proc uncompressIdats(
       p = data[start].unsafeAddr
     result = try: uncompress(p, len) except ZippyError: failInvalid()
 
+proc unfilterRow(
+  cur: var seq[uint8], prev: seq[uint8], filterType: uint8, rowBytes, bpp: int
+) {.raises: [ZippyError].} =
+  ## Unfilters one scanline in place. prev must hold the previous unfiltered
+  ## row (all zeroes for the first row, matching the PNG spec).
+  template paethPredictor(a, b, c: int): int =
+    let
+      p = a + b - c
+      pa = abs(p - a)
+      pb = abs(p - b)
+      pc = abs(p - c)
+    if pa <= pb and pa <= pc:
+      a
+    elif pb <= pc:
+      b
+    else:
+      c
+
+  case filterType:
+  of 0: # None
+    discard
+  of 1: # Sub
+    for x in bpp ..< rowBytes:
+      cur[x] = cur[x] + cur[x - bpp]
+  of 2: # Up
+    for x in 0 ..< rowBytes:
+      cur[x] = cur[x] + prev[x]
+  of 3: # Average
+    for x in 0 ..< rowBytes:
+      let left = if x >= bpp: cur[x - bpp].uint32 else: 0
+      cur[x] = cur[x] + ((left + prev[x].uint32) div 2).uint8
+  of 4: # Paeth
+    for x in 0 ..< rowBytes:
+      let
+        left = if x >= bpp: cur[x - bpp].int else: 0
+        upLeft = if x >= bpp: prev[x - bpp].int else: 0
+      cur[x] = cur[x] + paethPredictor(prev[x].int, left, upLeft).uint8
+  else:
+    raise newException(ZippyError, "Invalid PNG row filter")
+
+proc streamIdatRows(
+  data: ptr UncheckedArray[uint8],
+  header: PngHeader,
+  idats: seq[(int, int)],
+  onRow: proc (y: int, row: seq[uint8]) {.gcsafe, raises: [ZippyError].}
+) =
+  ## Inflates the IDAT stream and hands unfiltered scanlines to onRow one at
+  ## a time, in order. Peak memory: zippy's fixed ~64KB streaming window plus
+  ## two row buffers, regardless of image size. Non-interlaced images only.
+  if idats.len == 0:
+    failInvalid()
+
+  let
+    rowBytes = scanlineBytes(header.width, header)
+    bpp = header.filterBytesPerPixel
+    height = header.height
+
+  var
+    prevRow = newSeq[uint8](rowBytes)
+    curRow = newSeq[uint8](rowBytes)
+    rowFill = -1 # -1 = the next byte is the row's filter type
+    filterType: uint8
+    y: int
+
+  let onData = proc (chunk: openArray[uint8]) {.gcsafe, raises: [ZippyError].} =
+    var i = 0
+    while i < chunk.len:
+      if y >= height:
+        raise newException(ZippyError, "PNG has too much image data")
+      if rowFill < 0:
+        filterType = chunk[i]
+        inc i
+        rowFill = 0
+      let take = min(chunk.len - i, rowBytes - rowFill)
+      if take > 0:
+        copyMem(curRow[rowFill].addr, chunk[i].unsafeAddr, take)
+        rowFill += take
+        i += take
+      if rowFill == rowBytes:
+        unfilterRow(curRow, prevRow, filterType, rowBytes, bpp)
+        onRow(y, curRow)
+        swap(prevRow, curRow)
+        inc y
+        rowFill = -1
+
+  try:
+    if idats.len > 1:
+      var imageData: string
+      for (start, len) in idats:
+        let op = imageData.len
+        imageData.setLen(imageData.len + len)
+        copyMem(imageData[op].addr, data[start].addr, len)
+      uncompressStream(onData, imageData.cstring, imageData.len, dfZlib)
+    else:
+      let (start, len) = idats[0]
+      uncompressStream(onData, data[start].unsafeAddr, len, dfZlib)
+  except ZippyError:
+    failInvalid()
+
+  if y != height or rowFill != -1:
+    failInvalid()
+
 proc decodeImageData(
   data: ptr UncheckedArray[uint8],
   header: PngHeader,
@@ -525,31 +544,26 @@ proc decodeImageData(
   if idats.len == 0:
     failInvalid()
 
+  if header.interlaceMethod == 0:
+    # Stream scanlines straight out of the inflate window: peak memory is the
+    # pixel seq plus a fixed ~64KB, never a whole-image scanline buffer.
+    var image = newSeq[ColorRGBA](header.width * header.height)
+    streamIdatRows(
+      data, header, idats,
+      proc (y: int, row: seq[uint8]) {.gcsafe, raises: [ZippyError].} =
+        try:
+          image.writePixels(
+            header, palette, transparency, row,
+            header.width, 1, 0, y, 1, 1
+          )
+        except PixieError as e:
+          raise newException(ZippyError, e.msg)
+    )
+    return move(image)
+
   var uncompressed = uncompressIdats(data, idats)
 
-  if header.interlaceMethod == 0:
-    let
-      rowBytes = scanlineBytes(header.width, header)
-      totalBytes = rowBytes * header.height
-
-    # Uncompressed image data should be the total bytes of pixel data plus
-    # a filter byte for each row.
-    if uncompressed.len != totalBytes + header.height:
-      failInvalid()
-
-    # Unfilter in place: peak memory stays at one scanline buffer plus the
-    # pixel seq instead of two scanline buffers.
-    unfilterInPlace(
-      uncompressed, header.height, rowBytes, header.filterBytesPerPixel
-    )
-    result.setLen(header.width * header.height)
-    result.writePixels(
-      header, palette, transparency,
-      uncompressed.toOpenArrayByte(0, header.height * rowBytes - 1),
-      header.width, header.height, 0, 0, 1, 1
-    )
-    uncompressed = ""
-  else:
+  block:
     result.setLen(header.width * header.height)
     const
       startXs = [0, 4, 0, 2, 0, 1, 0]
@@ -599,31 +613,26 @@ proc decodeImageData16(
   if idats.len == 0:
     failInvalid()
 
+  if header.interlaceMethod == 0:
+    # Stream scanlines straight out of the inflate window: peak memory is the
+    # pixel seq plus a fixed ~64KB, never a whole-image scanline buffer.
+    var image = newSeq[ColorRGBA16](header.width * header.height)
+    streamIdatRows(
+      data, header, idats,
+      proc (y: int, row: seq[uint8]) {.gcsafe, raises: [ZippyError].} =
+        try:
+          image.writePixels16(
+            header, transparency, row,
+            header.width, 1, 0, y, 1, 1
+          )
+        except PixieError as e:
+          raise newException(ZippyError, e.msg)
+    )
+    return move(image)
+
   var uncompressed = uncompressIdats(data, idats)
 
-  if header.interlaceMethod == 0:
-    let
-      rowBytes = scanlineBytes(header.width, header)
-      totalBytes = rowBytes * header.height
-
-    # Uncompressed image data should be the total bytes of pixel data plus
-    # a filter byte for each row.
-    if uncompressed.len != totalBytes + header.height:
-      failInvalid()
-
-    # Unfilter in place: peak memory stays at one scanline buffer plus the
-    # pixel seq instead of two scanline buffers.
-    unfilterInPlace(
-      uncompressed, header.height, rowBytes, header.filterBytesPerPixel
-    )
-    result.setLen(header.width * header.height)
-    result.writePixels16(
-      header, transparency,
-      uncompressed.toOpenArrayByte(0, header.height * rowBytes - 1),
-      header.width, header.height, 0, 0, 1, 1
-    )
-    uncompressed = ""
-  else:
+  block:
     result.setLen(header.width * header.height)
     const
       startXs = [0, 4, 0, 2, 0, 1, 0]
@@ -705,41 +714,46 @@ proc validateScaledPngTarget(target: Image) {.raises: [PixieError].} =
   validateScaledPngTarget(target.width, target.height)
 
 proc scaledFitRects(
-  png: Png, targetWidth, targetHeight: int, fit: ScaledDecodeFit
+  srcWidth, srcHeight, targetWidth, targetHeight: int, fit: ScaledDecodeFit
 ): tuple[srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH: int] =
   ## Computes the source crop and target placement rectangles for a fit mode.
-  result = (0, 0, png.width, png.height, 0, 0, targetWidth, targetHeight)
+  result = (0, 0, srcWidth, srcHeight, 0, 0, targetWidth, targetHeight)
   case fit
   of fitStretch:
     discard
   of fitCover:
-    if png.width.int64 * targetHeight.int64 >
-        targetWidth.int64 * png.height.int64:
+    if srcWidth.int64 * targetHeight.int64 >
+        targetWidth.int64 * srcHeight.int64:
       let cropW = max(1, (
-        png.height.int64 * targetWidth.int64 div
+        srcHeight.int64 * targetWidth.int64 div
         max(1'i64, targetHeight.int64)).int)
-      result.srcX = (png.width - cropW) div 2
+      result.srcX = (srcWidth - cropW) div 2
       result.srcW = cropW
     else:
       let cropH = max(1, (
-        png.width.int64 * targetHeight.int64 div
+        srcWidth.int64 * targetHeight.int64 div
         max(1'i64, targetWidth.int64)).int)
-      result.srcY = (png.height - cropH) div 2
+      result.srcY = (srcHeight - cropH) div 2
       result.srcH = cropH
   of fitContain:
-    if png.width.int64 * targetHeight.int64 >
-        targetWidth.int64 * png.height.int64:
+    if srcWidth.int64 * targetHeight.int64 >
+        targetWidth.int64 * srcHeight.int64:
       let fitH = max(1, (
-        targetWidth.int64 * png.height.int64 div
-        max(1'i64, png.width.int64)).int)
+        targetWidth.int64 * srcHeight.int64 div
+        max(1'i64, srcWidth.int64)).int)
       result.dstY = (targetHeight - fitH) div 2
       result.dstH = fitH
     else:
       let fitW = max(1, (
-        targetHeight.int64 * png.width.int64 div
-        max(1'i64, png.height.int64)).int)
+        targetHeight.int64 * srcWidth.int64 div
+        max(1'i64, srcHeight.int64)).int)
       result.dstX = (targetWidth - fitW) div 2
       result.dstW = fitW
+
+proc scaledFitRects(
+  png: Png, targetWidth, targetHeight: int, fit: ScaledDecodeFit
+): tuple[srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH: int] =
+  scaledFitRects(png.width, png.height, targetWidth, targetHeight, fit)
 
 proc fillImage*(
   png: Png, target: Image, fit = fitStretch
@@ -805,12 +819,50 @@ proc decodePngDimensions*(
   ## Decodes the PNG dimensions.
   decodePngDimensions(data.cstring, data.len)
 
-proc decodePng*(data: pointer, len: int): Png {.raises: [PixieError].} =
-  ## Decodes the PNG data.
+type PngStructure = object
+  header: PngHeader
+  palette: seq[ColorRGB]
+  transparency: string
+  idats: seq[(int, int)]
+
+proc streamingRowOverheadBytes(header: PngHeader): int64 =
+  ## Fixed working memory for a streamed non-interlaced decode: zippy's
+  ## inflate window plus the previous/current row buffers.
+  3 * scanlineBytes(header.width, header).int64 + 66_000
+
+proc checkDecodeBudget(header: PngHeader, planBytes: int64) =
+  if overDecodeBudget(planBytes):
+    raise newException(PixieError,
+      "PNG decode of " & $header.width & "x" & $header.height &
+      " needs " & $(planBytes div 1024) &
+      "K of decode buffers, over the " &
+      $(decodeBudgetBytes() div 1024) & "K memory budget"
+    )
+
+proc checkFullDecodeBudget(header: PngHeader) =
+  ## Non-interlaced images stream scanlines out of the inflate window, so
+  ## the peak is the pixel seq plus a fixed overhead; interlaced images
+  ## still inflate and unfilter whole-image scanline buffers.
+  let
+    pixels = header.width.int64 * header.height.int64
+    pixelBytes = pixels * (if header.bitDepth == 16: 8 else: 4)
+    planBytes =
+      if header.interlaceMethod == 0:
+        pixelBytes + header.streamingRowOverheadBytes
+      else:
+        let scanlines = scanlineBytes(header.width, header).int64 *
+          header.height.int64 + header.height.int64
+        pixelBytes + 2 * scanlines
+  checkDecodeBudget(header, planBytes)
+
+proc parsePngStructure(
+  data: ptr UncheckedArray[uint8], len: int
+): PngStructure {.raises: [PixieError].} =
+  ## Validates the PNG signature and every chunk (including CRCs) and
+  ## collects the header, palette, transparency and IDAT locations without
+  ## decoding any image data.
   if len < (8 + (8 + 13 + 4) + 4): # Magic bytes + IHDR + IEND
     failInvalid()
-
-  let data = cast[ptr UncheckedArray[uint8]](data)
 
   # PNG file signature
   let signature = cast[array[8, uint8]](data.readUint64(0))
@@ -834,27 +886,6 @@ proc decodePng*(data: pointer, len: int): Png {.raises: [PixieError].} =
   header = decodeHeader(data[pos].addr)
   prevChunkType = "IHDR"
   inc(pos, 13)
-
-  # Check the decode plan against the memory budget before any image-sized
-  # allocation. Non-interlaced images unfilter in place, so the peak is the
-  # inflated scanlines + the pixel seq; interlaced images still allocate a
-  # second unfiltered buffer per pass.
-  block:
-    let
-      pixels = header.width.int64 * header.height.int64
-      scanlines = scanlineBytes(header.width, header).int64 *
-        header.height.int64 + header.height.int64
-      pixelBytes = pixels * (if header.bitDepth == 16: 8 else: 4)
-      planBytes =
-        if header.interlaceMethod == 0: pixelBytes + scanlines
-        else: pixelBytes + 2 * scanlines
-    if overDecodeBudget(planBytes):
-      raise newException(PixieError,
-        "PNG decode of " & $header.width & "x" & $header.height &
-        " needs " & $(planBytes div 1024) &
-        "K of decode buffers, over the " &
-        $(decodeBudgetBytes() div 1024) & "K memory budget"
-      )
 
   let headerCrc = crc32(data[pos - 17].addr, 17)
   if headerCrc != data.readUint32(pos).swap():
@@ -932,31 +963,126 @@ proc decodePng*(data: pointer, len: int): Png {.raises: [PixieError].} =
   if prevChunkType != "IEND":
     failInvalid()
 
+  PngStructure(
+    header: header,
+    palette: palette,
+    transparency: transparency,
+    idats: idats
+  )
+
+proc decodeWholePng(
+  data: ptr UncheckedArray[uint8], structure: PngStructure
+): Png {.raises: [PixieError].} =
+  let header = structure.header
+
+  checkFullDecodeBudget(header)
+
   result = Png()
   result.width = header.width
   result.height = header.height
   result.channels = 4
   result.bitDepth = header.bitDepth.int
   if header.bitDepth == 16:
-    result.data16 = decodeImageData16(data, header, transparency, idats)
+    result.data16 = decodeImageData16(
+      data, header, structure.transparency, structure.idats
+    )
   else:
-    result.data = decodeImageData(data, header, palette, transparency, idats)
+    result.data = decodeImageData(
+      data, header, structure.palette, structure.transparency, structure.idats
+    )
+
+proc decodePng*(data: pointer, len: int): Png {.raises: [PixieError].} =
+  ## Decodes the PNG data.
+  let data = cast[ptr UncheckedArray[uint8]](data)
+  decodeWholePng(data, parsePngStructure(data, len))
 
 proc decodePng*(data: string): Png {.inline, raises: [PixieError].} =
   ## Decodes the PNG data.
   decodePng(data.cstring, data.len)
 
+proc canStreamScaled(header: PngHeader): bool {.inline.} =
+  # Interlaced rows arrive out of order and 16-bit rows would need their own
+  # sampling path; both are rare, so they take the buffered fallback.
+  header.interlaceMethod == 0 and header.bitDepth != 16
+
+proc decodePngScaledIntoStreaming(
+  data: ptr UncheckedArray[uint8],
+  structure: PngStructure,
+  target: Image,
+  fit: ScaledDecodeFit
+) {.raises: [PixieError].} =
+  ## Samples scanlines into the target as they stream out of the inflate
+  ## window. Peak memory: one row of RGBA pixels plus the fixed streaming
+  ## overhead — the full-size pixel buffer is never allocated.
+  let header = structure.header
+
+  checkDecodeBudget(header,
+    header.streamingRowOverheadBytes + header.width.int64 * 4)
+
+  let rects = scaledFitRects(
+    header.width, header.height, target.width, target.height, fit
+  )
+
+  template srcYFor(y: int): int =
+    min(
+      rects.srcY + ((y - rects.dstY) * rects.srcH) div rects.dstH,
+      header.height - 1
+    )
+
+  template srcXFor(x: int): int =
+    min(
+      rects.srcX + ((x - rects.dstX) * rects.srcW) div rects.dstW,
+      header.width - 1
+    )
+
+  var
+    rowPixels = newSeq[ColorRGBA](header.width)
+    dstY = rects.dstY
+  let dstYEnd = rects.dstY + rects.dstH
+
+  streamIdatRows(
+    data, header, structure.idats,
+    proc (y: int, row: seq[uint8]) {.gcsafe, raises: [ZippyError].} =
+      if dstY >= dstYEnd or srcYFor(dstY) != y:
+        return # No remaining target row samples this source row
+      try:
+        rowPixels.writePixels(
+          header, structure.palette, structure.transparency, row,
+          header.width, 1, 0, 0, 1, 1
+        )
+      except PixieError as e:
+        raise newException(ZippyError, e.msg)
+      while dstY < dstYEnd and srcYFor(dstY) == y:
+        for x in rects.dstX ..< rects.dstX + rects.dstW:
+          target.unsafe[x, dstY] = rowPixels[srcXFor(x)].rgbx()
+        inc dstY
+  )
+
 proc decodePngScaled*(
   data: pointer, len, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Decodes the PNG data into an Image scaled to the requested dimensions.
-  decodePng(data, len).convertToImage(width, height, fit)
+  validateScaledPngTarget(width, height)
+  let data = cast[ptr UncheckedArray[uint8]](data)
+  let structure = parsePngStructure(data, len)
+  if structure.header.canStreamScaled:
+    result = newImage(width, height)
+    decodePngScaledIntoStreaming(data, structure, result, fit)
+  else:
+    result = decodeWholePng(data, structure).convertToImage(width, height, fit)
 
 proc decodePngScaledInto*(
   data: pointer, len: int, target: Image, fit = fitStretch
 ) {.raises: [PixieError].} =
-  ## Decodes the PNG data into an existing Image.
-  decodePng(data, len).fillImage(target, fit)
+  ## Decodes the PNG data into an existing Image. With fitContain, pixels
+  ## outside the fitted rectangle keep their current contents.
+  validateScaledPngTarget(target)
+  let data = cast[ptr UncheckedArray[uint8]](data)
+  let structure = parsePngStructure(data, len)
+  if structure.header.canStreamScaled:
+    decodePngScaledIntoStreaming(data, structure, target, fit)
+  else:
+    decodeWholePng(data, structure).fillImage(target, fit)
 
 proc decodePngScaled*(
   data: string, width, height: int, fit = fitStretch
@@ -974,27 +1100,27 @@ proc decodePngScaled*(
   data: var string, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].} =
   ## Decodes the PNG data into a scaled Image and releases the source string
-  ## before allocating the target Image.
-  let png = decodePng(data.cstring, data.len)
+  ## afterwards. The streamed decode never holds a full-size pixel buffer,
+  ## so releasing the source early no longer matters; it is freed on return
+  ## for callers that rely on it.
+  result = decodePngScaled(data.cstring, data.len, width, height, fit)
   data = ""
   try:
     GC_fullCollect()
   except Exception:
     discard
-  png.convertToImage(width, height, fit)
 
 proc decodePngScaledInto*(
   data: var string, target: Image, fit = fitStretch
 ) {.raises: [PixieError].} =
-  ## Decodes the PNG data into an existing Image and releases the source string
-  ## after PNG parsing.
-  let png = decodePng(data.cstring, data.len)
+  ## Decodes the PNG data into an existing Image and releases the source
+  ## string afterwards.
+  decodePngScaledInto(data.cstring, data.len, target, fit)
   data = ""
   try:
     GC_fullCollect()
   except Exception:
     discard
-  png.fillImage(target, fit)
 
 proc encodePng*(
   width, height, channels: int, data: pointer, len: int
