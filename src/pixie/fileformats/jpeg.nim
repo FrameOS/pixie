@@ -842,7 +842,10 @@ proc seekEntropyMarker(state: var DecoderState): bool =
       pos = markerPos + 1
       continue
     if marker.isEntropyMarker():
-      state.pos = pos
+      # A long 0xFF run can slide the streaming window past the run start;
+      # resuming at the window start keeps recovery working for these
+      # already-damaged inputs instead of failing the whole decode.
+      state.pos = max(pos, state.windowStart)
       state.hitEnd = true
       state.bitsBuffered = 0
       state.bitBuffer = 0
