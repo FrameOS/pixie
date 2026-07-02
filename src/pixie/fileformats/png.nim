@@ -1,5 +1,5 @@
 import chroma, flatty/binny, ../common, ../decodebudget, ../images,
-    ../internal, ../simd, zippy, crunchy
+    ../inflatestream, ../internal, ../simd, zippy, crunchy
 
 # See http://www.libpng.org/pub/png/spec/1.2/PNG-Contents.html
 
@@ -434,7 +434,7 @@ proc uncompressIdats(
 
 proc unfilterRow(
   cur: var seq[uint8], prev: seq[uint8], filterType: uint8, rowBytes, bpp: int
-) {.raises: [ZippyError].} =
+) {.raises: [PixieError].} =
   ## Unfilters one scanline in place. prev must hold the previous unfiltered
   ## row (all zeroes for the first row, matching the PNG spec).
   template paethPredictor(a, b, c: int): int =
@@ -470,13 +470,13 @@ proc unfilterRow(
         upLeft = if x >= bpp: prev[x - bpp].int else: 0
       cur[x] = cur[x] + paethPredictor(prev[x].int, left, upLeft).uint8
   else:
-    raise newException(ZippyError, "Invalid PNG row filter")
+    raise newException(PixieError, "Invalid PNG row filter")
 
 proc streamIdatRows(
   data: ptr UncheckedArray[uint8],
   header: PngHeader,
   idats: seq[(int, int)],
-  onRow: proc (y: int, row: seq[uint8]) {.gcsafe, raises: [ZippyError].}
+  onRow: proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].}
 ) =
   ## Inflates the IDAT stream and hands unfiltered scanlines to onRow one at
   ## a time, in order. Peak memory: zippy's fixed ~64KB streaming window plus
@@ -496,11 +496,11 @@ proc streamIdatRows(
     filterType: uint8
     y: int
 
-  let onData = proc (chunk: openArray[uint8]) {.gcsafe, raises: [ZippyError].} =
+  let onData = proc (chunk: openArray[uint8]) {.gcsafe, raises: [PixieError].} =
     var i = 0
     while i < chunk.len:
       if y >= height:
-        raise newException(ZippyError, "PNG has too much image data")
+        raise newException(PixieError, "PNG has too much image data")
       if rowFill < 0:
         filterType = chunk[i]
         inc i
@@ -517,19 +517,16 @@ proc streamIdatRows(
         inc y
         rowFill = -1
 
-  try:
-    if idats.len > 1:
-      var imageData: string
-      for (start, len) in idats:
-        let op = imageData.len
-        imageData.setLen(imageData.len + len)
-        copyMem(imageData[op].addr, data[start].addr, len)
-      uncompressStream(onData, imageData.cstring, imageData.len, dfZlib)
-    else:
-      let (start, len) = idats[0]
-      uncompressStream(onData, data[start].unsafeAddr, len, dfZlib)
-  except ZippyError:
-    failInvalid()
+  if idats.len > 1:
+    var imageData: string
+    for (start, len) in idats:
+      let op = imageData.len
+      imageData.setLen(imageData.len + len)
+      copyMem(imageData[op].addr, data[start].addr, len)
+    uncompressStreamZlib(onData, imageData.cstring, imageData.len)
+  else:
+    let (start, len) = idats[0]
+    uncompressStreamZlib(onData, data[start].unsafeAddr, len)
 
   if y != height or rowFill != -1:
     failInvalid()
@@ -550,14 +547,11 @@ proc decodeImageData(
     var image = newSeq[ColorRGBA](header.width * header.height)
     streamIdatRows(
       data, header, idats,
-      proc (y: int, row: seq[uint8]) {.gcsafe, raises: [ZippyError].} =
-        try:
-          image.writePixels(
-            header, palette, transparency, row,
-            header.width, 1, 0, y, 1, 1
-          )
-        except PixieError as e:
-          raise newException(ZippyError, e.msg)
+      proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].} =
+        image.writePixels(
+          header, palette, transparency, row,
+          header.width, 1, 0, y, 1, 1
+        )
     )
     return move(image)
 
@@ -619,14 +613,11 @@ proc decodeImageData16(
     var image = newSeq[ColorRGBA16](header.width * header.height)
     streamIdatRows(
       data, header, idats,
-      proc (y: int, row: seq[uint8]) {.gcsafe, raises: [ZippyError].} =
-        try:
-          image.writePixels16(
-            header, transparency, row,
-            header.width, 1, 0, y, 1, 1
-          )
-        except PixieError as e:
-          raise newException(ZippyError, e.msg)
+      proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].} =
+        image.writePixels16(
+          header, transparency, row,
+          header.width, 1, 0, y, 1, 1
+        )
     )
     return move(image)
 
@@ -1042,16 +1033,13 @@ proc decodePngScaledIntoStreaming(
 
   streamIdatRows(
     data, header, structure.idats,
-    proc (y: int, row: seq[uint8]) {.gcsafe, raises: [ZippyError].} =
+    proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].} =
       if dstY >= dstYEnd or srcYFor(dstY) != y:
         return # No remaining target row samples this source row
-      try:
-        rowPixels.writePixels(
-          header, structure.palette, structure.transparency, row,
-          header.width, 1, 0, 0, 1, 1
-        )
-      except PixieError as e:
-        raise newException(ZippyError, e.msg)
+      rowPixels.writePixels(
+        header, structure.palette, structure.transparency, row,
+        header.width, 1, 0, 0, 1, 1
+      )
       while dstY < dstYEnd and srcYFor(dstY) == y:
         for x in rects.dstX ..< rects.dstX + rects.dstW:
           target.unsafe[x, dstY] = rowPixels[srcXFor(x)].rgbx()
