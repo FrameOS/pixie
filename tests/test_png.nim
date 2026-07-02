@@ -1,4 +1,4 @@
-import pixie, pixie/fileformats/png, pngsuite, strformat
+import pixie, pixie/fileformats/png, pixie/decodebudget, pngsuite, strformat, strutils
 
 when defined(writeImages):
   import write_images
@@ -78,3 +78,26 @@ block:
     decodeImageDimensions(readFile("tests/fileformats/png/mandrill.png"))
   doAssert dimensions.width == 512
   doAssert dimensions.height == 512
+
+block: # in-place unfilter keeps canvas-sized decodes within tight budgets
+  let source = newImage(480, 800)
+  for y in 0 ..< source.height:
+    for x in 0 ..< source.width:
+      source.unsafe[x, y] = rgbx(uint8(x mod 256), uint8(y mod 256), uint8((x + y) mod 256), 255)
+  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.data.len * 4)
+
+  # Plan is pixels + scanlines (~3.0MB); a 4MB budget must accept it
+  setDecodeBudgetBytes(4 * 1024 * 1024)
+  let decoded = decodePng(encoded).convertToImage()
+  doAssert decoded.width == 480
+  doAssert decoded.height == 800
+  doAssert decoded[123, 456] == source[123, 456]
+
+  # And a 2MB budget must reject it with a catchable error
+  setDecodeBudgetBytes(2 * 1024 * 1024)
+  try:
+    discard decodePng(encoded)
+    doAssert false
+  except PixieError as e:
+    doAssert "memory budget" in e.msg
+  setDecodeBudgetBytes(0)

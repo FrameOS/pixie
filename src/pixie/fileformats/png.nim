@@ -88,6 +88,89 @@ proc decodePalette(data: pointer, len: int): seq[ColorRGB] =
 
   copyMem(result[0].addr, data, len)
 
+proc unfilterInPlace(
+  uncompressed: var string, height, rowBytes, bpp: int
+) {.raises: [PixieError].} =
+  ## Unfilters non-interlaced scanlines in place, compacting the
+  ## [filter byte][row] stride layout into contiguous unfiltered rows at the
+  ## start of the buffer. Avoids allocating a second scanline-sized buffer,
+  ## which matters on memory-constrained targets.
+  let buf = cast[ptr UncheckedArray[uint8]](uncompressed.cstring)
+  for y in 0 ..< height:
+    let
+      filterType = buf[y * (rowBytes + 1)]
+      src = y * (rowBytes + 1) + 1
+      dst = y * rowBytes
+    # dst + x < src + x for every byte, so reads stay ahead of writes and
+    # left/up/upLeft reads all land in already-compacted rows.
+    case filterType:
+    of 0: # None
+      moveMem(buf[dst].addr, buf[src].addr, rowBytes)
+    of 1: # Sub
+      for x in 0 ..< rowBytes:
+        var value = buf[src + x]
+        if x - bpp >= 0:
+          value += buf[dst + x - bpp]
+        buf[dst + x] = value
+    of 2: # Up
+      if y == 0:
+        moveMem(buf[dst].addr, buf[src].addr, rowBytes)
+      else:
+        var x: int
+        when allowSimd and (defined(amd64) or defined(arm64)):
+          for _ in 0 ..< rowBytes div 16:
+            when defined(amd64):
+              let
+                bytes = mm_loadu_si128(buf[src + x].addr)
+                up = mm_loadu_si128(buf[dst + x - rowBytes].addr)
+              mm_storeu_si128(buf[dst + x].addr, mm_add_epi8(bytes, up))
+            else: # arm64
+              let
+                bytes = vld1q_u8(buf[src + x].addr)
+                up = vld1q_u8(buf[dst + x - rowBytes].addr)
+              vst1q_u8(buf[dst + x].addr, vaddq_u8(bytes, up))
+            x += 16
+        for x in x ..< rowBytes:
+          buf[dst + x] = buf[src + x] + buf[dst + x - rowBytes]
+    of 3: # Average
+      for x in 0 ..< rowBytes:
+        var
+          value = buf[src + x]
+          left, up: uint32
+        if x - bpp >= 0:
+          left = buf[dst + x - bpp]
+        if y - 1 >= 0:
+          up = buf[dst + x - rowBytes]
+        value += ((left + up) div 2).uint8
+        buf[dst + x] = value
+    of 4: # Paeth
+      for x in 0 ..< rowBytes:
+        var
+          value = buf[src + x]
+          left, up, upLeft: int
+        if x - bpp >= 0:
+          left = buf[dst + x - bpp].int
+        if y - 1 >= 0:
+          up = buf[dst + x - rowBytes].int
+        if x - bpp >= 0 and y - 1 >= 0:
+          upLeft = buf[dst + x - rowBytes - bpp].int
+        template paethPredictor(a, b, c: int): int =
+          let
+            p = a + b - c
+            pa = abs(p - a)
+            pb = abs(p - b)
+            pc = abs(p - c)
+          if pa <= pb and pa <= pc:
+            a
+          elif pb <= pc:
+            b
+          else:
+            c
+        value += paethPredictor(up, left, upLeft).uint8
+        buf[dst + x] = value
+    else:
+      raise newException(PixieError, "Invalid PNG row filter")
+
 proc unfilter(
   uncompressed: pointer, len, height, rowBytes, bpp: int
 ): seq[uint8] =
@@ -454,21 +537,18 @@ proc decodeImageData(
     if uncompressed.len != totalBytes + header.height:
       failInvalid()
 
-    let unfiltered = unfilter(
-      uncompressed.cstring,
-      uncompressed.len,
-      header.height,
-      rowBytes,
-      header.filterBytesPerPixel
+    # Unfilter in place: peak memory stays at one scanline buffer plus the
+    # pixel seq instead of two scanline buffers.
+    unfilterInPlace(
+      uncompressed, header.height, rowBytes, header.filterBytesPerPixel
     )
-    # The inflated scanlines are no longer needed; release them before the
-    # pixel seq is allocated to lower the peak footprint.
-    uncompressed = ""
     result.setLen(header.width * header.height)
     result.writePixels(
-      header, palette, transparency, unfiltered,
+      header, palette, transparency,
+      uncompressed.toOpenArrayByte(0, header.height * rowBytes - 1),
       header.width, header.height, 0, 0, 1, 1
     )
+    uncompressed = ""
   else:
     result.setLen(header.width * header.height)
     const
@@ -531,21 +611,18 @@ proc decodeImageData16(
     if uncompressed.len != totalBytes + header.height:
       failInvalid()
 
-    let unfiltered = unfilter(
-      uncompressed.cstring,
-      uncompressed.len,
-      header.height,
-      rowBytes,
-      header.filterBytesPerPixel
+    # Unfilter in place: peak memory stays at one scanline buffer plus the
+    # pixel seq instead of two scanline buffers.
+    unfilterInPlace(
+      uncompressed, header.height, rowBytes, header.filterBytesPerPixel
     )
-    # The inflated scanlines are no longer needed; release them before the
-    # pixel seq is allocated to lower the peak footprint.
-    uncompressed = ""
     result.setLen(header.width * header.height)
     result.writePixels16(
-      header, transparency, unfiltered,
+      header, transparency,
+      uncompressed.toOpenArrayByte(0, header.height * rowBytes - 1),
       header.width, header.height, 0, 0, 1, 1
     )
+    uncompressed = ""
   else:
     result.setLen(header.width * header.height)
     const
@@ -759,17 +836,22 @@ proc decodePng*(data: pointer, len: int): Png {.raises: [PixieError].} =
   inc(pos, 13)
 
   # Check the decode plan against the memory budget before any image-sized
-  # allocation: inflated scanlines + unfiltered scanlines + the pixel seq.
+  # allocation. Non-interlaced images unfilter in place, so the peak is the
+  # inflated scanlines + the pixel seq; interlaced images still allocate a
+  # second unfiltered buffer per pass.
   block:
     let
       pixels = header.width.int64 * header.height.int64
       scanlines = scanlineBytes(header.width, header).int64 *
         header.height.int64 + header.height.int64
       pixelBytes = pixels * (if header.bitDepth == 16: 8 else: 4)
-    if overDecodeBudget(pixelBytes + 2 * scanlines):
+      planBytes =
+        if header.interlaceMethod == 0: pixelBytes + scanlines
+        else: pixelBytes + 2 * scanlines
+    if overDecodeBudget(planBytes):
       raise newException(PixieError,
         "PNG decode of " & $header.width & "x" & $header.height &
-        " needs " & $((pixelBytes + 2 * scanlines) div 1024) &
+        " needs " & $(planBytes div 1024) &
         "K of decode buffers, over the " &
         $(decodeBudgetBytes() div 1024) & "K memory budget"
       )
