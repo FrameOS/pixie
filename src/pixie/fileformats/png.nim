@@ -472,16 +472,28 @@ proc unfilterRow(
   else:
     raise newException(PixieError, "Invalid PNG row filter")
 
+proc idatSlices(
+  data: ptr UncheckedArray[uint8], idats: seq[(int, int)]
+): seq[InflateSegment] =
+  ## The IDAT chunks of a contiguous PNG as inflater segments — big PNGs
+  ## commonly split their compressed data across hundreds of IDATs, and
+  ## concatenating them would momentarily double the compressed-body
+  ## allocation.
+  result = newSeq[InflateSegment](idats.len)
+  for i, (start, len) in idats:
+    result[i] = InflateSegment(
+      data: cast[ptr UncheckedArray[uint8]](data[start].unsafeAddr), len: len
+    )
+
 proc streamIdatRows(
-  data: ptr UncheckedArray[uint8],
+  idatSegments: seq[InflateSegment],
   header: PngHeader,
-  idats: seq[(int, int)],
   onRow: proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].}
 ) =
   ## Inflates the IDAT stream and hands unfiltered scanlines to onRow one at
   ## a time, in order. Peak memory: zippy's fixed ~64KB streaming window plus
   ## two row buffers, regardless of image size. Non-interlaced images only.
-  if idats.len == 0:
+  if idatSegments.len == 0:
     failInvalid()
 
   let
@@ -517,15 +529,7 @@ proc streamIdatRows(
         inc y
         rowFill = -1
 
-  # Feed the IDAT chunks to the inflater as segments: big PNGs commonly
-  # split their compressed data across hundreds of IDATs, and concatenating
-  # them would momentarily double the compressed-body allocation.
-  var segments = newSeq[InflateSegment](idats.len)
-  for i, (start, len) in idats:
-    segments[i] = InflateSegment(
-      data: cast[ptr UncheckedArray[uint8]](data[start].unsafeAddr), len: len
-    )
-  uncompressStreamZlib(onData, segments)
+  uncompressStreamZlib(onData, idatSegments)
 
   if y != height or rowFill != -1:
     failInvalid()
@@ -545,7 +549,7 @@ proc decodeImageData(
     # pixel seq plus a fixed ~64KB, never a whole-image scanline buffer.
     var image = newSeq[ColorRGBA](header.width * header.height)
     streamIdatRows(
-      data, header, idats,
+      idatSlices(data, idats), header,
       proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].} =
         image.writePixels(
           header, palette, transparency, row,
@@ -611,7 +615,7 @@ proc decodeImageData16(
     # pixel seq plus a fixed ~64KB, never a whole-image scanline buffer.
     var image = newSeq[ColorRGBA16](header.width * header.height)
     streamIdatRows(
-      data, header, idats,
+      idatSlices(data, idats), header,
       proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].} =
         image.writePixels16(
           header, transparency, row,
@@ -996,7 +1000,7 @@ proc canStreamScaled(header: PngHeader): bool {.inline.} =
   header.interlaceMethod == 0 and header.bitDepth != 16
 
 proc decodePngScaledIntoStreaming(
-  data: ptr UncheckedArray[uint8],
+  idatSegments: seq[InflateSegment],
   structure: PngStructure,
   target: Image,
   fit: ScaledDecodeFit
@@ -1031,7 +1035,7 @@ proc decodePngScaledIntoStreaming(
   let dstYEnd = rects.dstY + rects.dstH
 
   streamIdatRows(
-    data, header, structure.idats,
+    idatSegments, header,
     proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].} =
       if dstY >= dstYEnd or srcYFor(dstY) != y:
         return # No remaining target row samples this source row
@@ -1054,7 +1058,7 @@ proc decodePngScaled*(
   let structure = parsePngStructure(data, len)
   if structure.header.canStreamScaled:
     result = newImage(width, height)
-    decodePngScaledIntoStreaming(data, structure, result, fit)
+    decodePngScaledIntoStreaming(idatSlices(data, structure.idats), structure, result, fit)
   else:
     result = decodeWholePng(data, structure).convertToImage(width, height, fit)
 
@@ -1067,7 +1071,7 @@ proc decodePngScaledInto*(
   let data = cast[ptr UncheckedArray[uint8]](data)
   let structure = parsePngStructure(data, len)
   if structure.header.canStreamScaled:
-    decodePngScaledIntoStreaming(data, structure, target, fit)
+    decodePngScaledIntoStreaming(idatSlices(data, structure.idats), structure, target, fit)
   else:
     decodeWholePng(data, structure).fillImage(target, fit)
 
@@ -1108,6 +1112,256 @@ proc decodePngScaledInto*(
     GC_fullCollect()
   except Exception:
     discard
+
+# ------------------------------------------------------------------------
+# Segmented sources: decode a PNG whose bytes are spread across several
+# non-contiguous buffers (e.g. an HTTP body downloaded in fixed-size chunks
+# on a device whose fragmented heap has no room for one contiguous copy).
+
+const pngCrcTable = block:
+  var table: array[256, uint32]
+  for i in 0 ..< 256:
+    var c = i.uint32
+    for _ in 0 ..< 8:
+      c = if (c and 1) != 0: 0xEDB88320'u32 xor (c shr 1) else: c shr 1
+    table[i] = c
+  table
+
+proc pngCrcUpdate(crc: uint32, data: openArray[uint8], len: int): uint32 =
+  result = crc
+  for i in 0 ..< len:
+    result = pngCrcTable[(result xor data[i].uint32) and 0xff] xor (result shr 8)
+
+type PngSegmentReader = object
+  segments: seq[InflateSegment]
+  seg, offset: int # Current segment and offset within it
+  pos: int         # Global position
+  total: int
+
+proc initPngSegmentReader(segments: openArray[InflateSegment]): PngSegmentReader =
+  result.segments = @segments
+  for segment in segments:
+    result.total += segment.len
+
+proc readBytesCrc(
+  r: var PngSegmentReader, dst: ptr UncheckedArray[uint8], len: int,
+  crc: var uint32, updateCrc: bool
+) =
+  ## Reads len bytes across segments into dst (skips when dst is nil),
+  ## optionally folding them into crc.
+  var remaining = len
+  var written = 0
+  while remaining > 0:
+    if r.seg >= r.segments.len:
+      failInvalid()
+    let segment = r.segments[r.seg]
+    let available = segment.len - r.offset
+    if available <= 0:
+      inc r.seg
+      r.offset = 0
+      continue
+    let take = min(remaining, available)
+    if updateCrc:
+      crc = crc.pngCrcUpdate(
+        segment.data.toOpenArray(r.offset, r.offset + take - 1), take)
+    if dst != nil:
+      copyMem(dst[written].addr, segment.data[r.offset].addr, take)
+      written += take
+    r.offset += take
+    r.pos += take
+    remaining -= take
+
+proc readBytes(r: var PngSegmentReader, dst: ptr UncheckedArray[uint8], len: int) =
+  var crc: uint32
+  r.readBytesCrc(dst, len, crc, false)
+
+proc readU32be(r: var PngSegmentReader): uint32 =
+  var bytes: array[4, uint8]
+  r.readBytes(cast[ptr UncheckedArray[uint8]](bytes[0].addr), 4)
+  (bytes[0].uint32 shl 24) or (bytes[1].uint32 shl 16) or
+    (bytes[2].uint32 shl 8) or bytes[3].uint32
+
+proc sliceSegments(
+  segments: openArray[InflateSegment], start, len: int
+): seq[InflateSegment] =
+  ## The [start, start+len) global span of the segments, as segment slices.
+  var
+    remaining = len
+    pos = 0
+  for segment in segments:
+    if remaining == 0:
+      break
+    let segStart = pos
+    pos += segment.len
+    if pos <= start:
+      continue
+    let offset = max(start - segStart, 0)
+    let take = min(segment.len - offset, remaining)
+    if take > 0:
+      result.add(InflateSegment(
+        data: cast[ptr UncheckedArray[uint8]](segment.data[offset].addr),
+        len: take
+      ))
+      remaining -= take
+  if remaining != 0:
+    failInvalid()
+
+proc parsePngStructure(
+  segments: openArray[InflateSegment]
+): PngStructure {.raises: [PixieError].} =
+  ## Segmented mirror of the contiguous parser: validates the signature and
+  ## every chunk CRC, collecting the header, palette, transparency and
+  ## global IDAT spans without copying the image data anywhere.
+  var r = initPngSegmentReader(segments)
+  if r.total < (8 + (8 + 13 + 4) + 4): # Magic bytes + IHDR + IEND
+    failInvalid()
+
+  var signature: array[8, uint8]
+  r.readBytes(cast[ptr UncheckedArray[uint8]](signature[0].addr), 8)
+  if signature != pngSignature:
+    failInvalid()
+
+  var
+    counts = ChunkCounts()
+    header: PngHeader
+    palette: seq[ColorRGB]
+    transparency: string
+    idats: seq[(int, int)]
+    prevChunkType: string
+
+  # First chunk must be IHDR
+  var chunkType: array[4, uint8]
+  var crc = 0xffffffff'u32
+  if r.readU32be() != 13:
+    failInvalid()
+  r.readBytesCrc(cast[ptr UncheckedArray[uint8]](chunkType[0].addr), 4, crc, true)
+  if chunkType != [73'u8, 72, 68, 82]: # "IHDR"
+    failInvalid()
+  var ihdr: array[13, uint8]
+  r.readBytesCrc(cast[ptr UncheckedArray[uint8]](ihdr[0].addr), 13, crc, true)
+  header = decodeHeader(ihdr[0].addr)
+  prevChunkType = "IHDR"
+  if (crc xor 0xffffffff'u32) != r.readU32be():
+    failCRC()
+
+  while true:
+    if r.pos + 8 > r.total:
+      failInvalid()
+
+    let chunkLen = r.readU32be().int
+    crc = 0xffffffff'u32
+    r.readBytesCrc(cast[ptr UncheckedArray[uint8]](chunkType[0].addr), 4, crc, true)
+    let chunkTypeStr = block:
+      var s = newString(4)
+      copyMem(s[0].addr, chunkType[0].addr, 4)
+      s
+
+    if chunkLen > high(int32).int:
+      failInvalid()
+
+    if r.pos + chunkLen + 4 > r.total:
+      failInvalid()
+
+    case chunkTypeStr:
+    of "IHDR":
+      failInvalid()
+    of "PLTE":
+      inc counts.PLTE
+      if counts.PLTE > 1 or counts.IDAT > 0 or counts.tRNS > 0:
+        failInvalid()
+      var paletteBytes = newSeq[uint8](chunkLen)
+      if chunkLen > 0:
+        r.readBytesCrc(
+          cast[ptr UncheckedArray[uint8]](paletteBytes[0].addr),
+          chunkLen, crc, true)
+      palette = decodePalette(
+        if chunkLen > 0: paletteBytes[0].addr else: nil, chunkLen)
+    of "tRNS":
+      inc counts.tRNS
+      if counts.tRNS > 1 or counts.IDAT > 0:
+        failInvalid()
+      transparency = newString(chunkLen)
+      if chunkLen > 0:
+        r.readBytesCrc(
+          cast[ptr UncheckedArray[uint8]](transparency[0].addr),
+          chunkLen, crc, true)
+      case header.colorType:
+      of 0:
+        if transparency.len != 2:
+          failInvalid()
+      of 2:
+        if transparency.len != 6:
+          failInvalid()
+      of 3:
+        if transparency.len > palette.len:
+          failInvalid()
+      else:
+        failInvalid()
+    of "IDAT":
+      inc counts.IDAT
+      if counts.IDAT > 1 and prevChunkType != "IDAT":
+        failInvalid()
+      if header.colorType == 3 and counts.PLTE == 0:
+        failInvalid()
+      idats.add((r.pos, chunkLen))
+      r.readBytesCrc(nil, chunkLen, crc, true)
+    of "IEND":
+      if chunkLen != 0:
+        failInvalid()
+    else:
+      if (chunkType[0] and 0b00100000) == 0:
+        raise newException(
+          PixieError, "Unrecognized PNG critical chunk " & chunkTypeStr
+        )
+      r.readBytesCrc(nil, chunkLen, crc, true)
+
+    if (crc xor 0xffffffff'u32) != r.readU32be():
+      failCRC()
+
+    prevChunkType = chunkTypeStr
+
+    if r.pos == r.total or prevChunkType == "IEND":
+      break
+
+  if prevChunkType != "IEND":
+    failInvalid()
+
+  PngStructure(
+    header: header,
+    palette: palette,
+    transparency: transparency,
+    idats: idats
+  )
+
+proc coalesceSegments(segments: openArray[InflateSegment]): string =
+  var total = 0
+  for segment in segments:
+    total += segment.len
+  result = newString(total)
+  var pos = 0
+  for segment in segments:
+    if segment.len > 0:
+      copyMem(result[pos].addr, segment.data[0].addr, segment.len)
+      pos += segment.len
+
+proc decodePngScaledInto*(
+  segments: openArray[InflateSegment], target: Image, fit = fitStretch
+) {.raises: [PixieError].} =
+  ## Decodes a PNG spread across non-contiguous buffers into an existing
+  ## Image. Non-interlaced ≤8-bit images stream scanlines straight out of
+  ## the inflate window without ever assembling a contiguous copy of the
+  ## file or a full-size pixel buffer; interlaced/16-bit images fall back
+  ## to coalescing and the buffered decode.
+  validateScaledPngTarget(target)
+  let structure = parsePngStructure(segments)
+  if structure.header.canStreamScaled:
+    var idatSegments: seq[InflateSegment]
+    for (start, len) in structure.idats:
+      idatSegments.add(sliceSegments(segments, start, len))
+    decodePngScaledIntoStreaming(idatSegments, structure, target, fit)
+  else:
+    var data = coalesceSegments(segments)
+    decodePng(data.cstring, data.len).fillImage(target, fit)
 
 proc encodePng*(
   width, height, channels: int, data: pointer, len: int

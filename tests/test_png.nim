@@ -1,4 +1,4 @@
-import pixie, pixie/fileformats/png, pixie/decodebudget, pngsuite, strformat, strutils, crunchy, flatty/binny
+import pixie, pixie/fileformats/png, pixie/decodebudget, pixie/inflatestream, pngsuite, strformat, strutils, crunchy, flatty/binny
 
 when defined(writeImages):
   import write_images
@@ -126,46 +126,47 @@ block: # streamed scaled decodes match the buffered fillImage path
         doAssert streamed.data[i] == buffered.data[i],
           "pixel mismatch at " & $i & " fit " & $fit & " " & $w & "x" & $h
 
+proc rechunkIdat(encoded: string, chunkSize: int): string =
+  ## Rewrites a PNG so its IDAT payload is split into chunkSize-byte IDATs.
+  var idatData = ""
+  result = encoded[0 ..< 8] # signature
+  var pos = 8
+  while pos < encoded.len:
+    let
+      chunkLen = int(encoded.readUint32(pos).swap())
+      chunkType = encoded[pos + 4 ..< pos + 8]
+  # collect IDAT payloads, copy everything else verbatim (before IEND)
+    if chunkType == "IDAT":
+      idatData.add(encoded[pos + 8 ..< pos + 8 + chunkLen])
+    elif chunkType == "IEND":
+      break
+    else:
+      result.add(encoded[pos ..< pos + 12 + chunkLen])
+    pos += 12 + chunkLen
+
+  var off = 0
+  while off < idatData.len:
+    let n = min(chunkSize, idatData.len - off)
+    var chunk = ""
+    chunk.addUint32(n.uint32.swap())
+    chunk.add("IDAT")
+    chunk.add(idatData[off ..< off + n])
+    chunk.addUint32(crc32(chunk[chunk.len - n - 4].addr, n + 4).swap())
+    result.add(chunk)
+    off += n
+
+  var iend = ""
+  iend.addUint32(0.uint32.swap())
+  iend.add("IEND")
+  iend.addUint32(crc32(iend[iend.len - 4].addr, 4).swap())
+  result.add(iend)
+
+
 block: # multi-IDAT PNGs decode without concatenating the compressed stream
   # Real-world encoders split compressed data across hundreds of IDAT
   # chunks (libpng defaults to 8K). The inflater consumes them as segments;
   # re-chunk a PNG's IDAT at awkward sizes — including 1-byte chunks that
   # split the zlib header — and require identical output.
-  proc rechunkIdat(encoded: string, chunkSize: int): string =
-    ## Rewrites a PNG so its IDAT payload is split into chunkSize-byte IDATs.
-    var idatData = ""
-    result = encoded[0 ..< 8] # signature
-    var pos = 8
-    while pos < encoded.len:
-      let
-        chunkLen = int(encoded.readUint32(pos).swap())
-        chunkType = encoded[pos + 4 ..< pos + 8]
-    # collect IDAT payloads, copy everything else verbatim (before IEND)
-      if chunkType == "IDAT":
-        idatData.add(encoded[pos + 8 ..< pos + 8 + chunkLen])
-      elif chunkType == "IEND":
-        break
-      else:
-        result.add(encoded[pos ..< pos + 12 + chunkLen])
-      pos += 12 + chunkLen
-
-    var off = 0
-    while off < idatData.len:
-      let n = min(chunkSize, idatData.len - off)
-      var chunk = ""
-      chunk.addUint32(n.uint32.swap())
-      chunk.add("IDAT")
-      chunk.add(idatData[off ..< off + n])
-      chunk.addUint32(crc32(chunk[chunk.len - n - 4].addr, n + 4).swap())
-      result.add(chunk)
-      off += n
-
-    var iend = ""
-    iend.addUint32(0.uint32.swap())
-    iend.add("IEND")
-    iend.addUint32(crc32(iend[iend.len - 4].addr, 4).swap())
-    result.add(iend)
-
   let source = newImage(101, 53)
   for y in 0 ..< source.height:
     for x in 0 ..< source.width:
@@ -187,3 +188,55 @@ block: # multi-IDAT PNGs decode without concatenating the compressed stream
     for i in 0 ..< target.data.len:
       doAssert target.data[i] == expected.data[i],
         "scaled pixel mismatch at " & $i & " with IDAT chunk size " & $chunkSize
+
+block: # segmented sources decode identically to contiguous ones
+  # A PNG downloaded in fixed-size chunks never gets assembled into one
+  # contiguous buffer; decodePngScaledInto(segments) must parse chunk CRCs
+  # across boundaries and stream IDATs spanning multiple segments.
+  proc segmentsOf(data: string, sizes: seq[int]): seq[InflateSegment] =
+    var pos = 0
+    var i = 0
+    while pos < data.len:
+      let n = min(sizes[i mod sizes.len], data.len - pos)
+      result.add(InflateSegment(
+        data: cast[ptr UncheckedArray[uint8]](data[pos].unsafeAddr), len: n
+      ))
+      pos += n
+      inc i
+
+  let source = newImage(97, 61)
+  for y in 0 ..< source.height:
+    for x in 0 ..< source.width:
+      source.unsafe[x, y] = rgbx(uint8((x * 13) mod 256), uint8((y * 3) mod 256), uint8((x xor y) mod 256), 255)
+  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.data.len * 4)
+
+  for idatChunkSize in [1, 3, 61, 8192]:
+    let rechunked = rechunkIdat(encoded, idatChunkSize)
+    let expected = newImage(40, 25)
+    decodePngScaledInto(rechunked, expected, fitStretch)
+    for segSizes in [@[1], @[2, 3, 5], @[7], @[100], @[64 * 1024]]:
+      let target = newImage(40, 25)
+      decodePngScaledInto(segmentsOf(rechunked, segSizes), target, fitStretch)
+      for i in 0 ..< target.data.len:
+        doAssert target.data[i] == expected.data[i],
+          "segmented mismatch at " & $i & " idat=" & $idatChunkSize & " segs=" & $segSizes
+
+  # Palette + transparency PNGs exercise PLTE/tRNS chunk handling
+  for file in ["basn3p08", "tbbn3p08", "basn6a08"]:
+    let original = readFile(&"tests/fileformats/png/pngsuite/{file}.png")
+    let expected = newImage(24, 24)
+    decodePngScaledInto(original, expected, fitStretch)
+    let target = newImage(24, 24)
+    decodePngScaledInto(segmentsOf(original, @[5, 11]), target, fitStretch)
+    for i in 0 ..< target.data.len:
+      doAssert target.data[i] == expected.data[i], file
+
+  # Corrupted files must still fail cleanly through the segmented parser
+  for file in pngSuiteCorruptedFiles:
+    let original = readFile(&"tests/fileformats/png/pngsuite/{file}.png")
+    try:
+      let target = newImage(8, 8)
+      decodePngScaledInto(segmentsOf(original, @[9]), target, fitStretch)
+      doAssert false
+    except PixieError:
+      discard
