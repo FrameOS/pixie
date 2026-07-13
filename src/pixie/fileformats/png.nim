@@ -517,16 +517,15 @@ proc streamIdatRows(
         inc y
         rowFill = -1
 
-  if idats.len > 1:
-    var imageData: string
-    for (start, len) in idats:
-      let op = imageData.len
-      imageData.setLen(imageData.len + len)
-      copyMem(imageData[op].addr, data[start].addr, len)
-    uncompressStreamZlib(onData, imageData.cstring, imageData.len)
-  else:
-    let (start, len) = idats[0]
-    uncompressStreamZlib(onData, data[start].unsafeAddr, len)
+  # Feed the IDAT chunks to the inflater as segments: big PNGs commonly
+  # split their compressed data across hundreds of IDATs, and concatenating
+  # them would momentarily double the compressed-body allocation.
+  var segments = newSeq[InflateSegment](idats.len)
+  for i, (start, len) in idats:
+    segments[i] = InflateSegment(
+      data: cast[ptr UncheckedArray[uint8]](data[start].unsafeAddr), len: len
+    )
+  uncompressStreamZlib(onData, segments)
 
   if y != height or rowFill != -1:
     failInvalid()

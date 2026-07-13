@@ -110,9 +110,18 @@ const
 type
   InflateOnData* = proc (data: openArray[uint8]) {.gcsafe, raises: [PixieError].}
 
+  InflateSegment* = object
+    ## One piece of a compressed stream. Lets callers hand over data that is
+    ## not contiguous in memory (e.g. a PNG's many IDAT chunks) without
+    ## first concatenating it into one big allocation.
+    data*: ptr UncheckedArray[uint8]
+    len*: int
+
   BitStreamReader = object
-    src: ptr UncheckedArray[uint8]
-    len, pos: int
+    segments: seq[InflateSegment]
+    segIndex: int
+    src: ptr UncheckedArray[uint8] # Current segment's data
+    len, pos: int                  # Current segment's length and read position
     when (defined(arm64) and defined(macosx)) or sizeof(int) == 4:
       bitBuffer: uint32
     else:
@@ -149,33 +158,56 @@ proc write64(dst: ptr UncheckedArray[uint8], op: int, v: uint64) {.inline.} =
 proc copy64(dst, src: ptr UncheckedArray[uint8], op, ip: int) {.inline.} =
   write64(dst, op, read64(src, ip))
 
+proc advanceSegment(b: var BitStreamReader): bool =
+  ## Moves to the next non-empty segment. Returns false at end of input.
+  while b.segIndex + 1 < b.segments.len:
+    inc b.segIndex
+    let segment = b.segments[b.segIndex]
+    if segment.len > 0:
+      b.src = segment.data
+      b.len = segment.len
+      b.pos = 0
+      return true
+  false
+
+proc initBitStreamReader(segments: openArray[InflateSegment]): BitStreamReader =
+  result = BitStreamReader(segments: @segments, segIndex: -1)
+  if not result.advanceSegment():
+    # No data at all; leave an empty current segment so reads hit EOF paths
+    result.src = nil
+    result.len = 0
+    result.pos = 0
+
+proc fillBitBufferSlow(b: var BitStreamReader) =
+  ## Byte-at-a-time refill for segment boundaries and the end of the stream.
+  ## Bits above bitsBuffered are always either zero or the true next stream
+  ## bits (see fillBitBuffer), so OR-ing the same byte again is harmless.
+  let bufferBitSize = sizeof(b.bitBuffer) * 8
+  while b.bitsBuffered <= bufferBitSize - 8:
+    if b.pos >= b.len:
+      if not b.advanceSegment():
+        return # At end of input: consumers drive bitsBuffered negative
+      continue
+    b.bitBuffer = b.bitBuffer or
+      (typeof(b.bitBuffer)(b.src[b.pos]) shl b.bitsBuffered)
+    inc b.pos
+    b.bitsBuffered += 8
+
 proc fillBitBuffer(b: var BitStreamReader) {.inline.} =
-  let
-    bufferBitSize = sizeof(b.bitBuffer).uint * 8
-    bytesNeeded = cast[int]((bufferBitSize - cast[uint](b.bitsBuffered)) div 8)
-    bytesAvailable = b.len - b.pos
-    bytesAdded = min(bytesNeeded, bytesAvailable)
-    pos = b.pos
-
-  b.pos += bytesAdded
-
-  when sizeof(b.bitBuffer) == 4:
-    var src: uint32
-    if bytesAvailable < 4:
-      copyMem(src.addr, b.src[b.len - 4].addr, 4)
-      src = src shr (8 * (4 - bytesAvailable))
-    else:
-      copyMem(src.addr, b.src[pos].addr, 4)
+  # Fast path: a whole bit-buffer's worth of bytes remains in the current
+  # segment. Loads the full word; bits beyond the bytes accounted for are the
+  # true next stream bytes, so the next fill ORs identical values over them.
+  if b.pos + sizeof(b.bitBuffer) <= b.len:
+    let
+      bufferBitSize = sizeof(b.bitBuffer).uint * 8
+      bytesNeeded = cast[int]((bufferBitSize - cast[uint](b.bitsBuffered)) div 8)
+    var src: typeof(b.bitBuffer)
+    copyMem(src.addr, b.src[b.pos].addr, sizeof(src))
+    b.bitBuffer = b.bitBuffer or (src shl b.bitsBuffered)
+    b.pos += bytesNeeded
+    b.bitsBuffered += 8 * bytesNeeded
   else:
-    var src: uint64
-    if bytesAvailable < 8:
-      copyMem(src.addr, b.src[b.len - 8].addr, 8)
-      src = src shr (8 * (8 - bytesAvailable))
-    else:
-      copyMem(src.addr, b.src[pos].addr, 8)
-
-  b.bitBuffer = b.bitBuffer or (src shl b.bitsBuffered)
-  b.bitsBuffered += 8 * bytesAdded
+    b.fillBitBufferSlow()
 
 proc readBits(
   b: var BitStreamReader,
@@ -195,15 +227,27 @@ proc readBytes(b: var BitStreamReader, dst: pointer, len: int) =
   if b.bitsBuffered mod 8 != 0:
     raise newException(PixieError, "Must be at a byte boundary")
 
-  let offset = b.bitsBuffered div 8
-  if b.pos - offset + len > b.len:
-    failStreamEOF()
-
-  copyMem(dst, b.src[b.pos - offset].addr, len)
-
-  b.pos = b.pos - offset + len
-  b.bitsBuffered = 0
-  b.bitBuffer = 0
+  let dst = cast[ptr UncheckedArray[uint8]](dst)
+  var i = 0
+  # Drain whole bytes already sitting in the bit buffer (they may have been
+  # loaded from an earlier segment, so rewinding pos is not an option)
+  while i < len and b.bitsBuffered >= 8:
+    dst[i] = uint8(b.bitBuffer and 0xff)
+    b.bitBuffer = b.bitBuffer shr 8
+    b.bitsBuffered -= 8
+    inc i
+  if b.bitsBuffered == 0:
+    b.bitBuffer = 0 # Clear any true-next-byte bits loaded beyond bitsBuffered
+  # Copy the rest straight from the segments
+  while i < len:
+    if b.pos >= b.len:
+      if not b.advanceSegment():
+        failStreamEOF()
+      continue
+    let take = min(len - i, b.len - b.pos)
+    copyMem(dst[i].addr, b.src[b.pos].addr, take)
+    i += take
+    b.pos += take
 
 proc skipRemainingBitsInCurrentByte(b: var BitStreamReader) =
   let mod8 = b.bitsBuffered mod 8
@@ -458,12 +502,10 @@ proc inflateNoCompressionStream(
 
 proc inflateStream(
   onData: InflateOnData,
-  src: ptr UncheckedArray[uint8],
-  len, pos: int
+  b: var BitStreamReader
 ) =
   var
     s = InflateStreamState(buf: newString(inflateBufferSize), onData: onData)
-    b = BitStreamReader(src: src, len: len, pos: pos)
     finalBlock: bool
   while not finalBlock:
     let
@@ -487,20 +529,24 @@ proc inflateStream(
 
 proc uncompressStreamZlib*(
   onData: InflateOnData,
-  src: pointer,
-  len: int
+  segments: openArray[InflateSegment]
 ) {.raises: [PixieError].} =
-  ## Uncompresses a zlib stream, emitting output through onData in order as
-  ## it is decompressed. Peak memory stays at a fixed ~64KB working buffer
-  ## regardless of the uncompressed size.
-  let src = cast[ptr UncheckedArray[uint8]](src)
-
-  if len < 6:
+  ## Uncompresses a zlib stream split across any number of segments (e.g. a
+  ## PNG's IDAT chunks), emitting output through onData in order as it is
+  ## decompressed. Peak memory stays at a fixed ~64KB working buffer
+  ## regardless of the uncompressed size; the segments are never copied
+  ## into a contiguous buffer.
+  var total = 0
+  for segment in segments:
+    total += segment.len
+  if total < 6:
     failStream()
 
+  var b = initBitStreamReader(segments)
+
   let
-    cmf = src[0].uint8
-    flg = src[1].uint8
+    cmf = b.readBits(8).uint8
+    flg = b.readBits(8).uint8
     cm = cmf and 0b00001111
     cinfo = cmf shr 4
 
@@ -516,7 +562,18 @@ proc uncompressStreamZlib*(
   if (flg and 0b00100000) != 0: # FDICT
     raise newException(PixieError, "Preset dictionary is not yet supported")
 
-  inflateStream(onData, src, len, 2)
+  inflateStream(onData, b)
+
+proc uncompressStreamZlib*(
+  onData: InflateOnData,
+  src: pointer,
+  len: int
+) {.raises: [PixieError].} =
+  ## Uncompresses a contiguous zlib stream; see the segmented overload.
+  let segment = [InflateSegment(
+    data: cast[ptr UncheckedArray[uint8]](src), len: len
+  )]
+  uncompressStreamZlib(onData, segment)
 
 when defined(release):
   {.pop.}
