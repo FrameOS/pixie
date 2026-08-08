@@ -69,9 +69,7 @@ type
     blocks: seq[seq[array[64, int16]]]
     channel: Mask
 
-  JpegSourceProc* = proc(
-    dst: pointer, maxBytes: int
-  ): int {.gcsafe, raises: [].}
+  JpegSourceProc* = ImageSourceProc
     ## Pull callback for streaming decodes: fill `dst` with up to `maxBytes`
     ## sequential input bytes, returning how many were written (<= 0 on EOF
     ## or read error — the decode then fails with a catchable PixieError).

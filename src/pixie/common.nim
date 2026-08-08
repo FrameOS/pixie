@@ -42,6 +42,50 @@ type
     width*, height*: int
     data*: seq[ColorRGBX]
 
+  ImageSourceProc* = proc(
+    dst: pointer, maxBytes: int
+  ): int {.gcsafe, raises: [].}
+    ## Pull callback for streamed decodes: fill `dst` with up to `maxBytes`
+    ## sequential input bytes, returning how many were written (<= 0 on EOF
+    ## or read error — the decode then fails with a catchable PixieError).
+
+proc scaledFitRects*(
+  srcWidth, srcHeight, targetWidth, targetHeight: int, fit: ScaledDecodeFit
+): tuple[srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH: int] =
+  ## Computes the source crop and target placement rectangles for a fit mode.
+  result = (0, 0, srcWidth, srcHeight, 0, 0, targetWidth, targetHeight)
+  case fit
+  of fitStretch:
+    discard
+  of fitCover:
+    if srcWidth.int64 * targetHeight.int64 >
+        targetWidth.int64 * srcHeight.int64:
+      let cropW = max(1, (
+        srcHeight.int64 * targetWidth.int64 div
+        max(1'i64, targetHeight.int64)).int)
+      result.srcX = (srcWidth - cropW) div 2
+      result.srcW = cropW
+    else:
+      let cropH = max(1, (
+        srcWidth.int64 * targetHeight.int64 div
+        max(1'i64, targetWidth.int64)).int)
+      result.srcY = (srcHeight - cropH) div 2
+      result.srcH = cropH
+  of fitContain:
+    if srcWidth.int64 * targetHeight.int64 >
+        targetWidth.int64 * srcHeight.int64:
+      let fitH = max(1, (
+        targetWidth.int64 * srcHeight.int64 div
+        max(1'i64, srcWidth.int64)).int)
+      result.dstY = (targetHeight - fitH) div 2
+      result.dstH = fitH
+    else:
+      let fitW = max(1, (
+        targetHeight.int64 * srcWidth.int64 div
+        max(1'i64, srcHeight.int64)).int)
+      result.dstX = (targetWidth - fitW) div 2
+      result.dstW = fitW
+
 proc newImage*(width, height: int): Image {.raises: [PixieError].} =
   ## Creates a new image with the parameter dimensions.
   if width <= 0 or height <= 0:
