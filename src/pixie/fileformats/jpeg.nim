@@ -723,7 +723,14 @@ proc decodeExif(state: var DecoderState) =
     # For now we only care about orientation tag.
     case tagNumber:
       of 0x0112: # Orientation
-        state.orientation = dataOffset shr 16
+        # The SHORT value occupies the first two bytes of the 4-byte data
+        # field. After the full-word maybeSwap above it sits in the low word
+        # for little-endian (II) files and the high word for big-endian (MM)
+        # ones; `shr 16` alone silently dropped orientation for II files
+        # (Sony/Canon), leaving photos sideways.
+        state.orientation =
+          if littleEndian: dataOffset and 0xffff
+          else: dataOffset shr 16
       else:
         discard
 

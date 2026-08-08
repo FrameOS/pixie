@@ -21,3 +21,14 @@ block:
   doAssert target.width == 13
   doAssert target.height == 9
   doAssert data.len == 0
+
+block:
+  # Little-endian (II) EXIF must decode identically to the big-endian (MM)
+  # originals: the orientation SHORT sits in the opposite word of the data
+  # field, which `shr 16` alone silently dropped (Sony/Canon files).
+  for n in 1 .. 8:
+    let
+      mm = decodeJpeg(readFile("tests/fileformats/jpeg/masters/f" & $n & "-exif.jpg"))
+      ii = decodeJpeg(readFile("tests/fileformats/jpeg/masters/f" & $n & "-exif-ii.jpg"))
+    doAssert ii.width == mm.width and ii.height == mm.height
+    doAssert ii.data == mm.data
