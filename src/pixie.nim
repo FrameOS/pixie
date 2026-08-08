@@ -120,6 +120,8 @@ proc decodeImageScaled*(
     decodePngScaled(data, len, width, height, fit)
   elif len > 2 and equalMem(data, jpegStartOfImage[0].unsafeAddr, 2):
     decodeJpegScaled(data, len, width, height, fit)
+  elif len > 2 and equalMem(data, bmpSignature.cstring, 2):
+    decodeBmpScaled(data, len, width, height, fit)
   else:
     var copy = newString(len)
     if len > 0:
@@ -135,6 +137,8 @@ proc decodeImageScaled*(
     decodePngScaled(data, width, height, fit)
   elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
     decodeJpegScaled(data, width, height, fit)
+  elif data.len > 2 and data.readStr(0, 2) == bmpSignature:
+    decodeBmpScaled(data, width, height, fit)
   else:
     let image = decodeImage(data)
     if image.width == width and image.height == height:
@@ -153,6 +157,8 @@ proc decodeImageScaled*(
     decodePngScaled(data, width, height, fit)
   elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
     decodeJpegScaled(data, width, height, fit)
+  elif data.len > 2 and data.readStr(0, 2) == bmpSignature:
+    decodeBmpScaled(data, width, height, fit)
   else:
     let image = decodeImage(data)
     data = ""
@@ -174,6 +180,8 @@ proc decodeImageScaledInto*(
     decodePngScaledInto(data, len, target, fit)
   elif len > 2 and equalMem(data, jpegStartOfImage[0].unsafeAddr, 2):
     decodeJpegScaledInto(data, len, target, fit)
+  elif len > 2 and equalMem(data, bmpSignature.cstring, 2):
+    decodeBmpScaledInto(data, len, target, fit)
   else:
     var copy = newString(len)
     if len > 0:
@@ -190,6 +198,8 @@ proc decodeImageScaledInto*(
     decodePngScaledInto(data, target, fit)
   elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
     decodeJpegScaledInto(data, target, fit)
+  elif data.len > 2 and data.readStr(0, 2) == bmpSignature:
+    decodeBmpScaledInto(data, target, fit)
   else:
     target.copyIntoTarget(decodeImageScaled(data, target.width, target.height))
   target
@@ -203,6 +213,8 @@ proc decodeImageScaledInto*(
     decodePngScaledInto(data, target, fit)
   elif data.len > 2 and data.readUint16(0) == cast[uint16](jpegStartOfImage):
     decodeJpegScaledInto(data, target, fit)
+  elif data.len > 2 and data.readStr(0, 2) == bmpSignature:
+    decodeBmpScaledInto(data, target, fit)
   else:
     target.copyIntoTarget(decodeImageScaled(data, target.width, target.height))
   target

@@ -1,4 +1,5 @@
-import chroma, flatty/binny, ../common, ../images, std/strutils
+import chroma, flatty/binny, ../common, ../decodebudget, ../images,
+  std/strutils
 
 # See: http://netpbm.sourceforge.net/doc/ppm.html
 
@@ -162,6 +163,174 @@ proc decodePpmDimensions*(
 ): ImageDimensions {.raises: [PixieError].} =
   ## Decodes the PPM dimensions.
   decodePpmDimensions(data.cstring, data.len)
+
+proc validateScaledPpmTarget(width, height: int) {.raises: [PixieError].} =
+  if width <= 0 or width > int32.high.int:
+    raise newException(PixieError, "Invalid PPM target width")
+  if height <= 0 or height > int32.high.int:
+    raise newException(PixieError, "Invalid PPM target height")
+
+proc checkDecodeBudget(header: PpmHeader, planBytes: int64) =
+  if overDecodeBudget(planBytes):
+    raise newException(PixieError,
+      "PPM decode of " & $header.width & "x" & $header.height &
+      " needs " & $(planBytes div 1024) &
+      "K of decode buffers, over the " &
+      $(decodeBudgetBytes() div 1024) & "K memory budget"
+    )
+
+proc decodePpmStreamScaledInto*(
+  source: ImageSourceProc, totalLen: int, target: Image, fit = fitStretch
+) {.raises: [PixieError].} =
+  ## Decodes a P6 PPM pulled sequentially from `source` (e.g. a file on
+  ## disk) into an existing Image, sampling pixel rows as they are read.
+  ## Peak memory: one raw row plus one row of RGBX pixels — the file is
+  ## never resident. Rows no target row samples are skipped without
+  ## conversion. P3 (ASCII) PPMs raise a PixieError since they need the
+  ## whole-file buffering this decoder exists to avoid. Pass the input size
+  ## as totalLen for payload size checks, or <= 0 when unknown.
+  if target.isNil:
+    raise newException(PixieError, "Invalid PPM target Image")
+  validateScaledPpmTarget(target.width, target.height)
+  if source == nil:
+    failInvalid()
+
+  # The header parse mirrors decodeHeader, pulling one byte at a time so
+  # the reader stops exactly at the first payload byte.
+  var
+    header: PpmHeader
+    commentMode, readWhitespace: bool
+    readFields: int
+    field: string
+  while readFields < 4:
+    var c: char
+    if source(c.addr, 1) != 1:
+      raise newException(PixieError, "Invalid PPM file header")
+    inc header.dataOffset
+    if c == '#':
+      commentMode = true
+    elif c == '\n':
+      commentMode = false
+    if not commentMode:
+      if c in Whitespace and not readWhitespace:
+        inc readFields
+        readWhitespace = true
+        try:
+          case readFields:
+            of 1:
+              header.version = field
+            of 2:
+              header.width = parseInt(field)
+            of 3:
+              header.height = parseInt(field)
+            of 4:
+              header.maxVal = parseInt(field)
+            else:
+              discard
+        except ValueError:
+          failInvalid()
+        field = ""
+      elif not (c in Whitespace):
+        field.add(c)
+        readWhitespace = false
+
+  if not (header.version in ppmSignatures):
+    failInvalid()
+
+  if header.version == "P3":
+    raise newException(PixieError,
+      "Streamed PPM decode supports the binary P6 format only"
+    )
+
+  if header.maxVal <= 0 or header.maxVal > 0xFFFF:
+    failInvalid()
+
+  if header.width <= 0 or header.height <= 0:
+    failInvalid()
+
+  let
+    bytesPerPixel = if header.maxVal > 0xFF: 6 else: 3
+    rowBytesLen = header.width * bytesPerPixel
+
+  # The buffered decoder requires the payload to be exactly one image large
+  if totalLen > 0 and totalLen.int64 - header.dataOffset.int64 !=
+      header.width.int64 * header.height.int64 * bytesPerPixel.int64:
+    failInvalid()
+
+  checkDecodeBudget(header, rowBytesLen.int64 + header.width.int64 * 4)
+
+  let rects = scaledFitRects(
+    header.width, header.height, target.width, target.height, fit
+  )
+
+  template srcYFor(y: int): int =
+    min(
+      rects.srcY + ((y - rects.dstY) * rects.srcH) div rects.dstH,
+      header.height - 1
+    )
+
+  template srcXFor(x: int): int =
+    min(
+      rects.srcX + ((x - rects.dstX) * rects.srcW) div rects.dstW,
+      header.width - 1
+    )
+
+  # See decodeP6Data for the maxVal multiplier reasoning
+  let valueMultiplier = (255 / header.maxVal).float32
+
+  var
+    rowBytes = newSeq[uint8](rowBytesLen)
+    rowPixels = newSeq[ColorRGBX](header.width)
+    dstY = rects.dstY
+  let dstYEnd = rects.dstY + rects.dstH
+
+  for fileY in 0 ..< header.height:
+    if dstY >= dstYEnd:
+      break # Every remaining row is below the sampled crop
+
+    # Skipped rows still consume their bytes to keep the reads sequential
+    var done = 0
+    while done < rowBytesLen:
+      let got = source(rowBytes[done].addr, rowBytesLen - done)
+      if got <= 0:
+        failInvalid()
+      done += got
+
+    if srcYFor(dstY) != fileY:
+      continue # No target row samples this source row
+
+    if header.maxVal > 0xFF:
+      for x in 0 ..< header.width:
+        let
+          red = ((rowBytes[x * 6 + 0].uint16 shl 8) or
+            rowBytes[x * 6 + 1].uint16).float32
+          green = ((rowBytes[x * 6 + 2].uint16 shl 8) or
+            rowBytes[x * 6 + 3].uint16).float32
+          blue = ((rowBytes[x * 6 + 4].uint16 shl 8) or
+            rowBytes[x * 6 + 5].uint16).float32
+        rowPixels[x] = rgbx(
+          (red * valueMultiplier + 0.5).uint8,
+          (green * valueMultiplier + 0.5).uint8,
+          (blue * valueMultiplier + 0.5).uint8,
+          255
+        )
+    else:
+      for x in 0 ..< header.width:
+        let
+          red = rowBytes[x * 3 + 0].float32
+          green = rowBytes[x * 3 + 1].float32
+          blue = rowBytes[x * 3 + 2].float32
+        rowPixels[x] = rgbx(
+          (red * valueMultiplier + 0.5).uint8,
+          (green * valueMultiplier + 0.5).uint8,
+          (blue * valueMultiplier + 0.5).uint8,
+          255
+        )
+
+    while dstY < dstYEnd and srcYFor(dstY) == fileY:
+      for x in rects.dstX ..< rects.dstX + rects.dstW:
+        target.unsafe[x, dstY] = rowPixels[srcXFor(x)]
+      inc dstY
 
 proc encodePpm*(image: Image): string {.raises: [].} =
   ## Encodes an image into the PPM file format (version P6).
