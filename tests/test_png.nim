@@ -240,3 +240,77 @@ block: # segmented sources decode identically to contiguous ones
       doAssert false
     except PixieError:
       discard
+
+block: # pull sources (file-backed) decode identically to buffered ones
+  # A download spilled to disk decodes through a sequential read callback;
+  # the whole compressed file is never in memory. Exercise awkward read
+  # granularities so chunk headers, CRCs and IDAT payloads all straddle
+  # read boundaries.
+  proc sourceOf(data: string, readSize: int): PngSourceProc =
+    var pos = 0
+    result = proc (dst: pointer, maxBytes: int): int =
+      let n = min(min(readSize, maxBytes), data.len - pos)
+      if n <= 0:
+        return 0
+      copyMem(dst, data[pos].unsafeAddr, n)
+      pos += n
+      n
+
+  let source = newImage(89, 47)
+  for y in 0 ..< source.height:
+    for x in 0 ..< source.width:
+      source.unsafe[x, y] = rgbx(uint8((x * 5) mod 256), uint8((y * 9) mod 256), uint8((x + 2 * y) mod 256), 255)
+  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.data.len * 4)
+
+  for idatChunkSize in [1, 3, 61, 8192, 1 shl 30]:
+    let rechunked = rechunkIdat(encoded, idatChunkSize)
+    for fit in [fitStretch, fitCover, fitContain]:
+      let expected = newImage(40, 25)
+      decodePngScaledInto(rechunked, expected, fit)
+      for readSize in [1, 7, 1000, 1 shl 20]:
+        let target = newImage(40, 25)
+        decodePngStreamScaledInto(sourceOf(rechunked, readSize), rechunked.len, target, fit)
+        for i in 0 ..< target.data.len:
+          doAssert target.data[i] == expected.data[i],
+            "pull mismatch at " & $i & " idat=" & $idatChunkSize &
+            " read=" & $readSize & " fit=" & $fit
+
+  # Palette + transparency PNGs exercise PLTE/tRNS chunk handling
+  for file in ["basn3p08", "tbbn3p08", "basn6a08"]:
+    let original = readFile(&"tests/fileformats/png/pngsuite/{file}.png")
+    let expected = newImage(24, 24)
+    decodePngScaledInto(original, expected, fitStretch)
+    let target = newImage(24, 24)
+    decodePngStreamScaledInto(sourceOf(original, 11), original.len, target, fitStretch)
+    for i in 0 ..< target.data.len:
+      doAssert target.data[i] == expected.data[i], file
+
+  # Interlaced and 16-bit PNGs cannot stream and must fail cleanly
+  for file in ["basi2c08", "basn2c16"]:
+    let original = readFile(&"tests/fileformats/png/pngsuite/{file}.png")
+    try:
+      let target = newImage(8, 8)
+      decodePngStreamScaledInto(sourceOf(original, 100), original.len, target, fitStretch)
+      doAssert false
+    except PixieError as e:
+      doAssert "non-interlaced" in e.msg
+
+  # Truncated input fails instead of hanging on the exhausted source
+  block:
+    let truncated = encoded[0 ..< encoded.len div 2]
+    try:
+      let target = newImage(8, 8)
+      decodePngStreamScaledInto(sourceOf(truncated, 100), truncated.len, target, fitStretch)
+      doAssert false
+    except PixieError:
+      discard
+
+  # Corrupted files must still fail cleanly through the pull parser
+  for file in pngSuiteCorruptedFiles:
+    let original = readFile(&"tests/fileformats/png/pngsuite/{file}.png")
+    try:
+      let target = newImage(8, 8)
+      decodePngStreamScaledInto(sourceOf(original, 9), original.len, target, fitStretch)
+      doAssert false
+    except PixieError:
+      discard

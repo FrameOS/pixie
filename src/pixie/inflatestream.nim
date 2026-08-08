@@ -117,8 +117,15 @@ type
     data*: ptr UncheckedArray[uint8]
     len*: int
 
+  InflatePull* = proc (): InflateSegment {.gcsafe, raises: [PixieError].}
+    ## Pull callback for streaming input: returns the next segment of the
+    ## compressed stream, or a segment with len <= 0 at end of input. Each
+    ## segment is consumed fully before the next pull, so the callback may
+    ## reuse the same backing buffer (e.g. one file-read buffer) every call.
+
   BitStreamReader = object
     segments: seq[InflateSegment]
+    pull: InflatePull
     segIndex: int
     src: ptr UncheckedArray[uint8] # Current segment's data
     len, pos: int                  # Current segment's length and read position
@@ -168,12 +175,27 @@ proc advanceSegment(b: var BitStreamReader): bool =
       b.len = segment.len
       b.pos = 0
       return true
+  if b.pull != nil:
+    let segment = b.pull()
+    if segment.len > 0 and segment.data != nil:
+      b.src = segment.data
+      b.len = segment.len
+      b.pos = 0
+      return true
+    b.pull = nil
   false
 
 proc initBitStreamReader(segments: openArray[InflateSegment]): BitStreamReader =
   result = BitStreamReader(segments: @segments, segIndex: -1)
   if not result.advanceSegment():
     # No data at all; leave an empty current segment so reads hit EOF paths
+    result.src = nil
+    result.len = 0
+    result.pos = 0
+
+proc initBitStreamReader(pull: InflatePull): BitStreamReader =
+  result = BitStreamReader(segIndex: -1, pull: pull)
+  if not result.advanceSegment():
     result.src = nil
     result.len = 0
     result.pos = 0
@@ -527,6 +549,33 @@ proc inflateStream(
 
   s.finishStream()
 
+proc uncompressZlibFrom(
+  onData: InflateOnData,
+  b: var BitStreamReader
+) {.raises: [PixieError].} =
+  let
+    cmf = b.readBits(8).uint8
+    flg = b.readBits(8).uint8
+    cm = cmf and 0b00001111
+    cinfo = cmf shr 4
+
+  if b.bitsBuffered < 0:
+    failStreamEOF()
+
+  if cm != 8: # DEFLATE
+    raise newException(PixieError, "Unsupported compression method")
+
+  if cinfo > 7.uint8:
+    raise newException(PixieError, "Invalid compression info")
+
+  if ((cmf.uint16 * 256) + flg.uint16) mod 31 != 0:
+    raise newException(PixieError, "Invalid header")
+
+  if (flg and 0b00100000) != 0: # FDICT
+    raise newException(PixieError, "Preset dictionary is not yet supported")
+
+  inflateStream(onData, b)
+
 proc uncompressStreamZlib*(
   onData: InflateOnData,
   segments: openArray[InflateSegment]
@@ -543,26 +592,19 @@ proc uncompressStreamZlib*(
     failStream()
 
   var b = initBitStreamReader(segments)
+  uncompressZlibFrom(onData, b)
 
-  let
-    cmf = b.readBits(8).uint8
-    flg = b.readBits(8).uint8
-    cm = cmf and 0b00001111
-    cinfo = cmf shr 4
-
-  if cm != 8: # DEFLATE
-    raise newException(PixieError, "Unsupported compression method")
-
-  if cinfo > 7.uint8:
-    raise newException(PixieError, "Invalid compression info")
-
-  if ((cmf.uint16 * 256) + flg.uint16) mod 31 != 0:
-    raise newException(PixieError, "Invalid header")
-
-  if (flg and 0b00100000) != 0: # FDICT
-    raise newException(PixieError, "Preset dictionary is not yet supported")
-
-  inflateStream(onData, b)
+proc uncompressStreamZlib*(
+  onData: InflateOnData,
+  pull: InflatePull
+) {.raises: [PixieError].} =
+  ## Uncompresses a zlib stream whose input arrives on demand from `pull`
+  ## (e.g. read from a file), emitting output through onData in order as it
+  ## is decompressed. Only the pull callback's current segment is held at a
+  ## time, so neither the compressed input nor the output ever needs to fit
+  ## in memory.
+  var b = initBitStreamReader(pull)
+  uncompressZlibFrom(onData, b)
 
 proc uncompressStreamZlib*(
   onData: InflateOnData,

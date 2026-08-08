@@ -485,17 +485,21 @@ proc idatSlices(
       data: cast[ptr UncheckedArray[uint8]](data[start].unsafeAddr), len: len
     )
 
-proc streamIdatRows(
-  idatSegments: seq[InflateSegment],
+type InflateRunProc = proc (
+  onData: InflateOnData
+) {.gcsafe, raises: [PixieError].}
+  ## Runs one full inflate of a PNG's IDAT stream, emitting the uncompressed
+  ## bytes through onData. Abstracts over where the compressed bytes live
+  ## (in-memory segments or a pull source).
+
+proc streamRows(
   header: PngHeader,
-  onRow: proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].}
+  onRow: proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].},
+  inflate: InflateRunProc
 ) =
   ## Inflates the IDAT stream and hands unfiltered scanlines to onRow one at
-  ## a time, in order. Peak memory: zippy's fixed ~64KB streaming window plus
+  ## a time, in order. Peak memory: the fixed ~64KB streaming window plus
   ## two row buffers, regardless of image size. Non-interlaced images only.
-  if idatSegments.len == 0:
-    failInvalid()
-
   let
     rowBytes = scanlineBytes(header.width, header)
     bpp = header.filterBytesPerPixel
@@ -529,10 +533,23 @@ proc streamIdatRows(
         inc y
         rowFill = -1
 
-  uncompressStreamZlib(onData, idatSegments)
+  inflate(onData)
 
   if y != height or rowFill != -1:
     failInvalid()
+
+proc streamIdatRows(
+  idatSegments: seq[InflateSegment],
+  header: PngHeader,
+  onRow: proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].}
+) =
+  ## streamRows over IDAT chunks that are resident in memory.
+  if idatSegments.len == 0:
+    failInvalid()
+  streamRows(header, onRow,
+    proc (onData: InflateOnData) {.gcsafe, raises: [PixieError].} =
+      uncompressStreamZlib(onData, idatSegments)
+  )
 
 proc decodeImageData(
   data: ptr UncheckedArray[uint8],
@@ -1000,10 +1017,10 @@ proc canStreamScaled(header: PngHeader): bool {.inline.} =
   header.interlaceMethod == 0 and header.bitDepth != 16
 
 proc decodePngScaledIntoStreaming(
-  idatSegments: seq[InflateSegment],
   structure: PngStructure,
   target: Image,
-  fit: ScaledDecodeFit
+  fit: ScaledDecodeFit,
+  inflate: InflateRunProc
 ) {.raises: [PixieError].} =
   ## Samples scanlines into the target as they stream out of the inflate
   ## window. Peak memory: one row of RGBA pixels plus the fixed streaming
@@ -1034,19 +1051,32 @@ proc decodePngScaledIntoStreaming(
     dstY = rects.dstY
   let dstYEnd = rects.dstY + rects.dstH
 
-  streamIdatRows(
-    idatSegments, header,
-    proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].} =
-      if dstY >= dstYEnd or srcYFor(dstY) != y:
-        return # No remaining target row samples this source row
-      rowPixels.writePixels(
-        header, structure.palette, structure.transparency, row,
-        header.width, 1, 0, 0, 1, 1
-      )
-      while dstY < dstYEnd and srcYFor(dstY) == y:
-        for x in rects.dstX ..< rects.dstX + rects.dstW:
-          target.unsafe[x, dstY] = rowPixels[srcXFor(x)].rgbx()
-        inc dstY
+  let onRow = proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].} =
+    if dstY >= dstYEnd or srcYFor(dstY) != y:
+      return # No remaining target row samples this source row
+    rowPixels.writePixels(
+      header, structure.palette, structure.transparency, row,
+      header.width, 1, 0, 0, 1, 1
+    )
+    while dstY < dstYEnd and srcYFor(dstY) == y:
+      for x in rects.dstX ..< rects.dstX + rects.dstW:
+        target.unsafe[x, dstY] = rowPixels[srcXFor(x)].rgbx()
+      inc dstY
+
+  streamRows(header, onRow, inflate)
+
+proc decodePngScaledIntoStreaming(
+  idatSegments: seq[InflateSegment],
+  structure: PngStructure,
+  target: Image,
+  fit: ScaledDecodeFit
+) {.raises: [PixieError].} =
+  ## The streaming scaled decode over IDAT chunks resident in memory.
+  if idatSegments.len == 0:
+    failInvalid()
+  decodePngScaledIntoStreaming(structure, target, fit,
+    proc (onData: InflateOnData) {.gcsafe, raises: [PixieError].} =
+      uncompressStreamZlib(onData, idatSegments)
   )
 
 proc decodePngScaled*(
@@ -1362,6 +1392,234 @@ proc decodePngScaledInto*(
   else:
     var data = coalesceSegments(segments)
     decodePng(data.cstring, data.len).fillImage(target, fit)
+
+# ------------------------------------------------------------------------
+# Pull sources: decode a PNG read sequentially from a callback (e.g. a
+# download spilled to disk on a device without the memory to buffer it).
+# Peak memory is one small read buffer plus the fixed streaming decode
+# overhead; the compressed file is never held in memory.
+
+type PngSourceProc* = proc(
+  dst: pointer, maxBytes: int
+): int {.gcsafe, raises: [].}
+  ## Pull callback for streamed decodes: fill `dst` with up to `maxBytes`
+  ## sequential input bytes, returning how many were written (<= 0 on EOF
+  ## or read error — the decode then fails with a catchable PixieError).
+
+const pngStreamReadBytes = 16384
+
+type PngStreamReader = object
+  source: PngSourceProc
+  totalLen: int # <= 0 when unknown
+  pos: int
+
+proc readExactCrc(
+  r: var PngStreamReader, dst: ptr UncheckedArray[uint8], len: int,
+  crc: var uint32, updateCrc: bool
+) =
+  var done = 0
+  while done < len:
+    let got = r.source(dst[done].addr, len - done)
+    if got <= 0:
+      failInvalid()
+    if updateCrc:
+      crc = crc.pngCrcUpdate(dst.toOpenArray(done, done + got - 1), got)
+    done += got
+    r.pos += got
+
+proc readU32be(r: var PngStreamReader): uint32 =
+  var
+    bytes: array[4, uint8]
+    crc: uint32
+  r.readExactCrc(cast[ptr UncheckedArray[uint8]](bytes[0].addr), 4, crc, false)
+  (bytes[0].uint32 shl 24) or (bytes[1].uint32 shl 16) or
+    (bytes[2].uint32 shl 8) or bytes[3].uint32
+
+proc decodePngStreamScaledInto*(
+  source: PngSourceProc, totalLen: int, target: Image, fit = fitStretch
+) {.raises: [PixieError].} =
+  ## Decodes a PNG pulled sequentially from `source` (e.g. a file on disk)
+  ## into an existing Image, sampling scanlines as they stream out of the
+  ## inflate window. Peak memory: one small read buffer, one source row of
+  ## RGBA pixels and the fixed inflate overhead — neither the compressed
+  ## file nor a full-size pixel buffer is ever resident. Non-interlaced
+  ## images up to 8 bits per channel only; interlaced/16-bit PNGs raise a
+  ## PixieError since they would need the whole-file buffering this decoder
+  ## exists to avoid. Chunk CRCs are validated as they stream by; chunks
+  ## after the image data are not read. Pass the input size as totalLen for
+  ## chunk bounds checks, or <= 0 when unknown.
+  validateScaledPngTarget(target)
+  if source == nil:
+    failInvalid()
+
+  var
+    r = PngStreamReader(source: source, totalLen: totalLen)
+    scratchCrc: uint32
+    signature: array[8, uint8]
+  r.readExactCrc(
+    cast[ptr UncheckedArray[uint8]](signature[0].addr), 8, scratchCrc, false)
+  if signature != pngSignature:
+    failInvalid()
+
+  # First chunk must be IHDR
+  var
+    chunkType: array[4, uint8]
+    crc = 0xffffffff'u32
+  if r.readU32be() != 13:
+    failInvalid()
+  r.readExactCrc(
+    cast[ptr UncheckedArray[uint8]](chunkType[0].addr), 4, crc, true)
+  if chunkType != [73'u8, 72, 68, 82]: # "IHDR"
+    failInvalid()
+  var ihdr: array[13, uint8]
+  r.readExactCrc(cast[ptr UncheckedArray[uint8]](ihdr[0].addr), 13, crc, true)
+  let header = decodeHeader(ihdr[0].addr)
+  if (crc xor 0xffffffff'u32) != r.readU32be():
+    failCRC()
+
+  if not header.canStreamScaled:
+    raise newException(PixieError,
+      "Streamed PNG decode supports non-interlaced images up to 8 bits per channel"
+    )
+
+  var
+    counts = ChunkCounts()
+    palette: seq[ColorRGB]
+    transparency: string
+    buffer = newSeq[uint8](pngStreamReadBytes)
+    idatRemaining = -1
+
+  # Walk the metadata chunks up to the first IDAT
+  while idatRemaining < 0:
+    if r.totalLen > 0 and r.pos + 8 > r.totalLen:
+      failInvalid()
+    let chunkLen = r.readU32be().int
+    if chunkLen > high(int32).int:
+      failInvalid()
+    if r.totalLen > 0 and r.pos + 4 + chunkLen + 4 > r.totalLen:
+      failInvalid()
+    crc = 0xffffffff'u32
+    r.readExactCrc(
+      cast[ptr UncheckedArray[uint8]](chunkType[0].addr), 4, crc, true)
+    let chunkTypeStr = block:
+      var s = newString(4)
+      copyMem(s[0].addr, chunkType[0].addr, 4)
+      s
+
+    case chunkTypeStr:
+    of "IHDR":
+      failInvalid()
+    of "PLTE":
+      inc counts.PLTE
+      if counts.PLTE > 1 or counts.tRNS > 0:
+        failInvalid()
+      if chunkLen == 0 or chunkLen > 768:
+        failInvalid()
+      var paletteBytes = newSeq[uint8](chunkLen)
+      r.readExactCrc(
+        cast[ptr UncheckedArray[uint8]](paletteBytes[0].addr),
+        chunkLen, crc, true)
+      palette = decodePalette(paletteBytes[0].addr, chunkLen)
+    of "tRNS":
+      inc counts.tRNS
+      if counts.tRNS > 1 or chunkLen > 768:
+        failInvalid()
+      transparency = newString(chunkLen)
+      if chunkLen > 0:
+        r.readExactCrc(
+          cast[ptr UncheckedArray[uint8]](transparency[0].addr),
+          chunkLen, crc, true)
+      case header.colorType:
+      of 0:
+        if transparency.len != 2:
+          failInvalid()
+      of 2:
+        if transparency.len != 6:
+          failInvalid()
+      of 3:
+        if transparency.len > palette.len:
+          failInvalid()
+      else:
+        failInvalid()
+    of "IDAT":
+      if header.colorType == 3 and counts.PLTE == 0:
+        failInvalid()
+      idatRemaining = chunkLen
+    of "IEND":
+      failInvalid() # No image data
+    else:
+      if (chunkType[0] and 0b00100000) == 0:
+        raise newException(
+          PixieError, "Unrecognized PNG critical chunk " & chunkTypeStr
+        )
+      # Skip ancillary chunk payloads through the read buffer
+      var remaining = chunkLen
+      while remaining > 0:
+        let take = min(remaining, buffer.len)
+        r.readExactCrc(
+          cast[ptr UncheckedArray[uint8]](buffer[0].addr), take, crc, true)
+        remaining -= take
+
+    if idatRemaining < 0:
+      if (crc xor 0xffffffff'u32) != r.readU32be():
+        failCRC()
+
+  let structure = PngStructure(
+    header: header, palette: palette, transparency: transparency
+  )
+
+  # crc currently covers the first IDAT's type bytes; the pull below keeps
+  # folding payload bytes into it and verifies at each chunk boundary.
+  var idatDone = false
+  let pull = proc (): InflateSegment {.gcsafe, raises: [PixieError].} =
+    while not idatDone:
+      if idatRemaining == 0:
+        # IDAT boundary: verify this chunk's CRC, then continue only when
+        # the next chunk is another IDAT (they must be consecutive).
+        if (crc xor 0xffffffff'u32) != r.readU32be():
+          failCRC()
+        if r.totalLen > 0 and r.pos + 8 > r.totalLen:
+          failInvalid()
+        let chunkLen = r.readU32be().int
+        if chunkLen > high(int32).int:
+          failInvalid()
+        crc = 0xffffffff'u32
+        r.readExactCrc(
+          cast[ptr UncheckedArray[uint8]](chunkType[0].addr), 4, crc, true)
+        if chunkType != [73'u8, 68, 65, 84]: # "IDAT"
+          idatDone = true
+          break
+        if r.totalLen > 0 and r.pos + chunkLen + 4 > r.totalLen:
+          failInvalid()
+        idatRemaining = chunkLen
+        continue
+      let take = min(buffer.len, idatRemaining)
+      let got = r.source(buffer[0].addr, take)
+      if got <= 0:
+        failInvalid()
+      crc = crc.pngCrcUpdate(buffer.toOpenArray(0, got - 1), got)
+      r.pos += got
+      idatRemaining -= got
+      return InflateSegment(
+        data: cast[ptr UncheckedArray[uint8]](buffer[0].addr), len: got)
+    InflateSegment(data: nil, len: 0)
+
+  decodePngScaledIntoStreaming(structure, target, fit,
+    proc (onData: InflateOnData) {.gcsafe, raises: [PixieError].} =
+      uncompressStreamZlib(onData, pull)
+  )
+
+  # The inflater stops at the zlib stream's end, usually leaving the last
+  # IDAT's tail (the adler32 trailer) unread. Drain it and verify that
+  # chunk's CRC too, so a corrupted final IDAT still fails the decode.
+  if not idatDone:
+    while idatRemaining > 0:
+      let take = min(buffer.len, idatRemaining)
+      r.readExactCrc(
+        cast[ptr UncheckedArray[uint8]](buffer[0].addr), take, crc, true)
+      idatRemaining -= take
+    if (crc xor 0xffffffff'u32) != r.readU32be():
+      failCRC()
 
 proc encodePng*(
   width, height, channels: int, data: pointer, len: int
