@@ -73,6 +73,40 @@ const straightAlphaTable = block:
       table[a][c] = min(round((c.float32 * multiplier)), 255).uint8
   table
 
+proc fillUnsafe*(
+  data: var seq[ColorRGBX], color: SomeColor, start, len: int
+) {.inline, raises: [].} =
+  ## Convenience for callers that hold a real seq rather than an image buffer.
+  if data.len > 0:
+    fillUnsafe(
+      cast[ptr UncheckedArray[ColorRGBX]](data[0].addr), color, start, len)
+
+proc toStraightAlpha*(image: Image) {.raises: [].} =
+  ## Converts an image from premultiplied alpha to straight alpha, in place.
+  ##
+  ## Span-based rather than a flat walk so it is correct for a view; an owner
+  ## is one span, so this is the same single pass it always was. The seq
+  ## overload below keeps the SIMD path for decoders that hold their pixels
+  ## outside an Image.
+  image.forEachSpan:
+    for i in spanStart ..< spanStart + spanLen:
+      var c = image.data[i]
+      c.r = straightAlphaTable[c.a][c.r]
+      c.g = straightAlphaTable[c.a][c.g]
+      c.b = straightAlphaTable[c.a][c.b]
+      image.data[i] = c
+
+proc toPremultipliedAlpha*(image: Image) {.raises: [].} =
+  ## Converts an image to premultiplied alpha from straight alpha, in place.
+  image.forEachSpan:
+    for i in spanStart ..< spanStart + spanLen:
+      var c = image.data[i]
+      if c.a != 255:
+        c.r = ((c.r.uint32 * c.a + 127) div 255).uint8
+        c.g = ((c.g.uint32 * c.a + 127) div 255).uint8
+        c.b = ((c.b.uint32 * c.a + 127) div 255).uint8
+        image.data[i] = c
+
 proc toStraightAlpha*(data: var seq[ColorRGBA | ColorRGBX]) {.raises: [].} =
   ## Converts an image from premultiplied alpha to straight alpha.
   ## This is expensive for large images.

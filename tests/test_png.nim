@@ -84,7 +84,7 @@ block: # streamed scanlines keep canvas-sized decodes within tight budgets
   for y in 0 ..< source.height:
     for x in 0 ..< source.width:
       source.unsafe[x, y] = rgbx(uint8(x mod 256), uint8(y mod 256), uint8((x + y) mod 256), 255)
-  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.data.len * 4)
+  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.dataLen * 4)
 
   # Full decode plan is pixels + fixed streaming overhead (~1.6MB);
   # a 2MB budget must accept it
@@ -115,14 +115,14 @@ block: # streamed scaled decodes match the buffered fillImage path
   for y in 0 ..< source.height:
     for x in 0 ..< source.width:
       source.unsafe[x, y] = rgbx(uint8((x * 7) mod 256), uint8((y * 5) mod 256), uint8((x + y) mod 256), 255)
-  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.data.len * 4)
+  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.dataLen * 4)
   for fit in [fitStretch, fitCover, fitContain]:
     for (w, h) in [(50, 40), (123, 77), (300, 90), (33, 200)]:
       let streamed = decodePngScaled(encoded, w, h, fit)
       let buffered = decodePng(encoded).convertToImage(w, h, fit)
       doAssert streamed.width == buffered.width
       doAssert streamed.height == buffered.height
-      for i in 0 ..< streamed.data.len:
+      for i in 0 ..< streamed.dataLen:
         doAssert streamed.data[i] == buffered.data[i],
           "pixel mismatch at " & $i & " fit " & $fit & " " & $w & "x" & $h
 
@@ -171,21 +171,21 @@ block: # multi-IDAT PNGs decode without concatenating the compressed stream
   for y in 0 ..< source.height:
     for x in 0 ..< source.width:
       source.unsafe[x, y] = rgbx(uint8((x * 3) mod 256), uint8((y * 11) mod 256), uint8((x * y) mod 256), 255)
-  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.data.len * 4)
+  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.dataLen * 4)
   let reference = decodePng(encoded).convertToImage()
 
   for chunkSize in [1, 2, 3, 7, 64, 8192, 1 shl 30]:
     let rechunked = rechunkIdat(encoded, chunkSize)
     let decoded = decodePng(rechunked).convertToImage()
     doAssert decoded.width == reference.width and decoded.height == reference.height
-    for i in 0 ..< decoded.data.len:
+    for i in 0 ..< decoded.dataLen:
       doAssert decoded.data[i] == reference.data[i],
         "pixel mismatch at " & $i & " with IDAT chunk size " & $chunkSize
 
     let target = newImage(48, 20)
     decodePngScaledInto(rechunked, target, fitStretch)
     let expected = decodePng(encoded).convertToImage(48, 20, fitStretch)
-    for i in 0 ..< target.data.len:
+    for i in 0 ..< target.dataLen:
       doAssert target.data[i] == expected.data[i],
         "scaled pixel mismatch at " & $i & " with IDAT chunk size " & $chunkSize
 
@@ -208,7 +208,7 @@ block: # segmented sources decode identically to contiguous ones
   for y in 0 ..< source.height:
     for x in 0 ..< source.width:
       source.unsafe[x, y] = rgbx(uint8((x * 13) mod 256), uint8((y * 3) mod 256), uint8((x xor y) mod 256), 255)
-  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.data.len * 4)
+  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.dataLen * 4)
 
   for idatChunkSize in [1, 3, 61, 8192]:
     let rechunked = rechunkIdat(encoded, idatChunkSize)
@@ -217,7 +217,7 @@ block: # segmented sources decode identically to contiguous ones
     for segSizes in [@[1], @[2, 3, 5], @[7], @[100], @[64 * 1024]]:
       let target = newImage(40, 25)
       decodePngScaledInto(segmentsOf(rechunked, segSizes), target, fitStretch)
-      for i in 0 ..< target.data.len:
+      for i in 0 ..< target.dataLen:
         doAssert target.data[i] == expected.data[i],
           "segmented mismatch at " & $i & " idat=" & $idatChunkSize & " segs=" & $segSizes
 
@@ -228,7 +228,7 @@ block: # segmented sources decode identically to contiguous ones
     decodePngScaledInto(original, expected, fitStretch)
     let target = newImage(24, 24)
     decodePngScaledInto(segmentsOf(original, @[5, 11]), target, fitStretch)
-    for i in 0 ..< target.data.len:
+    for i in 0 ..< target.dataLen:
       doAssert target.data[i] == expected.data[i], file
 
   # Corrupted files must still fail cleanly through the segmented parser
@@ -260,7 +260,7 @@ block: # pull sources (file-backed) decode identically to buffered ones
   for y in 0 ..< source.height:
     for x in 0 ..< source.width:
       source.unsafe[x, y] = rgbx(uint8((x * 5) mod 256), uint8((y * 9) mod 256), uint8((x + 2 * y) mod 256), 255)
-  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.data.len * 4)
+  let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.dataLen * 4)
 
   for idatChunkSize in [1, 3, 61, 8192, 1 shl 30]:
     let rechunked = rechunkIdat(encoded, idatChunkSize)
@@ -270,7 +270,7 @@ block: # pull sources (file-backed) decode identically to buffered ones
       for readSize in [1, 7, 1000, 1 shl 20]:
         let target = newImage(40, 25)
         decodePngStreamScaledInto(sourceOf(rechunked, readSize), rechunked.len, target, fit)
-        for i in 0 ..< target.data.len:
+        for i in 0 ..< target.dataLen:
           doAssert target.data[i] == expected.data[i],
             "pull mismatch at " & $i & " idat=" & $idatChunkSize &
             " read=" & $readSize & " fit=" & $fit
@@ -282,7 +282,7 @@ block: # pull sources (file-backed) decode identically to buffered ones
     decodePngScaledInto(original, expected, fitStretch)
     let target = newImage(24, 24)
     decodePngStreamScaledInto(sourceOf(original, 11), original.len, target, fitStretch)
-    for i in 0 ..< target.data.len:
+    for i in 0 ..< target.dataLen:
       doAssert target.data[i] == expected.data[i], file
 
   # Interlaced and 16-bit PNGs cannot stream and must fail cleanly

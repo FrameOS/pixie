@@ -707,26 +707,26 @@ proc convertToImage*(tiff: Tiff, min = 0.0f, max = 1.0f): Image {.raises: [].} =
     dataFormat: TiffDataFormat
     data: seq[ColorRGBX]
 
-  result = Image()
-  result.width = tiff.width
-  result.height = tiff.height
-
   case tiff.dataFormat
   of tiffRgba:
-    result.data = move cast[Movable](tiff).data
-    result.data.toPremultipliedAlpha()
+    result = newImageFromUnchecked(
+      tiff.width, tiff.height, move cast[Movable](tiff).data)
+    result.toPremultipliedAlpha()
   of tiffGray16:
-    result.data.setLen(tiff.dataGray16.len)
+    result = newImageFromUnchecked(tiff.width, tiff.height,
+      newSeq[ColorRGBX](tiff.width * tiff.height))
     for i, gray in tiff.dataGray16:
       let value = (gray div 257).uint8
       result.data[i] = rgbx(value, value, value, 255)
   of tiffGrayInt16:
-    result.data.setLen(tiff.dataGrayInt16.len)
+    result = newImageFromUnchecked(tiff.width, tiff.height,
+      newSeq[ColorRGBX](tiff.width * tiff.height))
     for i, gray in tiff.dataGrayInt16:
       let value = ((gray.int32 + 32768) div 257).uint8
       result.data[i] = rgbx(value, value, value, 255)
   of tiffFloat32:
-    result.data.setLen(tiff.dataFloat32.len)
+    result = newImageFromUnchecked(tiff.width, tiff.height,
+      newSeq[ColorRGBX](tiff.width * tiff.height))
     for i in 0 ..< tiff.dataFloat32.len:
       var gray: float32
       if max > min:
@@ -743,8 +743,8 @@ proc newImage*(tiff: Tiff): Image =
     return convertToImage(tiff)
 
   result = newImage(tiff.width, tiff.height)
-  if tiff.data.len != result.data.len:
+  if tiff.data.len != result.dataLen:
     failInvalid("image data length mismatch")
   if tiff.data.len > 0:
     copyMem(result.data[0].addr, tiff.data[0].addr, tiff.data.len * 4)
-  result.data.toPremultipliedAlpha()
+  result.toPremultipliedAlpha()

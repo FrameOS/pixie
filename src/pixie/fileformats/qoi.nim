@@ -48,9 +48,10 @@ proc srgbToLinear(color: var ColorRGBX) {.inline.} =
   color.g = color.g.srgbToLinear()
   color.b = color.b.srgbToLinear()
 
-proc srgbToLinear(data: ptr UncheckedArray[ColorRGBX]) =
-  for color in data.mitems:
-    color.srgbToLinear()
+proc srgbToLinear(image: Image) =
+  image.forEachSpan:
+    for i in spanStart ..< spanStart + spanLen:
+      image.data[i].srgbToLinear()
 
 proc linearPixel(qoi: Qoi, px: ColorRGBA): ColorRGBA {.inline.} =
   result = px
@@ -62,8 +63,8 @@ proc newImage*(qoi: Qoi): Image =
   result = newImage(qoi.width, qoi.height)
   copyMem(result.data[0].addr, qoi.data[0].addr, qoi.data.len * 4)
   if qoi.colorspace == sRBG:
-    result.data.srgbToLinear()
-  result.data.toPremultipliedAlpha()
+    result.srgbToLinear()
+  result.toPremultipliedAlpha()
 
 proc convertToImage*(qoi: Qoi): Image {.raises: [].} =
   ## Converts a QOI into an Image by moving the data. This is faster but can
@@ -73,13 +74,11 @@ proc convertToImage*(qoi: Qoi): Image {.raises: [].} =
     colorspace: Colorspace
     data: seq[ColorRGBX]
 
-  result = Image()
-  result.width = qoi.width
-  result.height = qoi.height
-  result.data = move cast[Movable](qoi).data
+  result = newImageFromUnchecked(
+    qoi.width, qoi.height, move cast[Movable](qoi).data)
   if qoi.colorspace == sRBG:
-    result.data.srgbToLinear()
-  result.data.toPremultipliedAlpha()
+    result.srgbToLinear()
+  result.toPremultipliedAlpha()
 
 proc decodeQoi*(data: string): Qoi {.raises: [PixieError].} =
   ## Decompress QOI file format data.
@@ -265,9 +264,15 @@ proc encodeQoi*(image: Image): string {.raises: [PixieError].} =
   qoi.height = image.height
   qoi.channels = 4
   qoi.colorspace = Linear
-  qoi.data.setLen(image.data.len)
-
-  copyMem(qoi.data[0].addr, image.data[0].addr, image.data.len * 4)
+  # Packed copy rather than a flat one: a view's rows are not adjacent, and
+  # `image.data` is a pointer into a buffer that may be larger than the image.
+  qoi.data.setLen(image.width * image.height)
+  for y in 0 ..< image.height:
+    copyMem(
+      qoi.data[y * image.width].addr,
+      image.data[image.dataIndex(0, y)].addr,
+      image.width * 4
+    )
   qoi.data.toStraightAlpha()
 
   encodeQoi(qoi)

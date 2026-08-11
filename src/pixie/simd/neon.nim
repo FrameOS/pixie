@@ -55,6 +55,12 @@ proc fillUnsafeNeon*(
     data[i] = rgbx
 
 proc isOneColorNeon*(image: Image): bool {.simd.} =
+  # A view's pixels are not one flat run, and this answer is only ever used to
+  # take a shortcut, so declining for views is safe: the caller falls back to
+  # the general path.
+  if image.isView:
+    return false
+
   result = true
 
   let color = image.data[0]
@@ -94,6 +100,10 @@ proc isOneColorNeon*(image: Image): bool {.simd.} =
       return false
 
 proc isTransparentNeon*(image: Image): bool {.simd.} =
+  # See isOneColorNeon: a false answer for a view is conservative, not wrong.
+  if image.isView:
+    return false
+
   var
     i: int
     p = cast[uint](image.data[0].addr)
@@ -129,7 +139,7 @@ proc isOpaqueNeon*(data: ptr UncheckedArray[ColorRGBX], start, len: int): bool {
 
   var
     i = start
-    p = cast[uint](data[0].addr)
+    p = cast[uint](data[i].addr)
   # Align to 16 bytes
   while i < (start + len) and (p and 15) != 0:
     if data[i].a != 255:
@@ -189,49 +199,52 @@ proc toPremultipliedAlphaNeon*(data: var seq[ColorRGBA | ColorRGBX]) {.simd.} =
       data[i] = c
 
 proc invertNeon*(image: Image) {.simd.} =
-  var
-    i: int
-    p = cast[uint](image.data[0].addr)
-  # Align to 16 bytes
-  while i < image.dataLen and (p and 15) != 0:
-    var rgbx = image.data[i]
-    rgbx.r = 255 - rgbx.r
-    rgbx.g = 255 - rgbx.g
-    rgbx.b = 255 - rgbx.b
-    rgbx.a = 255 - rgbx.a
-    image.data[i] = rgbx
-    inc i
-    p += 4
+  image.forEachSpan:
+    let spanEnd = spanStart + spanLen
 
-  let
-    vec255 = vmovq_n_u8(255)
-    iterations = image.dataLen div 16
-  for _ in 0 ..< iterations:
-    var channels = vld4q_u8(cast[pointer](p))
-    channels.val[0] = vsubq_u8(vec255, channels.val[0])
-    channels.val[1] = vsubq_u8(vec255, channels.val[1])
-    channels.val[2] = vsubq_u8(vec255, channels.val[2])
-    channels.val[3] = vsubq_u8(vec255, channels.val[3])
-    vst4q_u8(cast[pointer](p), channels)
-    p += 64
-  i += 16 * iterations
-
-  for i in i ..< image.dataLen:
-    var rgbx = image.data[i]
-    rgbx.r = 255 - rgbx.r
-    rgbx.g = 255 - rgbx.g
-    rgbx.b = 255 - rgbx.b
-    rgbx.a = 255 - rgbx.a
-    image.data[i] = rgbx
-
-  for i in 0 ..< image.dataLen:
-    var rgbx = image.data[i]
-    let a = rgbx.a.uint32
-    if a != 255:
-      rgbx.r = ((rgbx.r.uint32 * a) div 255).uint8
-      rgbx.g = ((rgbx.g.uint32 * a) div 255).uint8
-      rgbx.b = ((rgbx.b.uint32 * a) div 255).uint8
+    var
+      i = spanStart
+      p = cast[uint](image.data[i].addr)
+    # Align to 16 bytes
+    while i < spanEnd and (p and 15) != 0:
+      var rgbx = image.data[i]
+      rgbx.r = 255 - rgbx.r
+      rgbx.g = 255 - rgbx.g
+      rgbx.b = 255 - rgbx.b
+      rgbx.a = 255 - rgbx.a
       image.data[i] = rgbx
+      inc i
+      p += 4
+
+    let
+      vec255 = vmovq_n_u8(255)
+      iterations = (spanEnd - i) div 16
+    for _ in 0 ..< iterations:
+      var channels = vld4q_u8(cast[pointer](p))
+      channels.val[0] = vsubq_u8(vec255, channels.val[0])
+      channels.val[1] = vsubq_u8(vec255, channels.val[1])
+      channels.val[2] = vsubq_u8(vec255, channels.val[2])
+      channels.val[3] = vsubq_u8(vec255, channels.val[3])
+      vst4q_u8(cast[pointer](p), channels)
+      p += 64
+    i += 16 * iterations
+
+    for i in i ..< spanEnd:
+      var rgbx = image.data[i]
+      rgbx.r = 255 - rgbx.r
+      rgbx.g = 255 - rgbx.g
+      rgbx.b = 255 - rgbx.b
+      rgbx.a = 255 - rgbx.a
+      image.data[i] = rgbx
+
+    for i in spanStart ..< spanEnd:
+      var rgbx = image.data[i]
+      let a = rgbx.a.uint32
+      if a != 255:
+        rgbx.r = ((rgbx.r.uint32 * a + 127) div 255).uint8
+        rgbx.g = ((rgbx.g.uint32 * a + 127) div 255).uint8
+        rgbx.b = ((rgbx.b.uint32 * a + 127) div 255).uint8
+        image.data[i] = rgbx
 
 proc applyOpacityNeon*(image: Image, opacity: float32) {.simd.} =
   let opacity = round(255 * opacity).uint8
@@ -239,58 +252,66 @@ proc applyOpacityNeon*(image: Image, opacity: float32) {.simd.} =
     return
 
   if opacity == 0:
-    fillUnsafeNeon(image.data, rgbx(0, 0, 0, 0), 0, image.dataLen)
+    image.forEachSpan:
+      fillUnsafeNeon(image.data, rgbx(0, 0, 0, 0), spanStart, spanLen)
     return
 
-  var
-    i: int
-    p = cast[uint](image.data[0].addr)
+  image.forEachSpan:
+    let spanEnd = spanStart + spanLen
 
-  let
-    opacityVec = vmov_n_u8(opacity)
-    iterations = image.dataLen div 8
-  for _ in 0 ..< iterations:
-    var channels = vld4_u8(cast[pointer](p))
-    channels.val[0] = multiplyDiv255(channels.val[0], opacityVec)
-    channels.val[1] = multiplyDiv255(channels.val[1], opacityVec)
-    channels.val[2] = multiplyDiv255(channels.val[2], opacityVec)
-    channels.val[3] = multiplyDiv255(channels.val[3], opacityVec)
-    vst4_u8(cast[pointer](p), channels)
-    p += 32
-  i += 8 * iterations
+    var
+      i = spanStart
+      p = cast[uint](image.data[i].addr)
 
-  for i in i ..< image.dataLen:
-    var rgbx = image.data[i]
-    rgbx.r = ((rgbx.r * opacity) div 255).uint8
-    rgbx.g = ((rgbx.g * opacity) div 255).uint8
-    rgbx.b = ((rgbx.b * opacity) div 255).uint8
-    rgbx.a = ((rgbx.a * opacity) div 255).uint8
-    image.data[i] = rgbx
+    let
+      opacityVec = vmov_n_u8(opacity)
+      iterations = spanLen div 8
+    for _ in 0 ..< iterations:
+      var channels = vld4_u8(cast[pointer](p))
+      channels.val[0] = multiplyDiv255(channels.val[0], opacityVec)
+      channels.val[1] = multiplyDiv255(channels.val[1], opacityVec)
+      channels.val[2] = multiplyDiv255(channels.val[2], opacityVec)
+      channels.val[3] = multiplyDiv255(channels.val[3], opacityVec)
+      vst4_u8(cast[pointer](p), channels)
+      p += 32
+    i += 8 * iterations
+
+    # Widen before multiplying: uint8 * uint8 wraps, which zeroed the span tail.
+    for i in i ..< spanEnd:
+      var rgbx = image.data[i]
+      rgbx.r = ((rgbx.r.uint32 * opacity) div 255).uint8
+      rgbx.g = ((rgbx.g.uint32 * opacity) div 255).uint8
+      rgbx.b = ((rgbx.b.uint32 * opacity) div 255).uint8
+      rgbx.a = ((rgbx.a.uint32 * opacity) div 255).uint8
+      image.data[i] = rgbx
 
 proc ceilNeon*(image: Image) {.simd.} =
-  var
-    i: int
-    p = cast[uint](image.data[0].addr)
+  image.forEachSpan:
+    let spanEnd = spanStart + spanLen
 
-  let
-    zeroVec = vmovq_n_u8(0)
-    vec255 = vmovq_n_u8(255)
-    iterations = image.dataLen div 4
-  for _ in 0 ..< iterations:
-    var values = vld1q_u8(cast[pointer](p))
-    values = vceqq_u8(values, zeroVec)
-    values = vbicq_u8(vec255, values)
-    vst1q_u8(cast[pointer](p), values)
-    p += 16
-  i += 4 * iterations
+    var
+      i = spanStart
+      p = cast[uint](image.data[i].addr)
 
-  for i in i ..< image.dataLen:
-    var rgbx = image.data[i]
-    rgbx.r = if rgbx.r == 0: 0 else: 255
-    rgbx.g = if rgbx.g == 0: 0 else: 255
-    rgbx.b = if rgbx.b == 0: 0 else: 255
-    rgbx.a = if rgbx.a == 0: 0 else: 255
-    image.data[i] = rgbx
+    let
+      zeroVec = vmovq_n_u8(0)
+      vec255 = vmovq_n_u8(255)
+      iterations = spanLen div 4
+    for _ in 0 ..< iterations:
+      var values = vld1q_u8(cast[pointer](p))
+      values = vceqq_u8(values, zeroVec)
+      values = vbicq_u8(vec255, values)
+      vst1q_u8(cast[pointer](p), values)
+      p += 16
+    i += 4 * iterations
+
+    for i in i ..< spanEnd:
+      var rgbx = image.data[i]
+      rgbx.r = if rgbx.r == 0: 0 else: 255
+      rgbx.g = if rgbx.g == 0: 0 else: 255
+      rgbx.b = if rgbx.b == 0: 0 else: 255
+      rgbx.a = if rgbx.a == 0: 0 else: 255
+      image.data[i] = rgbx
 
 proc minifyBy2Neon*(image: Image, power = 1): Image {.simd.} =
   ## Scales the image down by an integer scale.

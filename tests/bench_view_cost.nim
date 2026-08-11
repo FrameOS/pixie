@@ -64,3 +64,19 @@ bench("subImage copy (quarter)", 200, proc () =
 bench("newImage quarter", 200, proc () =
   discard newImage(W div 2, H div 2)
 )
+
+# The reason any of this exists: handing a caller a sub-region used to mean
+# allocating and copying it. Only meaningful on the view build.
+when compiles(canvas.view(0, 0, 1, 1)):
+  bench("view (quarter)", 200, proc () =
+    discard canvas.view(0, 0, W div 2, H div 2)
+  )
+
+  let cell = canvas.view(0, 0, W div 2, H div 2)
+  bench("fill through a view", 200, proc () =
+    cell.fill(rgba(10, 20, 30, 255))
+  )
+
+  bench("draw alpha into a view", 200, proc () =
+    cell.draw(sprite, translate(vec2(0, 0)), NormalBlend)
+  )

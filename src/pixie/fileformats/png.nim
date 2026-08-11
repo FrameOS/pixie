@@ -689,7 +689,7 @@ proc newImage*(png: Png): Image {.raises: [PixieError].} =
   result = newImage(png.width, png.height)
   if png.data.len > 0:
     copyMem(result.data[0].addr, png.data[0].addr, png.data.len * 4)
-    result.data.toPremultipliedAlpha()
+    result.toPremultipliedAlpha()
   else:
     for i, color in png.data16:
       result.data[i] = color.toRgba.rgbx()
@@ -702,16 +702,17 @@ proc convertToImage*(png: Png): Image {.raises: [].} =
     data: seq[ColorRGBX]
     data16: seq[ColorRGBA16]
 
-  result = Image()
-  result.width = png.width
-  result.height = png.height
   if png.data.len > 0:
-    result.data = move cast[Movable](png).data
-    result.data.toPremultipliedAlpha()
+    # Adopt the decoder's buffer rather than copying it; that move is the whole
+    # point of this entry point.
+    result = newImageFromUnchecked(
+      png.width, png.height, move cast[Movable](png).data)
+    result.toPremultipliedAlpha()
   else:
-    result.data.setLen(png.data16.len)
+    var pixels = newSeq[ColorRGBX](png.width * png.height)
     for i, color in png.data16:
-      result.data[i] = color.toRgba.rgbx()
+      pixels[i] = color.toRgba.rgbx()
+    result = newImageFromUnchecked(png.width, png.height, move pixels)
 
 proc validateScaledPngTarget(width, height: int) {.raises: [PixieError].} =
   if width <= 0 or width > int32.high.int:
@@ -1711,12 +1712,12 @@ proc encodePng*(png: Png): string {.raises: [PixieError].} =
 
 proc encodePng*(image: Image): string {.raises: [PixieError].} =
   ## Encodes the image data into the PNG file format.
-  if image.data.len == 0:
+  if image.dataLen == 0:
     raise newException(
       PixieError,
       "Image has no data (are height and width 0?)"
     )
-  var copy = image.data
+  var copy = image.toContiguousSeq()
   copy.toStraightAlpha()
   encodePng(image.width, image.height, 4, copy[0].addr, copy.len * 4)
 

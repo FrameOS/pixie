@@ -55,7 +55,7 @@ block:
       expected = newImage(parseSvg(data, 200, 200))
       actual = newImage(200, 200)
     parseSvg(data, 200, 200).renderInto(actual)
-    doAssert expected.data == actual.data
+    doAssert expected == actual
 
   block:
     # On a target that already has content it must match rendering on
@@ -72,7 +72,7 @@ block:
 
     var worst = 0
     var differing = 0
-    for i in 0 ..< fused.data.len:
+    for i in 0 ..< fused.dataLen:
       var pixelWorst = 0
       pixelWorst = max(pixelWorst, abs(fused.data[i].r.int - materialized.data[i].r.int))
       pixelWorst = max(pixelWorst, abs(fused.data[i].g.int - materialized.data[i].g.int))
@@ -86,5 +86,5 @@ block:
     # composite onto transparency does before the final blend. A few units out
     # of 255 is the cost of not allocating the second image.
     doAssert worst <= 4, &"renderInto differs from draw by {worst}"
-    doAssert differing * 100 div fused.data.len <= 25,
-      &"renderInto differs on {differing * 100 div fused.data.len}% of pixels"
+    doAssert differing * 100 div fused.dataLen <= 25,
+      &"renderInto differs on {differing * 100 div fused.dataLen}% of pixels"

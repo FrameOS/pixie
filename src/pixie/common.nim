@@ -154,6 +154,58 @@ proc newImage*(width, height: int): Image {.raises: [PixieError].} =
   result.storage = newSeq[ColorRGBX](width * height)
   result.pixels = cast[ptr UncheckedArray[ColorRGBX]](result.storage[0].addr)
 
+proc newImageFrom*(
+  width, height: int, data: sink seq[ColorRGBX]
+): Image {.raises: [PixieError].} =
+  ## Wraps an existing buffer as an image that owns it, without copying.
+  ##
+  ## Decoders build their pixels in a seq and hand it over; that move is worth
+  ## keeping, so this exists rather than making them copy into a fresh image.
+  if width <= 0 or height <= 0:
+    raise newException(PixieError, "Image width and height must be > 0")
+  if data.len < width * height:
+    raise newException(PixieError, "Buffer is too small for " & $width & "x" & $height)
+  result = Image()
+  result.width = width
+  result.height = height
+  result.stride = width
+  result.origin = 0
+  result.storage = data
+  result.pixels = cast[ptr UncheckedArray[ColorRGBX]](result.storage[0].addr)
+
+proc toContiguousSeq*(image: Image): seq[ColorRGBX] {.raises: [].} =
+  ## The image's pixels as a packed, owned buffer, rows back to back.
+  ##
+  ## For encoders and anything else that needs to hand a plain array to a
+  ## library. It is a copy on purpose: `image.data` is a pointer now, so
+  ## `var copy = image.data` aliases rather than copies, and a caller that then
+  ## mutates `copy` would be scribbling on the image it was asked to read.
+  result = newSeq[ColorRGBX](image.width * image.height)
+  if image.width * image.height > 0:
+    for y in 0 ..< image.height:
+      copyMem(
+        result[y * image.width].addr,
+        image.data[image.dataIndex(0, y)].addr,
+        image.width * 4
+      )
+
+proc newImageFromUnchecked*(
+  width, height: int, data: sink seq[ColorRGBX]
+): Image {.raises: [].} =
+  ## `newImageFrom` for callers whose dimensions are already validated and
+  ## whose signature promises not to raise — the decoders, which checked the
+  ## header long before they got here. Wrong arguments are a programming error,
+  ## not a malformed file, so they assert rather than raise.
+  doAssert width > 0 and height > 0
+  doAssert data.len >= width * height
+  result = Image()
+  result.width = width
+  result.height = height
+  result.stride = width
+  result.origin = 0
+  result.storage = data
+  result.pixels = cast[ptr UncheckedArray[ColorRGBX]](result.storage[0].addr)
+
 proc view*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
   ## A window onto part of `image`, sharing its pixels. Writes through.
   ##

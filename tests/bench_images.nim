@@ -80,12 +80,12 @@ timeIt "applyOpacity":
 reset()
 
 timeIt "toPremultipliedAlpha":
-  image.data.toPremultipliedAlpha()
+  image.toPremultipliedAlpha()
 
 reset()
 
 timeIt "toStraightAlpha":
-  image.data.toStraightAlpha()
+  image.toStraightAlpha()
 
 reset()
 

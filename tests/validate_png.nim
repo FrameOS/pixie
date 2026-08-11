@@ -28,5 +28,5 @@ for file in pngSuiteFiles:
 
   doAssert pixieLoaded.width == width
   doAssert pixieLoaded.height == height
-  doAssert pixieLoaded.data.len == stbiLoadedRGBA.len
+  doAssert pixieLoaded.dataLen == stbiLoadedRGBA.len
   doAssert pixieLoaded.data == stbiLoadedRGBA

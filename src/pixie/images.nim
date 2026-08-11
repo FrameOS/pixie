@@ -54,26 +54,61 @@ proc setColor*(image: Image, x, y: int, color: Color) {.inline, raises: [].} =
 
 proc fill*(image: Image, color: SomeColor) {.inline, raises: [].} =
   ## Fills the image with the color.
-  fillUnsafe(image.data, color, 0, image.data.len)
+  # An owner is a single span, so this stays the one memset it always was.
+  # A view fills row by row, which is how a tiled render clears its cell.
+  image.forEachSpan:
+    fillUnsafe(image.data, color, spanStart, spanLen)
+
+proc `==`*(a, b: Image): bool {.raises: [].} =
+  ## Compares two images by their pixels.
+  ##
+  ## Worth having explicitly now that `data` is a pointer: `a.data == b.data`
+  ## compares addresses, which is never what a caller means and is quietly
+  ## false for two images with identical contents.
+  if a.isNil or b.isNil:
+    return a.isNil and b.isNil
+  if a.width != b.width or a.height != b.height:
+    return false
+  for y in 0 ..< a.height:
+    if not equalMem(
+      a.data[a.dataIndex(0, y)].addr,
+      b.data[b.dataIndex(0, y)].addr,
+      a.width * 4
+    ):
+      return false
+  true
 
 proc isOneColor*(image: Image): bool {.hasSimd, raises: [].} =
   ## Checks if the entire image is the same color.
+  # This is an optimization hint with no callers inside pixie, so a view gets
+  # the conservative answer rather than a row walk. The SIMD variants bail out
+  # the same way — the dispatch the hasSimd pragma inserts runs before this.
+  if image.isView:
+    return false
   result = true
   let color = cast[uint32](image.data[0])
-  for i in 0 ..< image.data.len:
+  for i in 0 ..< image.dataLen:
     if cast[uint32](image.data[i]) != color:
       return false
 
 proc isTransparent*(image: Image): bool {.hasSimd, raises: [].} =
   ## Checks if this image is fully transparent or not.
+  # Conservative for a view, for the same reason as isOneColor.
+  if image.isView:
+    return false
   result = true
-  for i in 0 ..< image.data.len:
+  for i in 0 ..< image.dataLen:
     if image.data[i].a != 0:
       return false
 
 proc isOpaque*(image: Image): bool {.raises: [].} =
   ## Checks if the entire image is opaque (alpha values are all 255).
-  isOpaque(image.data, 0, image.dataLen)
+  # No image-level SIMD variant can bypass this walk, so unlike isOneColor and
+  # isTransparent a view can be answered exactly instead of conservatively.
+  result = true
+  image.forEachSpan:
+    if not isOpaque(image.data, spanStart, spanLen):
+      return false
 
 proc flipHorizontal*(image: Image) {.raises: [].} =
   ## Flips the image around the Y axis.
@@ -99,14 +134,23 @@ proc flipVertical*(image: Image) {.raises: [].} =
 
 proc rotate90*(image: Image) {.raises: [PixieError].} =
   ## Rotates the image 90 degrees clockwise.
+  # Rotating swaps the dimensions, which a view cannot express: its rectangle
+  # lives inside someone else's buffer and cannot change shape there.
+  if image.isView:
+    raise newException(PixieError, "Cannot rotate90 a view, copy it first")
+
   let rotated = newImage(image.height, image.width)
   for y in 0 ..< rotated.height:
     for x in 0 ..< rotated.width:
       rotated.data[rotated.dataIndex(x, y)] =
         image.data[image.dataIndex(y, image.height - x - 1)]
-  image.width = rotated.width
-  image.height = rotated.height
-  image.data = move rotated.data
+  # The pixels are copied back rather than the buffer handed over, because an
+  # image's storage belongs to it: rebinding it to the temporary's would leave
+  # this image pointing at pixels that die with the temporary. The pixel count
+  # is unchanged, so the existing buffer still fits.
+  swap(image.width, image.height)
+  image.stride = image.width
+  copyMem(image.data[0].addr, rotated.data[0].addr, image.dataLen * 4)
 
 proc subImage*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
   ## Gets a sub image from this image.
@@ -268,38 +312,45 @@ proc applyOpacity*(image: Image, opacity: float32) {.hasSimd, raises: [].} =
     image.fill(rgbx(0, 0, 0, 0))
     return
 
-  for i in 0 ..< image.data.len:
-    var rgbx = image.data[i]
-    rgbx.r = ((rgbx.r * opacity) div 255).uint8
-    rgbx.g = ((rgbx.g * opacity) div 255).uint8
-    rgbx.b = ((rgbx.b * opacity) div 255).uint8
-    rgbx.a = ((rgbx.a * opacity) div 255).uint8
-    image.data[i] = rgbx
+  image.forEachSpan:
+    for i in spanStart ..< spanStart + spanLen:
+      var rgbx = image.data[i]
+      rgbx.r = ((rgbx.r * opacity) div 255).uint8
+      rgbx.g = ((rgbx.g * opacity) div 255).uint8
+      rgbx.b = ((rgbx.b * opacity) div 255).uint8
+      rgbx.a = ((rgbx.a * opacity) div 255).uint8
+      image.data[i] = rgbx
 
 proc invert*(image: Image) {.hasSimd, raises: [].} =
   ## Inverts all of the colors and alpha.
-  for i in 0 ..< image.data.len:
-    var rgbx = image.data[i]
-    rgbx.r = 255 - rgbx.r
-    rgbx.g = 255 - rgbx.g
-    rgbx.b = 255 - rgbx.b
-    rgbx.a = 255 - rgbx.a
-    image.data[i] = rgbx
-
-  # Inverting rgbx(50, 100, 150, 200) becomes rgbx(205, 155, 105, 55). This
-  # is not a valid premultiplied alpha color.
-  # We need to convert back to premultiplied alpha after inverting.
-  image.data.toPremultipliedAlpha()
+  image.forEachSpan:
+    for i in spanStart ..< spanStart + spanLen:
+      var rgbx = image.data[i]
+      rgbx.r = 255 - rgbx.r
+      rgbx.g = 255 - rgbx.g
+      rgbx.b = 255 - rgbx.b
+      rgbx.a = 255 - rgbx.a
+      # Inverting rgbx(50, 100, 150, 200) becomes rgbx(205, 155, 105, 55). This
+      # is not a valid premultiplied alpha color, so convert back here. Both
+      # steps are per pixel, so folding the conversion into this pass gives the
+      # same result as the separate whole-buffer pass it replaces — and unlike
+      # that pass it follows the image's rows rather than the buffer.
+      if rgbx.a != 255:
+        rgbx.r = ((rgbx.r.uint32 * rgbx.a + 127) div 255).uint8
+        rgbx.g = ((rgbx.g.uint32 * rgbx.a + 127) div 255).uint8
+        rgbx.b = ((rgbx.b.uint32 * rgbx.a + 127) div 255).uint8
+      image.data[i] = rgbx
 
 proc ceil*(image: Image) {.hasSimd, raises: [].} =
   ## A value of 0 stays 0. Anything else turns into 255.
-  for i in 0 ..< image.data.len:
-    var rgbx = image.data[i]
-    rgbx.r = if rgbx.r == 0: 0 else: 255
-    rgbx.g = if rgbx.g == 0: 0 else: 255
-    rgbx.b = if rgbx.b == 0: 0 else: 255
-    rgbx.a = if rgbx.a == 0: 0 else: 255
-    image.data[i] = rgbx
+  image.forEachSpan:
+    for i in spanStart ..< spanStart + spanLen:
+      var rgbx = image.data[i]
+      rgbx.r = if rgbx.r == 0: 0 else: 255
+      rgbx.g = if rgbx.g == 0: 0 else: 255
+      rgbx.b = if rgbx.b == 0: 0 else: 255
+      rgbx.a = if rgbx.a == 0: 0 else: 255
+      image.data[i] = rgbx
 
 proc blur*(
   image: Image, radius: float32, outOfBounds: SomeColor = color(0, 0, 0, 0)
@@ -465,6 +516,16 @@ proc blendLineMask(a, b: ptr UncheckedArray[ColorRGBX], len: int) {.hasSimd.} =
   for i in 0 ..< len:
     a[i] = blendMask(a[i], b[i])
 
+template zeroRows(image: Image, y, h: int) =
+  ## Clears `h` whole rows starting at row `y`. One memset when the rows are
+  ## back to back, which is every owner, and one per row for a strided view —
+  ## whose rows must not be zeroed through, since the gaps belong to the parent.
+  if image.isContiguous:
+    zeroMem(image.data[image.dataIndex(0, y)].addr, h * image.width * 4)
+  else:
+    for yy in y ..< y + h:
+      zeroMem(image.data[image.dataIndex(0, yy)].addr, image.width * 4)
+
 proc blendRect(a, b: Image, pos: Ivec2, blendMode: BlendMode) =
   let
     px = pos.x.int
@@ -499,7 +560,7 @@ proc blendRect(a, b: Image, pos: Ivec2, blendMode: BlendMode) =
   of MaskBlend:
     {.linearScanEnd.}
     if yStart + py > 0:
-      zeroMem(a.data[0].addr, (yStart + py) * a.width * 4)
+      a.zeroRows(0, yStart + py)
     for y in yStart ..< yEnd:
       if xStart + px > 0:
         zeroMem(a.data[a.dataIndex(0, y + py)].addr, (xStart + px) * 4)
@@ -514,10 +575,7 @@ proc blendRect(a, b: Image, pos: Ivec2, blendMode: BlendMode) =
           (a.width - (xEnd + px)) * 4
         )
     if yEnd + py < a.height:
-      zeroMem(
-        a.data[a.dataIndex(0, yEnd + py)].addr,
-        (a.height - (yEnd + py)) * a.width * 4
-      )
+      a.zeroRows(yEnd + py, a.height - (yEnd + py))
   else:
     let blender = blendMode.blender()
     for y in yStart ..< yEnd:
@@ -559,7 +617,7 @@ proc drawSmooth(a, b: Image, transform: Mat3, blendMode: BlendMode) =
   yEnd = yEnd.clamp(0, a.height)
 
   if blendMode == MaskBlend and yStart > 0:
-    zeroMem(a.data[0].addr, yStart * a.width * 4)
+    a.zeroRows(0, yStart)
 
   var sampleLine = newSeq[ColorRGBX](a.width)
   for y in yStart ..< yEnd:
@@ -628,10 +686,7 @@ proc drawSmooth(a, b: Image, transform: Mat3, blendMode: BlendMode) =
       )
 
   if blendMode == MaskBlend and a.height - yEnd > 0:
-    zeroMem(
-      a.data[a.dataIndex(0, yEnd)].addr,
-      a.width * (a.height - yEnd) * 4
-    )
+    a.zeroRows(yEnd, a.height - yEnd)
 
 proc draw*(
   a, b: Image, transform = mat3(), blendMode = NormalBlend

@@ -138,15 +138,14 @@ proc decodePpm*(data: string): Image {.raises: [PixieError].} =
   if header.maxVal <= 0 or header.maxVal > 0xFFFF:
     failInvalid()
 
-  result = newImage(header.width, header.height)
-  let pixels =
+  var pixels =
     if header.version == "P3":
       decodeP3Data(data[header.dataOffset .. ^1], header.maxVal)
     else:
       decodeP6Data(data[header.dataOffset .. ^1], header.maxVal)
-  if pixels.len != result.data.len:
+  if pixels.len != header.width * header.height:
     failInvalid()
-  result.data = pixels
+  result = newImageFrom(header.width, header.height, move pixels)
 
 proc decodePpmDimensions*(
   data: pointer, len: int

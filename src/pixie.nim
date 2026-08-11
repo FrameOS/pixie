@@ -92,11 +92,13 @@ proc validateScaledImageTarget(target: Image) {.raises: [PixieError].} =
 proc copyIntoTarget(target, source: Image) {.raises: [PixieError].} =
   if target.width != source.width or target.height != source.height:
     raise newException(PixieError, "Image dimensions do not match target")
-  if target.data.len > 0:
+  # Row at a time: either side may be a view, whose rows are `stride` apart
+  # rather than adjacent.
+  for y in 0 ..< target.height:
     copyMem(
-      target.data[0].addr,
-      source.data[0].unsafeAddr,
-      target.data.len * sizeof(ColorRGBX)
+      target.data[target.dataIndex(0, y)].addr,
+      source.data[source.dataIndex(0, y)].unsafeAddr,
+      target.width * sizeof(ColorRGBX)
     )
 
 proc decodeImageScaled*(
@@ -286,9 +288,11 @@ proc fill*(image: Image, paint: Paint) {.raises: [PixieError].} =
   ## Fills the image with the paint.
   case paint.kind:
   of SolidPaint:
-    fillUnsafe(image.data, paint.color, 0, image.data.len)
+    image.forEachSpan:
+      fillUnsafe(image.data, paint.color, spanStart, spanLen)
   of ImagePaint, TiledImagePaint:
-    fillUnsafe(image.data, rgbx(0, 0, 0, 0), 0, image.data.len)
+    image.forEachSpan:
+      fillUnsafe(image.data, rgbx(0, 0, 0, 0), spanStart, spanLen)
     let path = newPath()
     path.rect(0, 0, image.width.float32, image.height.float32)
     image.fillPath(path, paint)
