@@ -117,6 +117,25 @@ template isContiguous*(image: Image): bool =
   ## when it is full width.
   image.stride == image.width
 
+template forEachSpan*(image: Image, body: untyped) =
+  ## Runs `body` over every run of pixels that IS contiguous in the buffer,
+  ## injecting `spanStart` (an index into `image.data`) and `spanLen`.
+  ##
+  ## An image that owns its pixels is one span, so a whole-image operation
+  ## written this way costs exactly what it did before the views existed — one
+  ## call, one loop, the same SIMD. A view is one span per row. This is the
+  ## seam that lets flat operations stay fast and become correct at once.
+  block:
+    if image.stride == image.width:
+      let spanStart {.inject.} = image.origin
+      let spanLen {.inject.} = image.width * image.height
+      body
+    else:
+      for spanRow in 0 ..< image.height:
+        let spanStart {.inject.} = image.origin + image.stride * spanRow
+        let spanLen {.inject.} = image.width
+        body
+
 template dataLen*(image: Image): int =
   ## Number of pixels the image addresses. Only the extent of a flat walk when
   ## `isContiguous`.
