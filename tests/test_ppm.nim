@@ -49,7 +49,7 @@ block: # pull-source scaled decodes match the buffered decoder
   block:
     let target = newImage(full.width, full.height)
     decodePpmStreamScaledInto(sourceOf(data, 7), data.len, target, fitStretch)
-    doAssert target == full
+    doAssert target.pixelsEqual(full)
 
   # Downscales match nearest-neighbour sampling of the full decode
   for readSize in [1, 7, 1 shl 20]:
@@ -73,7 +73,7 @@ block: # pull-source scaled decodes match the buffered decoder
       full16 = decodePpm(data16)
       target = newImage(2, 2)
     decodePpmStreamScaledInto(sourceOf(data16, 3), data16.len, target, fitStretch)
-    doAssert target == full16
+    doAssert target.pixelsEqual(full16)
 
   # P3 (ASCII) PPMs cannot stream and must fail cleanly
   block:

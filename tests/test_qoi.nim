@@ -34,7 +34,7 @@ for name in tests:
   doAssert output.data.len == input.data.len
   doAssert output.colorspace == Linear
   if input.colorspace == Linear:
-    doAssert output == input
+    doAssert output.data == input.data
   else:
     for i, px in input.data:
       doAssert output.data[i] == rgba(

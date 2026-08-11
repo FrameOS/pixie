@@ -31,4 +31,4 @@ block:
       mm = decodeJpeg(readFile("tests/fileformats/jpeg/masters/f" & $n & "-exif.jpg"))
       ii = decodeJpeg(readFile("tests/fileformats/jpeg/masters/f" & $n & "-exif-ii.jpg"))
     doAssert ii.width == mm.width and ii.height == mm.height
-    doAssert ii == mm
+    doAssert ii.pixelsEqual(mm)

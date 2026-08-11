@@ -59,12 +59,17 @@ proc fill*(image: Image, color: SomeColor) {.inline, raises: [].} =
   image.forEachSpan:
     fillUnsafe(image.data, color, spanStart, spanLen)
 
-proc `==`*(a, b: Image): bool {.raises: [].} =
+proc pixelsEqual*(a, b: Image): bool {.raises: [].} =
   ## Compares two images by their pixels.
   ##
-  ## Worth having explicitly now that `data` is a pointer: `a.data == b.data`
-  ## compares addresses, which is never what a caller means and is quietly
-  ## false for two images with identical contents.
+  ## Deliberately not `==`. `Image` is a ref, so `==` already means "the same
+  ## object", and callers rely on that — "did the producer draw straight into
+  ## my canvas?" is an identity question, and answering it by comparing every
+  ## pixel would be both wrong and O(n).
+  ##
+  ## This exists because `a.data == b.data` no longer compares contents either:
+  ## `data` is a pointer now, so that compares addresses and is quietly false
+  ## for two images that hold the same picture.
   if a.isNil or b.isNil:
     return a.isNil and b.isNil
   if a.width != b.width or a.height != b.height:

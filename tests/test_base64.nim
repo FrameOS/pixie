@@ -13,7 +13,7 @@ block:
   let decoded = decodeBase64(encoded)
   doAssert decoded.width == image.width
   doAssert decoded.height == image.height
-  doAssert decoded == image
+  doAssert decoded.pixelsEqual(image)
 
 block:
   let image = newImage(1, 1)
@@ -25,7 +25,7 @@ block:
 
   doAssert decoded.width == image.width
   doAssert decoded.height == image.height
-  doAssert decoded == image
+  doAssert decoded.pixelsEqual(image)
 
 block:
   try:

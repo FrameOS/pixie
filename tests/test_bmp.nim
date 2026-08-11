@@ -59,7 +59,7 @@ proc makeIndexedBmp(bits: int, pixelData: string): string =
 #   var image2 = decodeBmp(encodeBmp(image))
 #   doAssert image2.width == image.width
 #   doAssert image2.height == image.height
-#   doAssert image2 == image
+#   doAssert image2.pixelsEqual(image)
 
 # block:
 #   var image = newImage(16, 16)
@@ -69,7 +69,7 @@ proc makeIndexedBmp(bits: int, pixelData: string): string =
 #   var image2 = decodeBmp(encodeBmp(image))
 #   doAssert image2.width == image.width
 #   doAssert image2.height == image.height
-#   doAssert image2 == image
+#   doAssert image2.pixelsEqual(image)
 
 block:
   for bits in [32, 24]:
@@ -109,7 +109,7 @@ block:
     encoded = encodeDib(image)
     decoded = decodeDib(encoded.cstring, encoded.len, true)
 
-  doAssert image == decoded
+  doAssert image.pixelsEqual(decoded)
 
 block: # identity-size scaled decodes match the reference decoder exactly
   var files: seq[string]
@@ -123,7 +123,7 @@ block: # identity-size scaled decodes match the reference decoder exactly
       expected = decodeBmp(data)
       target = newImage(expected.width, expected.height)
     decodeBmpScaledInto(data, target, fitStretch)
-    doAssert target == expected, file
+    doAssert target.pixelsEqual(expected), file
 
 block: # streaming sampling matches nearest-neighbour on the full decode
   let
@@ -169,7 +169,7 @@ block: # pull sources decode identically to buffered ones
         for readSize in [7, 4096, 1 shl 20]:
           let target = newImage(tw, th)
           decodeBmpStreamScaledInto(sourceOf(data, readSize), data.len, target, fit)
-          doAssert target == expected,
+          doAssert target.pixelsEqual(expected),
             file & " " & $tw & "x" & $th & " read=" & $readSize & " fit=" & $fit
 
   # Single-byte reads and unknown totalLen on a small file
@@ -181,7 +181,7 @@ block: # pull sources decode identically to buffered ones
         target = newImage(3, 3)
       decodeBmpScaledInto(data, expected, fitStretch)
       decodeBmpStreamScaledInto(sourceOf(data, 1), totalLen, target, fitStretch)
-      doAssert target == expected
+      doAssert target.pixelsEqual(expected)
 
   # Truncated input fails instead of hanging on the exhausted source
   block:
@@ -201,7 +201,7 @@ block: # var string scaled decodes release the source buffer
   let expected = decodeBmpScaled(data.cstring, data.len, 64, 48)
   let image = decodeBmpScaled(data, 64, 48)
   doAssert data.len == 0
-  doAssert image == expected
+  doAssert image.pixelsEqual(expected)
 
 block: # the format dispatchers route BMPs to the streaming decoder
   let
@@ -209,10 +209,10 @@ block: # the format dispatchers route BMPs to the streaming decoder
     expected = newImage(64, 48)
   decodeBmpScaledInto(data, expected, fitCover)
   let scaled = decodeImageScaled(data, 64, 48, fitCover)
-  doAssert scaled == expected
+  doAssert scaled.pixelsEqual(expected)
   let target = newImage(64, 48)
   discard decodeImageScaledInto(data, target, fitCover)
-  doAssert target == expected
+  doAssert target.pixelsEqual(expected)
 
 block: # decode budget: full decodes over budget fail, streaming fits
   setDecodeBudgetBytes(64 * 1024)

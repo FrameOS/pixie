@@ -55,7 +55,7 @@ block:
       expected = newImage(parseSvg(data, 200, 200))
       actual = newImage(200, 200)
     parseSvg(data, 200, 200).renderInto(actual)
-    doAssert expected == actual
+    doAssert expected.pixelsEqual(actual)
 
   block:
     # On a target that already has content it must match rendering on
