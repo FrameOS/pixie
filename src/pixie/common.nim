@@ -39,8 +39,24 @@ type
 
   Image* = ref object
     ## Image object that holds bitmap data in premultiplied alpha RGBA format.
+    ##
+    ## An image either **owns** its pixels or is a **view** into another
+    ## image's. A view shares the owner's buffer and addresses a rectangle
+    ## inside it, so handing a caller a sub-region costs nothing and writes
+    ## through to the original — which is what lets a tiled render draw its
+    ## cells in place instead of copying each one out and back.
+    ##
+    ## `stride` is the distance between rows in the shared buffer, so it equals
+    ## `width` for an owner and the owner's `width` for a view. Everything that
+    ## addresses pixels through `dataIndex` is therefore correct for both.
+    ## Anything that walks the buffer flat, assuming rows are contiguous across
+    ## the whole image, is correct only for an owner — see `isContiguous`.
     width*, height*: int
-    data*: seq[ColorRGBX]
+    stride*: int  ## elements between vertically adjacent pixels
+    origin*: int  ## index of (0, 0) within the shared buffer
+    storage: seq[ColorRGBX] ## owned pixels; empty for a view
+    root: Image             ## the owner whose buffer this views; nil if owner
+    pixels: ptr UncheckedArray[ColorRGBX] ## the buffer, owned or borrowed
 
   ImageSourceProc* = proc(
     dst: pointer, maxBytes: int
@@ -86,6 +102,26 @@ proc scaledFitRects*(
       result.dstX = (targetWidth - fitW) div 2
       result.dstW = fitW
 
+template data*(image: Image): ptr UncheckedArray[ColorRGBX] =
+  ## The pixels this image addresses — its own, or its owner's when it is a
+  ## view. Indexed with `dataIndex`, never with a flat running counter unless
+  ## `isContiguous` says that is safe.
+  image.pixels
+
+template dataIndex*(image: Image, x, y: int): int =
+  image.origin + image.stride * y + x
+
+template isContiguous*(image: Image): bool =
+  ## True when the image's rows sit back to back in the buffer, which is what a
+  ## whole-image flat loop needs. Always true for an owner; true for a view only
+  ## when it is full width.
+  image.stride == image.width
+
+template dataLen*(image: Image): int =
+  ## Number of pixels the image addresses. Only the extent of a flat walk when
+  ## `isContiguous`.
+  image.width * image.height
+
 proc newImage*(width, height: int): Image {.raises: [PixieError].} =
   ## Creates a new image with the parameter dimensions.
   if width <= 0 or height <= 0:
@@ -94,17 +130,49 @@ proc newImage*(width, height: int): Image {.raises: [PixieError].} =
   result = Image()
   result.width = width
   result.height = height
-  result.data = newSeq[ColorRGBX](width * height)
+  result.stride = width
+  result.origin = 0
+  result.storage = newSeq[ColorRGBX](width * height)
+  result.pixels = cast[ptr UncheckedArray[ColorRGBX]](result.storage[0].addr)
+
+proc view*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
+  ## A window onto part of `image`, sharing its pixels. Writes through.
+  ##
+  ## Views of views are flattened onto the original owner, so nesting costs one
+  ## object and no extra indirection however deep it goes.
+  if w <= 0 or h <= 0:
+    raise newException(PixieError, "View width and height must be > 0")
+  if x < 0 or y < 0 or x + w > image.width or y + h > image.height:
+    raise newException(PixieError, "View " & $w & "x" & $h & " at " & $x & "," &
+      $y & " does not fit inside " & $image.width & "x" & $image.height)
+  result = Image()
+  result.width = w
+  result.height = h
+  result.stride = image.stride
+  result.origin = image.dataIndex(x, y)
+  result.root = if image.root.isNil: image else: image.root
+  result.pixels = image.pixels
+
+template isView*(image: Image): bool =
+  ## True when the image borrows another's pixels rather than owning them.
+  not image.root.isNil
 
 proc copy*(image: Image): Image {.raises: [].} =
-  ## Copies the image data into a new image.
+  ## Copies the image data into a new image. A view copies out, so the result
+  ## always owns its pixels.
   result = Image()
   result.width = image.width
   result.height = image.height
-  result.data = image.data
-
-template dataIndex*(image: Image, x, y: int): int =
-  image.width * y + x
+  result.stride = image.width
+  result.origin = 0
+  result.storage = newSeq[ColorRGBX](image.width * image.height)
+  result.pixels = cast[ptr UncheckedArray[ColorRGBX]](result.storage[0].addr)
+  for y in 0 ..< image.height:
+    copyMem(
+      result.pixels[result.dataIndex(0, y)].addr,
+      image.pixels[image.dataIndex(0, y)].addr,
+      image.width * 4
+    )
 
 proc mix*(a, b: ColorRGBX, t: float32): ColorRGBX {.inline, raises: [].} =
   ## Linearly interpolate between a and b using t.

@@ -46,7 +46,7 @@ template blendMaskSimd(backdrop, source: M128i): M128i =
   mm_or_si128(backdropEven, mm_slli_epi16(backdropOdd, 8))
 
 proc fillUnsafeSse2*(
-  data: var seq[ColorRGBX],
+  data: ptr UncheckedArray[ColorRGBX],
   color: SomeColor,
   start, len: int
 ) {.simd.} =
@@ -145,7 +145,7 @@ proc isTransparentSse2*(image: Image): bool {.simd.} =
     if image.data[i].a != 0:
       return false
 
-proc isOpaqueSse2*(data: var seq[ColorRGBX], start, len: int): bool {.simd.} =
+proc isOpaqueSse2*(data: ptr UncheckedArray[ColorRGBX], start, len: int): bool {.simd.} =
   result = true
 
   var
@@ -264,7 +264,14 @@ proc invertSse2*(image: Image) {.simd.} =
     rgbx.a = 255 - rgbx.a
     image.data[i] = rgbx
 
-  toPremultipliedAlphaSse2(image.data)
+  for i in 0 ..< image.dataLen:
+    var rgbx = image.data[i]
+    let a = rgbx.a.uint32
+    if a != 255:
+      rgbx.r = ((rgbx.r.uint32 * a) div 255).uint8
+      rgbx.g = ((rgbx.g.uint32 * a) div 255).uint8
+      rgbx.b = ((rgbx.b.uint32 * a) div 255).uint8
+      image.data[i] = rgbx
 
 proc applyOpacitySse2*(image: Image, opacity: float32) {.simd.} =
   let opacity = round(255 * opacity).uint16

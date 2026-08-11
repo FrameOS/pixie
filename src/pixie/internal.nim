@@ -53,7 +53,7 @@ template getUncheckedArray*(
   cast[ptr UncheckedArray[ColorRGBX]](image.data[image.dataIndex(x, y)].addr)
 
 proc fillUnsafe*(
-  data: var seq[ColorRGBX], color: SomeColor, start, len: int
+  data: ptr UncheckedArray[ColorRGBX], color: SomeColor, start, len: int
 ) {.hasSimd, raises: [].} =
   ## Fills the image data with the color starting at index start and
   ## continuing for len indices.
@@ -95,7 +95,7 @@ proc toPremultipliedAlpha*(
       c.b = ((c.b.uint32 * c.a + 127) div 255).uint8
       data[i] = c
 
-proc isOpaque*(data: var seq[ColorRGBX], start, len: int): bool {.hasSimd.} =
+proc isOpaque*(data: ptr UncheckedArray[ColorRGBX], start, len: int): bool {.hasSimd.} =
   result = true
   for i in start ..< start + len:
     if data[i].a != 255:

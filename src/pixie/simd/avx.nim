@@ -7,7 +7,7 @@ when defined(release):
   {.push checks: off.}
 
 proc fillUnsafeAvx*(
-  data: var seq[ColorRGBX],
+  data: ptr UncheckedArray[ColorRGBX],
   color: SomeColor,
   start, len: int
 ) {.simd.} =

@@ -48,7 +48,7 @@ proc srgbToLinear(color: var ColorRGBX) {.inline.} =
   color.g = color.g.srgbToLinear()
   color.b = color.b.srgbToLinear()
 
-proc srgbToLinear(data: var seq[ColorRGBX]) =
+proc srgbToLinear(data: ptr UncheckedArray[ColorRGBX]) =
   for color in data.mitems:
     color.srgbToLinear()
 

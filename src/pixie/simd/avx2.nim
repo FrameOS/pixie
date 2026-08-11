@@ -98,7 +98,7 @@ proc isTransparentAvx2*(image: Image): bool {.simd.} =
     if image.data[i].a != 0:
       return false
 
-proc isOpaqueAvx2*(data: var seq[ColorRGBX], start, len: int): bool {.simd.} =
+proc isOpaqueAvx2*(data: ptr UncheckedArray[ColorRGBX], start, len: int): bool {.simd.} =
   result = true
 
   var i = start
@@ -220,7 +220,14 @@ proc invertAvx2*(image: Image) {.simd.} =
     rgbx.a = 255 - rgbx.a
     image.data[i] = rgbx
 
-  toPremultipliedAlphaAvx2(image.data)
+  for i in 0 ..< image.dataLen:
+    var rgbx = image.data[i]
+    let a = rgbx.a.uint32
+    if a != 255:
+      rgbx.r = ((rgbx.r.uint32 * a) div 255).uint8
+      rgbx.g = ((rgbx.g.uint32 * a) div 255).uint8
+      rgbx.b = ((rgbx.b.uint32 * a) div 255).uint8
+      image.data[i] = rgbx
 
 proc applyOpacityAvx2*(image: Image, opacity: float32) {.simd.} =
   let opacity = round(255 * opacity).uint16

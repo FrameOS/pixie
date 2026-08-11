@@ -73,7 +73,7 @@ proc isTransparent*(image: Image): bool {.hasSimd, raises: [].} =
 
 proc isOpaque*(image: Image): bool {.raises: [].} =
   ## Checks if the entire image is opaque (alpha values are all 255).
-  isOpaque(image.data, 0, image.data.len)
+  isOpaque(image.data, 0, image.dataLen)
 
 proc flipHorizontal*(image: Image) {.raises: [].} =
   ## Flips the image around the Y axis.
