@@ -554,12 +554,11 @@ proc parseSvg*(data: string, width = 0, height = 0): Svg {.raises: [PixieError].
   except:
     raise currentExceptionAsPixieError()
 
-proc newImage*(svg: Svg): Image {.raises: [PixieError].} =
-  ## Render SVG and return the image.
-  result = newImage(svg.width, svg.height)
-
+proc renderSvg(
+  svg: Svg, target: Image, firstBlendMode: BlendMode
+) {.raises: [PixieError].} =
   try:
-    var blendMode = OverwriteBlend # Start as overwrite
+    var blendMode = firstBlendMode
     for (path, props) in svg.elements:
       if props.display and props.opacity > 0:
         if props.fill != "none":
@@ -585,14 +584,14 @@ proc newImage*(svg: Svg): Image {.raises: [PixieError].} =
           paint.opacity = props.fillOpacity * props.opacity
           paint.blendMode = blendMode
 
-          result.fillPath(path, paint, props.transform, props.fillRule)
+          target.fillPath(path, paint, props.transform, props.fillRule)
 
         blendMode = NormalBlend # Switch to normal when compositing multiple paths
 
         if props.stroke != rgbx(0, 0, 0, 0) and props.strokeWidth > 0:
           let paint = props.stroke.copy()
           paint.color.a *= (props.opacity * props.strokeOpacity)
-          result.strokePath(
+          target.strokePath(
             path,
             paint,
             props.transform,
@@ -606,3 +605,22 @@ proc newImage*(svg: Svg): Image {.raises: [PixieError].} =
     raise e
   except:
     raise currentExceptionAsPixieError()
+
+proc renderInto*(svg: Svg, target: Image) {.raises: [PixieError].} =
+  ## Render SVG into an existing image, compositing onto whatever is already
+  ## there. Nothing is allocated: for a caller that already owns a correctly
+  ## sized buffer — a render canvas, a cell of a larger image — this is the
+  ## difference between one image and two.
+  ##
+  ## Unlike `newImage`, the first path composites rather than overwrites.
+  ## `newImage` can start in overwrite because its image is freshly
+  ## transparent, where the two are identical; on a target that already has
+  ## content they are not, and a semi-transparent first path would replace what
+  ## is underneath instead of blending with it.
+  svg.renderSvg(target, NormalBlend)
+
+proc newImage*(svg: Svg): Image {.raises: [PixieError].} =
+  ## Render SVG and return the image.
+  result = newImage(svg.width, svg.height)
+  svg.renderSvg(result, OverwriteBlend) # Fresh image: overwrite == normal
+
