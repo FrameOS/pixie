@@ -59,6 +59,25 @@ proc fill*(image: Image, color: SomeColor) {.inline, raises: [].} =
   image.forEachSpan:
     fillUnsafe(image.data, color, spanStart, spanLen)
 
+iterator items*(image: Image): ColorRGBX =
+  ## Every pixel, left to right then top to bottom.
+  ##
+  ## `for c in image.data` used to work because `data` was a seq; it is a
+  ## pointer now, and a pointer has no length to iterate. This is the
+  ## replacement, and it is correct for a view — where walking the buffer flat
+  ## would have wandered into the neighbouring rows.
+  for y in 0 ..< image.height:
+    for x in 0 ..< image.width:
+      yield image.unsafe[x, y]
+
+iterator pairs*(image: Image): (int, ColorRGBX) =
+  ## Every pixel with its index in this image, not in the buffer behind it.
+  var i = 0
+  for y in 0 ..< image.height:
+    for x in 0 ..< image.width:
+      yield (i, image.unsafe[x, y])
+      inc i
+
 proc pixelsEqual*(a, b: Image): bool {.raises: [].} =
   ## Compares two images by their pixels.
   ##
