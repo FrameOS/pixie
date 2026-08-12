@@ -104,6 +104,8 @@ type
     streamBaselineBlocks: bool
     scaledTargetWidth, scaledTargetHeight: int
     scaledFit: ScaledDecodeFit
+    plannedDecodeBytes: int64 ## what the SOF plan check accounted for, so the
+                              ## build step can budget its output image on top
 
   Mask = ref object
     ## Mask object that holds mask opacity data.
@@ -598,7 +600,24 @@ proc decodeSOF0(state: var DecoderState) =
         blockBytes =
           if streamsBlocks: 0'i64
           else: blockColumns.int64 * blockRows.int64 * 64'i64 * sizeof(int16).int64
-        maskBytes = channelWidth.int64 * channelHeight.int64
+        maskBytes =
+          if state.useScaledChannels():
+            channelWidth.int64 * channelHeight.int64
+          else:
+            # The reconstruction path magnifies every subsampled channel up to
+            # full stride resolution (magnifyXBy2/magnifyYBy2), and during the
+            # last doubling the half-size source is still alive next to its
+            # result. Count that peak, not the subsampled plane the decode
+            # starts with — under-counting here is a plan that "fits the
+            # budget" and then dies on the upsample allocations.
+            let fullBytes =
+              (state.numMcuWide * state.maxYScale * 8).int64 *
+              (state.numMcuHigh * state.maxXScale * 8).int64
+            if component.yScale == state.maxYScale and
+                component.xScale == state.maxXScale:
+              fullBytes
+            else:
+              fullBytes + fullBytes div 2
       totalBlockBytes += blockBytes
       totalMaskBytes += maskBytes
 
@@ -615,11 +634,12 @@ proc decodeSOF0(state: var DecoderState) =
   # Check the whole decode plan against the memory budget before any
   # image-sized allocation happens, so oversized inputs fail with a
   # catchable error instead of exhausting memory.
-  if overDecodeBudget(totalBlockBytes + totalMaskBytes):
+  state.plannedDecodeBytes = totalBlockBytes + totalMaskBytes
+  if overDecodeBudget(state.plannedDecodeBytes):
     failInvalid(
       "JPEG decode of " & $state.imageWidth & "x" & $state.imageHeight &
       (if state.progressive: " (progressive)" else: "") &
-      " needs " & $((totalBlockBytes + totalMaskBytes) div 1024) &
+      " needs " & $(state.plannedDecodeBytes div 1024) &
       "K of decode buffers, over the " &
       $(decodeBudgetBytes() div 1024) & "K memory budget"
     )
@@ -1642,14 +1662,31 @@ proc fillImage(state: var DecoderState, result: Image) =
   else:
     failInvalid()
 
+proc ensureOutputBudget(state: DecoderState, width, height: int) =
+  ## The SOF plan check covers the decode buffers; the output image the
+  ## build step is about to allocate lives NEXT TO them, and an output the
+  ## budget cannot carry deserves the same catchable refusal — not an
+  ## allocation attempt that exhausts a fragmented heap. The *Into variants
+  ## never come here: their target is the caller's to have afforded.
+  let outputBytes = width.int64 * height.int64 * 4
+  if overDecodeBudget(state.plannedDecodeBytes + outputBytes):
+    failInvalid(
+      "JPEG output of " & $width & "x" & $height & " needs " &
+      $(outputBytes div 1024) & "K next to " &
+      $(state.plannedDecodeBytes div 1024) & "K of decode buffers, over the " &
+      $(decodeBudgetBytes() div 1024) & "K memory budget"
+    )
+
 proc buildImage(state: var DecoderState, targetWidth, targetHeight: int): Image =
   ## Takes a jpeg image object and builds a target-sized pixie Image from it.
+  state.ensureOutputBudget(targetWidth, targetHeight)
   result = newImage(targetWidth, targetHeight)
   state.fillImage(result)
 
 proc buildImage(state: var DecoderState): Image =
   ## Takes a jpeg image object and builds a pixie Image from it.
 
+  state.ensureOutputBudget(state.imageWidth, state.imageHeight)
   result = newImage(state.imageWidth, state.imageHeight)
 
   case state.components.len:
