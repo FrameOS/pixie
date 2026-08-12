@@ -1695,6 +1695,29 @@ proc sourceCoords(
   else:
     failInvalid("invalid orientation")
 
+proc channelAxis(
+  gridCoord, gridSize, sampleSize, nativeSize: int
+): tuple[lo, hi, frac, den: int] {.inline.} =
+  ## Where one axis of a grid coordinate lands in a channel. A channel that
+  ## was box-downsampled below its native resolution (subsampled chroma on a
+  ## scaled decode) interpolates between its two nearest samples,
+  ## center-aligned; every other channel keeps the exact nearest pick it
+  ## always had — the identity when sample and grid sizes match, replication
+  ## on upscales — so 1:1 and upscale decodes stay byte-identical.
+  if sampleSize < nativeSize:
+    let
+      den = 2 * gridSize
+      num = (2 * gridCoord + 1) * sampleSize - gridSize
+    if num <= 0:
+      return (0, 0, 0, den)
+    let lo = num div den
+    if lo >= sampleSize - 1:
+      return (sampleSize - 1, sampleSize - 1, 0, den)
+    (lo, lo + 1, num - lo * den, den)
+  else:
+    let nearest = min((gridCoord * sampleSize) div gridSize, sampleSize - 1)
+    (nearest, nearest, 0, 1)
+
 proc channelAt(
   component: Component,
   sourceX, sourceY, sourceWidth, sourceHeight: int
@@ -1706,9 +1729,20 @@ proc channelAt(
     sampleHeight =
       if component.sampleHeight > 0: component.sampleHeight
       else: component.height
-    x = min((sourceX * sampleWidth) div sourceWidth, sampleWidth - 1)
-    y = min((sourceY * sampleHeight) div sourceHeight, sampleHeight - 1)
-  component.channel.data[component.channel.dataIndex(x, y)]
+    ax = channelAxis(sourceX, sourceWidth, sampleWidth, component.width)
+    ay = channelAxis(sourceY, sourceHeight, sampleHeight, component.height)
+  if ax.frac == 0 and ay.frac == 0:
+    return component.channel.data[component.channel.dataIndex(ax.lo, ay.lo)]
+  let
+    c00 = component.channel.data[component.channel.dataIndex(ax.lo, ay.lo)].int
+    c10 = component.channel.data[component.channel.dataIndex(ax.hi, ay.lo)].int
+    c01 = component.channel.data[component.channel.dataIndex(ax.lo, ay.hi)].int
+    c11 = component.channel.data[component.channel.dataIndex(ax.hi, ay.hi)].int
+    top = c00 * (ax.den - ax.frac) + c10 * ax.frac
+    bottom = c01 * (ax.den - ax.frac) + c11 * ax.frac
+    total = top * (ay.den - ay.frac) + bottom * ay.frac
+    area = ax.den * ay.den
+  ((total + area div 2) div area).uint8
 
 proc scaledFitRects(
   state: DecoderState, targetWidth, targetHeight: int

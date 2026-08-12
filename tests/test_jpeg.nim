@@ -92,7 +92,7 @@ block:
 
   for (path, tolerance) in [
     ("tests/fileformats/jpeg/masters/cat_4_4_4.jpg", 2),
-    ("tests/fileformats/jpeg/masters/cat_4_2_0.jpg", 24)
+    ("tests/fileformats/jpeg/masters/cat_4_2_0.jpg", 18)
   ]:
     let
       data = readFile(path)
