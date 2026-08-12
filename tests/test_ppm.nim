@@ -51,17 +51,40 @@ block: # pull-source scaled decodes match the buffered decoder
     decodePpmStreamScaledInto(sourceOf(data, 7), data.len, target, fitStretch)
     doAssert target.pixelsEqual(full)
 
-  # Downscales match nearest-neighbour sampling of the full decode
+  # Per axis: downscales are box averages of each pixel's exact source
+  # footprint, upscale axes keep the nearest pick (4 wide into 5 here).
   for readSize in [1, 7, 1 shl 20]:
     for totalLen in [data.len, 0]:
       let target = newImage(5, 3)
       decodePpmStreamScaledInto(
         sourceOf(data, readSize), totalLen, target, fitStretch)
-      for y in 0 ..< target.height:
-        let srcY = min(y * full.height div target.height, full.height - 1)
-        for x in 0 ..< target.width:
-          let srcX = min(x * full.width div target.width, full.width - 1)
-          doAssert target.unsafe[x, y] == full.unsafe[srcX, srcY]
+      for ty in 0 ..< target.height:
+        var ys: seq[int]
+        if target.height <= full.height:
+          for sy in 0 ..< full.height:
+            if (sy * target.height) div full.height == ty: ys.add(sy)
+        else:
+          ys.add((ty * full.height) div target.height)
+        for tx in 0 ..< target.width:
+          var xs: seq[int]
+          if target.width <= full.width:
+            for sx in 0 ..< full.width:
+              if (sx * target.width) div full.width == tx: xs.add(sx)
+          else:
+            xs.add((tx * full.width) div target.width)
+          var r, g, b: uint64
+          for sy in ys:
+            for sx in xs:
+              let px = full.unsafe[sx, sy]
+              r += px.r
+              g += px.g
+              b += px.b
+          let n = uint64(xs.len * ys.len)
+          doAssert target.unsafe[tx, ty] == rgbx(
+            uint8((r + n div 2) div n),
+            uint8((g + n div 2) div n),
+            uint8((b + n div 2) div n),
+            255)
 
   # 16-bit maxVal payloads stream too
   block:

@@ -256,23 +256,8 @@ proc decodePpmStreamScaledInto*(
       header.width.int64 * header.height.int64 * bytesPerPixel.int64:
     failInvalid()
 
-  checkDecodeBudget(header, rowBytesLen.int64 + header.width.int64 * 4)
-
-  let rects = scaledFitRects(
-    header.width, header.height, target.width, target.height, fit
-  )
-
-  template srcYFor(y: int): int =
-    min(
-      rects.srcY + ((y - rects.dstY) * rects.srcH) div rects.dstH,
-      header.height - 1
-    )
-
-  template srcXFor(x: int): int =
-    min(
-      rects.srcX + ((x - rects.dstX) * rects.srcW) div rects.dstW,
-      header.width - 1
-    )
+  checkDecodeBudget(header, rowBytesLen.int64 + header.width.int64 * 4 +
+    target.width.int64 * 4 * 8 * 2)
 
   # See decodeP6Data for the maxVal multiplier reasoning
   let valueMultiplier = (255 / header.maxVal).float32
@@ -280,13 +265,10 @@ proc decodePpmStreamScaledInto*(
   var
     rowBytes = newSeq[uint8](rowBytesLen)
     rowPixels = newSeq[ColorRGBX](header.width)
-    dstY = rects.dstY
-  let dstYEnd = rects.dstY + rects.dstH
+    sampler = initRowBoxSampler(
+      header.width, header.height, target.width, target.height, fit)
 
   for fileY in 0 ..< header.height:
-    if dstY >= dstYEnd:
-      break # Every remaining row is below the sampled crop
-
     # Skipped rows still consume their bytes to keep the reads sequential
     var done = 0
     while done < rowBytesLen:
@@ -295,8 +277,8 @@ proc decodePpmStreamScaledInto*(
         failInvalid()
       done += got
 
-    if srcYFor(dstY) != fileY:
-      continue # No target row samples this source row
+    if not sampler.wantsRow(fileY):
+      continue # Outside the fitted crop; skip the pixel conversion too
 
     if header.maxVal > 0xFF:
       for x in 0 ..< header.width:
@@ -326,10 +308,8 @@ proc decodePpmStreamScaledInto*(
           255
         )
 
-    while dstY < dstYEnd and srcYFor(dstY) == fileY:
-      for x in rects.dstX ..< rects.dstX + rects.dstW:
-        target.unsafe[x, dstY] = rowPixels[srcXFor(x)]
-      inc dstY
+    sampler.feedRow(target, fileY, rowPixels)
+  sampler.finish(target)
 
 proc encodePpm*(image: Image): string {.raises: [].} =
   ## Encodes an image into the PPM file format (version P6).

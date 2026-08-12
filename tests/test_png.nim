@@ -107,7 +107,25 @@ block: # streamed scanlines keep canvas-sized decodes within tight budgets
   setDecodeBudgetBytes(256 * 1024)
   let target = newImage(96, 60)
   decodePngScaledInto(encoded, target, fitStretch)
-  doAssert target[48, 30] == source[240, 400]
+  # The box sampler's answer for (48, 30): the rounded average of that
+  # pixel's exact source footprint (columns 240..<245, rows 400..<414).
+  block:
+    var r, g, b: uint64
+    var n: uint64
+    for sy in 0 ..< source.height:
+      if (sy * 60) div source.height != 30: continue
+      for sx in 0 ..< source.width:
+        if (sx * 96) div source.width != 48: continue
+        let px = source[sx, sy]
+        r += px.r
+        g += px.g
+        b += px.b
+        inc n
+    doAssert target[48, 30] == rgbx(
+      uint8((r + n div 2) div n),
+      uint8((g + n div 2) div n),
+      uint8((b + n div 2) div n),
+      255)
   setDecodeBudgetBytes(0)
 
 block: # streamed scaled decodes match the buffered fillImage path

@@ -733,30 +733,29 @@ proc scaledFitRects(
 proc fillImage*(
   png: Png, target: Image, fit = fitStretch
 ) {.raises: [PixieError].} =
-  ## Scales a decoded PNG into an existing Image. With fitContain, pixels
-  ## outside the fitted rectangle keep their current contents.
+  ## Scales a decoded PNG into an existing Image through the shared row box
+  ## sampler — the same filtering the streamed decode applies, so an
+  ## interlaced or 16-bit source that had to buffer whole does not come out
+  ## sampled differently. With fitContain, pixels outside the fitted
+  ## rectangle keep their current contents.
   validateScaledPngTarget(target)
 
-  let rects = png.scaledFitRects(target.width, target.height, fit)
+  var
+    rowRgbx = newSeq[ColorRGBX](png.width)
+    sampler = initRowBoxSampler(
+      png.width, png.height, target.width, target.height, fit)
 
-  template srcYFor(y: int): int =
-    min(rects.srcY + ((y - rects.dstY) * rects.srcH) div rects.dstH, png.height - 1)
-
-  template srcXFor(x: int): int =
-    min(rects.srcX + ((x - rects.dstX) * rects.srcW) div rects.dstW, png.width - 1)
-
-  if png.data.len > 0:
-    for y in rects.dstY ..< rects.dstY + rects.dstH:
-      let srcY = srcYFor(y)
-      for x in rects.dstX ..< rects.dstX + rects.dstW:
-        let srcX = srcXFor(x)
-        target.unsafe[x, y] = png.data[srcX + srcY * png.width].rgbx()
-  else:
-    for y in rects.dstY ..< rects.dstY + rects.dstH:
-      let srcY = srcYFor(y)
-      for x in rects.dstX ..< rects.dstX + rects.dstW:
-        let srcX = srcXFor(x)
-        target.unsafe[x, y] = png.data16[srcX + srcY * png.width].toRgba.rgbx()
+  for y in 0 ..< png.height:
+    if not sampler.wantsRow(y):
+      continue
+    if png.data.len > 0:
+      for x in 0 ..< png.width:
+        rowRgbx[x] = png.data[x + y * png.width].rgbx()
+    else:
+      for x in 0 ..< png.width:
+        rowRgbx[x] = png.data16[x + y * png.width].toRgba.rgbx()
+    sampler.feedRow(target, y, rowRgbx)
+  sampler.finish(target)
 
 proc convertToImage*(
   png: Png, width, height: int, fit = fitStretch
@@ -986,48 +985,38 @@ proc decodePngScaledIntoStreaming(
   fit: ScaledDecodeFit,
   inflate: InflateRunProc
 ) {.raises: [PixieError].} =
-  ## Samples scanlines into the target as they stream out of the inflate
-  ## window. Peak memory: one row of RGBA pixels plus the fixed streaming
-  ## overhead — the full-size pixel buffer is never allocated.
+  ## Folds scanlines into the target as they stream out of the inflate
+  ## window, through the shared row box sampler: downscales are area
+  ## filtered (nearest decimation swallowed thin strokes — an XKCD comic's
+  ## letter stems vanished into a contain fit), 1:1 and upscale axes are
+  ## byte-identical to the nearest pick this replaced. Peak memory: one row
+  ## of pixels in two forms plus two target-width accumulator rows — the
+  ## full-size pixel buffer is never allocated.
   let header = structure.header
 
   checkDecodeBudget(header,
-    header.streamingRowOverheadBytes + header.width.int64 * 4)
-
-  let rects = scaledFitRects(
-    header.width, header.height, target.width, target.height, fit
-  )
-
-  template srcYFor(y: int): int =
-    min(
-      rects.srcY + ((y - rects.dstY) * rects.srcH) div rects.dstH,
-      header.height - 1
-    )
-
-  template srcXFor(x: int): int =
-    min(
-      rects.srcX + ((x - rects.dstX) * rects.srcW) div rects.dstW,
-      header.width - 1
-    )
+    header.streamingRowOverheadBytes + header.width.int64 * 8 +
+    target.width.int64 * 4 * 8 * 2)
 
   var
     rowPixels = newSeq[ColorRGBA](header.width)
-    dstY = rects.dstY
-  let dstYEnd = rects.dstY + rects.dstH
+    rowRgbx = newSeq[ColorRGBX](header.width)
+    sampler = initRowBoxSampler(
+      header.width, header.height, target.width, target.height, fit)
 
   let onRow = proc (y: int, row: seq[uint8]) {.gcsafe, raises: [PixieError].} =
-    if dstY >= dstYEnd or srcYFor(dstY) != y:
-      return # No remaining target row samples this source row
+    if not sampler.wantsRow(y):
+      return # Outside the fitted crop; skip the pixel conversion too
     rowPixels.writePixels(
       header, structure.palette, structure.transparency, row,
       header.width, 1, 0, 0, 1, 1
     )
-    while dstY < dstYEnd and srcYFor(dstY) == y:
-      for x in rects.dstX ..< rects.dstX + rects.dstW:
-        target.unsafe[x, dstY] = rowPixels[srcXFor(x)].rgbx()
-      inc dstY
+    for i in 0 ..< header.width:
+      rowRgbx[i] = rowPixels[i].rgbx()
+    sampler.feedRow(target, y, rowRgbx)
 
   streamRows(header, onRow, inflate)
+  sampler.finish(target)
 
 proc decodePngScaledIntoStreaming(
   idatSegments: seq[InflateSegment],

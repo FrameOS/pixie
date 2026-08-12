@@ -307,70 +307,36 @@ proc decodeBmpScaledIntoStreaming(
   fit: ScaledDecodeFit,
   readRow: BmpRowRead
 ) {.raises: [PixieError].} =
-  ## Samples pixel rows into the target as they arrive in file order.
-  ## Bottom-up files walk the target cursor from the bottom edge upward, so
-  ## no flip pass or full-size pixel buffer is ever needed. Peak memory: one
-  ## raw row plus one row of RGBX pixels.
+  ## Folds pixel rows into the target as they arrive in file order, through
+  ## the shared row box sampler: downscales are area filtered instead of
+  ## nearest-decimated, 1:1 and upscale axes stay byte-identical to the
+  ## nearest pick this replaced. Bottom-up files feed the sampler in
+  ## descending image order, which it accepts — footprint rows stay
+  ## contiguous either way. Peak memory: one raw row, one row of RGBX
+  ## pixels, two target-width accumulator rows.
   if header.width <= 0 or header.height <= 0:
     failInvalid()
 
   checkDecodeBudget(header,
-    header.rowStride.int64 + header.width.int64 * 4 + bmpStreamReadBytes)
-
-  let rects = scaledFitRects(
-    header.width, header.height, target.width, target.height, fit
-  )
-
-  template srcYFor(y: int): int =
-    min(
-      rects.srcY + ((y - rects.dstY) * rects.srcH) div rects.dstH,
-      header.height - 1
-    )
-
-  template srcXFor(x: int): int =
-    min(
-      rects.srcX + ((x - rects.dstX) * rects.srcW) div rects.dstW,
-      header.width - 1
-    )
+    header.rowStride.int64 + header.width.int64 * 4 + bmpStreamReadBytes +
+    target.width.int64 * 4 * 8 * 2)
 
   var
     rowBytes = newSeq[uint8](header.rawRowBytes)
     rowPixels = newSeq[ColorRGBX](header.width)
-  let
-    rowBytesPtr = cast[ptr UncheckedArray[uint8]](rowBytes[0].addr)
-    dstYEnd = rects.dstY + rects.dstH
+    sampler = initRowBoxSampler(
+      header.width, header.height, target.width, target.height, fit)
+  let rowBytesPtr = cast[ptr UncheckedArray[uint8]](rowBytes[0].addr)
 
-  if header.topDown:
-    var dstY = rects.dstY
-    for fileY in 0 ..< header.height:
-      if dstY >= dstYEnd:
-        break # Every remaining file row is below the sampled crop
-      let needed = srcYFor(dstY) == fileY
-      readRow(rowBytesPtr, not needed)
-      if not needed:
-        continue # No target row samples this source row
-      bmpRowToPixels(header, rowBytes, rowPixels)
-      while dstY < dstYEnd and srcYFor(dstY) == fileY:
-        for x in rects.dstX ..< rects.dstX + rects.dstW:
-          target.unsafe[x, dstY] = rowPixels[srcXFor(x)]
-        inc dstY
-  else:
-    # Bottom-up: the first file row is the bottom image row, so the target
-    # cursor starts at the bottom of the fitted rect and moves upward.
-    var dstY = dstYEnd - 1
-    for fileY in 0 ..< header.height:
-      if dstY < rects.dstY:
-        break # Every remaining file row is above the sampled crop
-      let imageY = header.height - fileY - 1
-      let needed = srcYFor(dstY) == imageY
-      readRow(rowBytesPtr, not needed)
-      if not needed:
-        continue # No target row samples this source row
-      bmpRowToPixels(header, rowBytes, rowPixels)
-      while dstY >= rects.dstY and srcYFor(dstY) == imageY:
-        for x in rects.dstX ..< rects.dstX + rects.dstW:
-          target.unsafe[x, dstY] = rowPixels[srcXFor(x)]
-        dec dstY
+  for fileY in 0 ..< header.height:
+    let imageY = if header.topDown: fileY else: header.height - fileY - 1
+    let needed = sampler.wantsRow(imageY)
+    readRow(rowBytesPtr, not needed)
+    if not needed:
+      continue # Outside the fitted crop; skip the pixel conversion too
+    bmpRowToPixels(header, rowBytes, rowPixels)
+    sampler.feedRow(target, imageY, rowPixels)
+  sampler.finish(target)
 
 proc decodeDibScaledInto(
   data: ptr UncheckedArray[uint8], len: int, target: Image,

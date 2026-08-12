@@ -141,6 +141,134 @@ template dataLen*(image: Image): int =
   ## `isContiguous`.
   image.width * image.height
 
+type RowBoxSampler* = object
+  ## The shared sampler for row-streamed scaled decodes (PNG, BMP, PPM).
+  ## Full source scanlines are fed in as they decode, and each target pixel
+  ## of the fitted rect becomes the rounded average of its exact source
+  ## footprint — a proper area filter on downscale axes, so thin strokes
+  ## dim instead of disappearing the way nearest decimation swallowed them.
+  ## Axes at 1:1 reduce to the identity and upscale axes keep the exact
+  ## former nearest replication, byte for byte. Rows may arrive top-down or
+  ## bottom-up (BMP), as long as the rows inside one vertical footprint are
+  ## contiguous. Peak memory: two target-width accumulator rows.
+  srcX, srcY, srcW, srcH: int
+  dstX, dstY, dstW, dstH: int
+  boxX, boxY: bool
+  colCount: seq[uint32]  ## source columns per target column, when boxX
+  line: seq[uint64]      ## one scanline folded to target width (RGBX sums)
+  sums: seq[uint64]      ## the vertical accumulator, when boxY
+  currentTy: int         ## relative target row being accumulated; -1 = none
+  rowsInBox: int
+
+proc initRowBoxSampler*(
+  srcWidth, srcHeight, targetWidth, targetHeight: int, fit: ScaledDecodeFit
+): RowBoxSampler =
+  let rects = scaledFitRects(srcWidth, srcHeight, targetWidth, targetHeight, fit)
+  result.srcX = rects.srcX
+  result.srcY = rects.srcY
+  result.srcW = rects.srcW
+  result.srcH = rects.srcH
+  result.dstX = rects.dstX
+  result.dstY = rects.dstY
+  result.dstW = rects.dstW
+  result.dstH = rects.dstH
+  result.boxX = rects.srcW >= rects.dstW
+  result.boxY = rects.srcH >= rects.dstH
+  result.currentTy = -1
+  result.line = newSeq[uint64](rects.dstW * 4)
+  if result.boxX:
+    result.colCount = newSeq[uint32](rects.dstW)
+    for sx in 0 ..< rects.srcW:
+      inc result.colCount[(sx.int64 * rects.dstW.int64).int div rects.srcW]
+  if result.boxY:
+    result.sums = newSeq[uint64](rects.dstW * 4)
+
+proc wantsRow*(sampler: RowBoxSampler, sy: int): bool {.inline.} =
+  ## Whether this source row contributes at all — callers skip the pixel
+  ## conversion (or the read itself) for rows outside the crop.
+  sy >= sampler.srcY and sy < sampler.srcY + sampler.srcH
+
+proc foldRowX(sampler: var RowBoxSampler, row: openArray[ColorRGBX]) =
+  if sampler.boxX:
+    for i in 0 ..< sampler.line.len:
+      sampler.line[i] = 0
+    for sx in 0 ..< sampler.srcW:
+      let
+        tx = (sx.int64 * sampler.dstW.int64).int div sampler.srcW
+        px = row[sampler.srcX + sx]
+        base = tx * 4
+      sampler.line[base + 0] += px.r
+      sampler.line[base + 1] += px.g
+      sampler.line[base + 2] += px.b
+      sampler.line[base + 3] += px.a
+  else:
+    for tx in 0 ..< sampler.dstW:
+      let
+        px = row[sampler.srcX + (tx * sampler.srcW) div sampler.dstW]
+        base = tx * 4
+      sampler.line[base + 0] = px.r
+      sampler.line[base + 1] = px.g
+      sampler.line[base + 2] = px.b
+      sampler.line[base + 3] = px.a
+
+proc writeSampledRow(
+  sampler: RowBoxSampler, target: Image, ty: int,
+  values: seq[uint64], rows: int
+) =
+  let outY = sampler.dstY + ty
+  for tx in 0 ..< sampler.dstW:
+    let
+      area = uint64(rows) *
+        (if sampler.boxX: sampler.colCount[tx].uint64 else: 1'u64)
+      base = tx * 4
+      half = area div 2
+    target.data[target.dataIndex(sampler.dstX + tx, outY)] = ColorRGBX(
+      r: ((values[base + 0] + half) div area).uint8,
+      g: ((values[base + 1] + half) div area).uint8,
+      b: ((values[base + 2] + half) div area).uint8,
+      a: ((values[base + 3] + half) div area).uint8
+    )
+
+proc flushBoxRow(sampler: var RowBoxSampler, target: Image) =
+  if sampler.currentTy < 0 or sampler.rowsInBox == 0:
+    return
+  sampler.writeSampledRow(target, sampler.currentTy, sampler.sums, sampler.rowsInBox)
+  for i in 0 ..< sampler.sums.len:
+    sampler.sums[i] = 0
+  sampler.rowsInBox = 0
+  sampler.currentTy = -1
+
+proc feedRow*(
+  sampler: var RowBoxSampler, target: Image, sy: int, row: openArray[ColorRGBX]
+) =
+  ## Folds one full source scanline (premultiplied pixels) into the target.
+  if not sampler.wantsRow(sy):
+    return
+  let rel = sy - sampler.srcY
+  sampler.foldRowX(row)
+  if sampler.boxY:
+    let ty = (rel.int64 * sampler.dstH.int64).int div sampler.srcH
+    if ty != sampler.currentTy:
+      sampler.flushBoxRow(target)
+      sampler.currentTy = ty
+    for i in 0 ..< sampler.sums.len:
+      sampler.sums[i] += sampler.line[i]
+    inc sampler.rowsInBox
+  else:
+    let
+      tyLo = ((rel.int64 * sampler.dstH.int64 + sampler.srcH - 1) div
+        sampler.srcH).int
+      tyHi = min(sampler.dstH, ((int64(rel + 1) * sampler.dstH.int64 +
+        sampler.srcH - 1) div sampler.srcH).int)
+    for ty in tyLo ..< tyHi:
+      sampler.writeSampledRow(target, ty, sampler.line, 1)
+
+proc finish*(sampler: var RowBoxSampler, target: Image) =
+  ## Flushes the last vertical footprint; a truncated stream still leaves
+  ## every row that fully arrived written.
+  sampler.flushBoxRow(target)
+
+
 proc newImage*(width, height: int): Image {.raises: [PixieError].} =
   ## Creates a new image with the parameter dimensions.
   if width <= 0 or height <= 0:
