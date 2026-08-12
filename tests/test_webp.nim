@@ -1,4 +1,4 @@
-import pixie, pixie/fileformats/webp, webpsuite
+import pixie, pixie/decodebudget, pixie/fileformats/webp, webpsuite
 
 proc checkDimensions(path: string, width, height: int) =
   let
@@ -95,3 +95,103 @@ block:
   )
   doAssert rawAlpha.hasAlpha
   doAssert rawAlpha.alphaInfo.compressionMethod == 0
+
+proc chunkedSource(data: string, chunkSize: int): ImageSourceProc =
+  ## A pull source that drips the body in small chunks, like a spilled file
+  ## read back from storage.
+  var pos = 0
+  result = proc(dst: pointer, maxBytes: int): int {.gcsafe, raises: [].} =
+    let n = min(min(maxBytes, chunkSize), data.len - pos)
+    if n > 0:
+      copyMem(dst, data[pos].unsafeAddr, n)
+      pos += n
+    n
+
+block:
+  # The scaled-into family against the buffered decoder, over the whole
+  # suite. At native size the sampling is the identity, so the fitted decode
+  # must be pixel-identical to decodeWebp — same YUV conversion, same alpha,
+  # same premultiplication. The pull-source variant reads the same bytes
+  # through a drip-fed callback and must land on the same pixels.
+  for path in WebpSuiteFiles:
+    let data = readFile(path)
+    if decodeWebpInfo(data).compression == UnknownWebpCompression:
+      continue
+    let
+      reference = decodeWebp(data)
+      same = newImage(reference.width, reference.height)
+    discard decodeWebpScaledInto(data, same, fitStretch)
+    doAssert same.pixelsEqual(reference), path
+
+    let streamed = newImage(reference.width, reference.height)
+    decodeWebpStreamScaledInto(
+      chunkedSource(data, 977), data.len, streamed, fitStretch
+    )
+    doAssert streamed.pixelsEqual(reference), path
+
+block:
+  # Downscale sampling against a hand-rolled nearest reference over the
+  # buffered decode, for every fit. The reference samples the decoded image;
+  # the scaled path samples YUV planes (lossy) or the ARGB buffer (lossless)
+  # directly — agreement means the per-pixel conversion matches at sampled
+  # coordinates, not just over full rows.
+  for path in [
+    "tests/fileformats/webp/test.webp",           # lossy
+    "tests/fileformats/webp/lossless1.webp",      # lossless, odd size
+    "tests/fileformats/webp/lossy_alpha1.webp",   # lossy + alpha
+    "tests/fileformats/webp/small_31x13.webp"     # tiny, odd size
+  ]:
+    let
+      data = readFile(path)
+      reference = decodeWebp(data)
+    for fit in [fitStretch, fitCover, fitContain]:
+      let
+        targetWidth = max(1, reference.width div 3)
+        targetHeight = max(1, reference.height div 2)
+        scaled = decodeWebpScaled(data, targetWidth, targetHeight, fit)
+        rects = scaledFitRects(
+          reference.width, reference.height, targetWidth, targetHeight, fit
+        )
+      for dstY in rects.dstY ..< rects.dstY + rects.dstH:
+        let srcY = min(
+          rects.srcY + ((dstY - rects.dstY) * rects.srcH) div rects.dstH,
+          reference.height - 1
+        )
+        for dstX in rects.dstX ..< rects.dstX + rects.dstW:
+          let srcX = min(
+            rects.srcX + ((dstX - rects.dstX) * rects.srcW) div rects.dstW,
+            reference.width - 1
+          )
+          doAssert scaled.data[scaled.dataIndex(dstX, dstY)] ==
+            reference.data[reference.dataIndex(srcX, srcY)],
+            path & " " & $fit & " at " & $dstX & "," & $dstY
+
+block:
+  # A contain fit writes only the fitted rect; the margins belong to the
+  # caller (they may be the live canvas of a render in progress).
+  let
+    data = readFile("tests/fileformats/webp/test.webp") # 128x128
+    sentinel = rgbx(1, 2, 3, 255)
+    target = newImage(200, 100)
+  target.fill(sentinel)
+  discard decodeWebpScaledInto(data, target, fitContain)
+  # 128x128 into 200x100 contain -> a 100x100 rect centered horizontally.
+  doAssert target.data[target.dataIndex(0, 50)] == sentinel
+  doAssert target.data[target.dataIndex(199, 50)] == sentinel
+  doAssert target.data[target.dataIndex(100, 50)] != sentinel
+
+block:
+  # An over-budget decode refuses catchably before allocating, in every
+  # entry point, and the stream variant refuses before buffering the body.
+  let data = readFile("tests/fileformats/webp/lossless1.webp")
+  setDecodeBudgetBytes(1024)
+  doAssertRaises(PixieError):
+    discard decodeWebp(data)
+  doAssertRaises(PixieError):
+    discard decodeWebpScaled(data, 10, 10)
+  doAssertRaises(PixieError):
+    decodeWebpStreamScaledInto(
+      chunkedSource(data, 977), data.len, newImage(10, 10)
+    )
+  setDecodeBudgetBytes(0)
+  doAssert decodeWebp(data).width == 1000

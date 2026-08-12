@@ -1,4 +1,4 @@
-import chroma, flatty/binny, webp_vp8_tables, ../common, ../images
+import chroma, flatty/binny, webp_vp8_tables, ../common, ../decodebudget, ../images
 
 # WebP is a RIFF container around VP8 or VP8L image data.
 # See: https://developers.google.com/speed/webp/docs/riff_container
@@ -2458,72 +2458,92 @@ proc getFancyChroma(
   ((9 * main.uint16 + 3 * secondary1.uint16 + 3 * secondary2.uint16 +
     tertiary.uint16 + 8) div 16).uint8
 
-proc frameToRgbaBytes(frame: Vp8Frame): seq[uint8] =
-  result = newSeq[uint8](frame.width * frame.height * 4)
+type ChromaRow = object
+  ## Per-scanline chroma sampling context: which two subsampled chroma rows
+  ## the fancy upsampler blends for a given luma row. Factored out of the
+  ## full-frame conversion so a scaled decode can convert any single (x, y)
+  ## without materializing the full-size RGBA image.
+  mainBase, otherBase: int
+  topOnly: bool
+
+proc chromaRow(frame: Vp8Frame, y: int): ChromaRow =
   let
     lumaWidth = ((frame.width + 15) div 16) * 16
     chromaWidth = lumaWidth div 2
-    chromaPixelWidth = (frame.width + 1) div 2
     chromaPixelHeight = (frame.height + 1) div 2
-  for y in 0 ..< frame.height:
-    let
-      topOnly = y == 0 or (y == frame.height - 1 and (frame.height and 1) == 0)
-      mainRow =
-        if y == 0: 0
-        elif topOnly: chromaPixelHeight - 1
-        else: y div 2
-      otherRow =
-        if topOnly:
-          mainRow
-        elif (y and 1) != 0:
-          min(chromaPixelHeight - 1, mainRow + 1)
-        else:
-          max(0, mainRow - 1)
-      mainBase = mainRow * chromaWidth
-      otherBase = otherRow * chromaWidth
-    for x in 0 ..< frame.width:
-      var
-        uValue: uint8
-        vValue: uint8
-      if x == 0:
-        if topOnly:
-          uValue = frame.ubuf[mainBase]
-          vValue = frame.vbuf[mainBase]
-        else:
-          uValue = getFancyChroma(
-            frame.ubuf[mainBase], frame.ubuf[mainBase],
-            frame.ubuf[otherBase], frame.ubuf[otherBase]
-          )
-          vValue = getFancyChroma(
-            frame.vbuf[mainBase], frame.vbuf[mainBase],
-            frame.vbuf[otherBase], frame.vbuf[otherBase]
-          )
-      elif (x and 1) != 0:
-        let
-          col = (x - 1) div 2
-          nextCol = min(chromaPixelWidth - 1, col + 1)
-        uValue = getFancyChroma(
-          frame.ubuf[mainBase + col], frame.ubuf[mainBase + nextCol],
-          frame.ubuf[otherBase + col], frame.ubuf[otherBase + nextCol]
-        )
-        vValue = getFancyChroma(
-          frame.vbuf[mainBase + col], frame.vbuf[mainBase + nextCol],
-          frame.vbuf[otherBase + col], frame.vbuf[otherBase + nextCol]
-        )
+    topOnly = y == 0 or (y == frame.height - 1 and (frame.height and 1) == 0)
+    mainRow =
+      if y == 0: 0
+      elif topOnly: chromaPixelHeight - 1
+      else: y div 2
+    otherRow =
+      if topOnly:
+        mainRow
+      elif (y and 1) != 0:
+        min(chromaPixelHeight - 1, mainRow + 1)
       else:
-        let
-          col = x div 2
-          prevCol = max(0, col - 1)
-        uValue = getFancyChroma(
-          frame.ubuf[mainBase + col], frame.ubuf[mainBase + prevCol],
-          frame.ubuf[otherBase + col], frame.ubuf[otherBase + prevCol]
-        )
-        vValue = getFancyChroma(
-          frame.vbuf[mainBase + col], frame.vbuf[mainBase + prevCol],
-          frame.vbuf[otherBase + col], frame.vbuf[otherBase + prevCol]
-        )
+        max(0, mainRow - 1)
+  ChromaRow(
+    mainBase: mainRow * chromaWidth,
+    otherBase: otherRow * chromaWidth,
+    topOnly: topOnly
+  )
 
+proc chromaAt(
+  frame: Vp8Frame, row: ChromaRow, x: int
+): tuple[u, v: uint8] {.inline.} =
+  let chromaPixelWidth = (frame.width + 1) div 2
+  if x == 0:
+    if row.topOnly:
+      (frame.ubuf[row.mainBase], frame.vbuf[row.mainBase])
+    else:
+      (
+        getFancyChroma(
+          frame.ubuf[row.mainBase], frame.ubuf[row.mainBase],
+          frame.ubuf[row.otherBase], frame.ubuf[row.otherBase]
+        ),
+        getFancyChroma(
+          frame.vbuf[row.mainBase], frame.vbuf[row.mainBase],
+          frame.vbuf[row.otherBase], frame.vbuf[row.otherBase]
+        )
+      )
+  elif (x and 1) != 0:
+    let
+      col = (x - 1) div 2
+      nextCol = min(chromaPixelWidth - 1, col + 1)
+    (
+      getFancyChroma(
+        frame.ubuf[row.mainBase + col], frame.ubuf[row.mainBase + nextCol],
+        frame.ubuf[row.otherBase + col], frame.ubuf[row.otherBase + nextCol]
+      ),
+      getFancyChroma(
+        frame.vbuf[row.mainBase + col], frame.vbuf[row.mainBase + nextCol],
+        frame.vbuf[row.otherBase + col], frame.vbuf[row.otherBase + nextCol]
+      )
+    )
+  else:
+    let
+      col = x div 2
+      prevCol = max(0, col - 1)
+    (
+      getFancyChroma(
+        frame.ubuf[row.mainBase + col], frame.ubuf[row.mainBase + prevCol],
+        frame.ubuf[row.otherBase + col], frame.ubuf[row.otherBase + prevCol]
+      ),
+      getFancyChroma(
+        frame.vbuf[row.mainBase + col], frame.vbuf[row.mainBase + prevCol],
+        frame.vbuf[row.otherBase + col], frame.vbuf[row.otherBase + prevCol]
+      )
+    )
+
+proc frameToRgbaBytes(frame: Vp8Frame): seq[uint8] =
+  result = newSeq[uint8](frame.width * frame.height * 4)
+  let lumaWidth = ((frame.width + 15) div 16) * 16
+  for y in 0 ..< frame.height:
+    let row = frame.chromaRow(y)
+    for x in 0 ..< frame.width:
       let
+        (uValue, vValue) = frame.chromaAt(row, x)
         yValue = frame.ybuf[y * lumaWidth + x]
         dst = (y * frame.width + x) * 4
       result[dst + 0] = yuvToR(yValue, vValue)
@@ -2818,9 +2838,55 @@ proc decodeWebpDimensions*(
   result.width = info.width
   result.height = info.height
 
+proc webpDecodePlanBytes(info: WebpInfo): int64 =
+  ## Bytes of decode intermediates this image will allocate, for the memory
+  ## budget check. Lossy WebP holds YUV planes padded to whole macroblocks
+  ## plus per-macroblock state, and possibly an alpha plane (itself
+  ## VP8L-decoded through a full ARGB buffer when losslessly compressed).
+  ## Lossless WebP inherently holds the whole decoded ARGB buffer: its LZ77
+  ## back-references reach across the entire image, so it cannot be windowed.
+  ## Huffman tables, transform side data and borders are noise next to these.
+  let
+    wh = info.width.int64 * info.height.int64
+    mbWidth = ((info.width + 15) div 16).int64
+    mbHeight = ((info.height + 15) div 16).int64
+  case info.compression
+  of LossyWebp:
+    let
+      lumaWidth = mbWidth * 16
+      chromaWidth = mbWidth * 8
+    result = lumaWidth * mbHeight * 16 +
+      2 * chromaWidth * mbHeight * 8 +
+      mbWidth * mbHeight * sizeof(Vp8MacroBlock).int64
+    if info.hasAlpha:
+      result += wh # the assembled alpha plane
+      if info.alphaInfo.compressionMethod == 1:
+        result += wh * 5 # lossless alpha: ARGB decode buffer + residual
+      else:
+        result += wh # raw residual
+  of LosslessWebp:
+    result = wh * 4
+  of UnknownWebpCompression:
+    result = 0
+
+proc checkWebpDecodeBudget(info: WebpInfo, extraBytes: int64) =
+  ## `extraBytes` carries what the caller keeps alive alongside the decode:
+  ## the compressed body, and any full-size RGBA output it is about to build.
+  let planBytes = webpDecodePlanBytes(info) + extraBytes
+  if overDecodeBudget(planBytes):
+    raise newException(PixieError,
+      "WebP decode of " & $info.width & "x" & $info.height & " needs " &
+      $(planBytes div 1024) & "K of decode buffers, over the " &
+      $(decodeBudgetBytes() div 1024) & "K memory budget"
+    )
+
 proc decodeWebp*(data: string): Image {.raises: [PixieError].} =
   ## Decodes a WebP image.
   let info = decodeWebpInfo(data)
+  # The buffered path builds the RGBA byte seq and then the Image, and both
+  # are alive at once, on top of the compressed body.
+  checkWebpDecodeBudget(info,
+    data.len.int64 + info.width.int64 * info.height.int64 * 8)
   case info.compression
   of LosslessWebp:
     var rgbaData = decodeLosslessData(
@@ -2843,6 +2909,141 @@ proc decodeWebp*(data: string): Image {.raises: [PixieError].} =
     newImageFromRgbaBytes(rgbaData, info.width, info.height)
   of UnknownWebpCompression:
     raise newException(PixieError, "Invalid WebP, animation decoding is not implemented")
+
+proc frameToTargetRect(
+  frame: Vp8Frame, alpha: seq[uint8], target: Image, fit: ScaledDecodeFit
+) =
+  ## Converts the fitted rect of `target` straight from the YUV planes with
+  ## nearest sampling; the full-size RGBA image never exists. Pixels outside
+  ## the fitted rect are left untouched, matching every other scaled-into
+  ## decoder (a contain fit's margins belong to the caller).
+  let
+    rects = scaledFitRects(
+      frame.width, frame.height, target.width, target.height, fit
+    )
+    lumaWidth = ((frame.width + 15) div 16) * 16
+  for dstY in rects.dstY ..< rects.dstY + rects.dstH:
+    let
+      srcY = min(
+        rects.srcY + ((dstY - rects.dstY) * rects.srcH) div rects.dstH,
+        frame.height - 1
+      )
+      row = frame.chromaRow(srcY)
+    for dstX in rects.dstX ..< rects.dstX + rects.dstW:
+      let
+        srcX = min(
+          rects.srcX + ((dstX - rects.dstX) * rects.srcW) div rects.dstW,
+          frame.width - 1
+        )
+        (uValue, vValue) = frame.chromaAt(row, srcX)
+        yValue = frame.ybuf[srcY * lumaWidth + srcX]
+        alphaValue =
+          if alpha.len > 0: alpha[srcY * frame.width + srcX] else: 255'u8
+      target.data[target.dataIndex(dstX, dstY)] = rgba(
+        yuvToR(yValue, vValue),
+        yuvToG(yValue, uValue, vValue),
+        yuvToB(yValue, uValue),
+        alphaValue
+      ).rgbx()
+
+proc rgbaBytesToTargetRect(
+  rgbaData: seq[uint8], width, height: int, forceOpaque: bool,
+  target: Image, fit: ScaledDecodeFit
+) =
+  ## The lossless twin: samples the decoded ARGB buffer into the fitted rect.
+  ## `forceOpaque` stands in for the buffered path's whole-buffer alpha
+  ## rewrite when the stream declares no alpha.
+  let rects = scaledFitRects(width, height, target.width, target.height, fit)
+  for dstY in rects.dstY ..< rects.dstY + rects.dstH:
+    let srcY = min(
+      rects.srcY + ((dstY - rects.dstY) * rects.srcH) div rects.dstH,
+      height - 1
+    )
+    for dstX in rects.dstX ..< rects.dstX + rects.dstW:
+      let
+        srcX = min(
+          rects.srcX + ((dstX - rects.dstX) * rects.srcW) div rects.dstW,
+          width - 1
+        )
+        src = (srcY * width + srcX) * 4
+      target.data[target.dataIndex(dstX, dstY)] = rgba(
+        rgbaData[src + 0],
+        rgbaData[src + 1],
+        rgbaData[src + 2],
+        if forceOpaque: 255'u8 else: rgbaData[src + 3]
+      ).rgbx()
+
+proc decodeWebpScaledInto*(
+  data: string, target: Image, fit = fitStretch
+): Image {.raises: [PixieError].} =
+  ## Decodes a WebP scaled into an existing target image, writing only the
+  ## fitted rect. The full-size RGBA intermediate of the buffered path never
+  ## exists: lossy WebP converts straight from its YUV planes, lossless
+  ## samples from the decoded buffer its format cannot avoid. What the decode
+  ## *will* allocate is checked against the memory budget first, so an image
+  ## too big to decode refuses catchably instead of dying in an allocation.
+  if target.isNil or target.width <= 0 or target.height <= 0:
+    raise newException(PixieError, "Invalid target image")
+  let info = decodeWebpInfo(data)
+  case info.compression
+  of LosslessWebp:
+    checkWebpDecodeBudget(info, data.len.int64)
+    let rgbaData = decodeLosslessData(
+      data, info.vp8LOffset, info.vp8LSize, info.width, info.height, false
+    )
+    rgbaBytesToTargetRect(
+      rgbaData, info.width, info.height, not info.losslessAlpha, target, fit
+    )
+  of LossyWebp:
+    checkWebpDecodeBudget(info, data.len.int64)
+    let frame = decodeVp8Frame(
+      data, info.vp8Offset, info.vp8Size, info.width, info.height
+    )
+    var alpha: seq[uint8]
+    if info.hasAlpha:
+      if info.alphaOffset == 0:
+        failInvalid("missing ALPH chunk")
+      alpha = decodeAlphaData(data, info)
+    frameToTargetRect(frame, alpha, target, fit)
+  of UnknownWebpCompression:
+    raise newException(PixieError, "Invalid WebP, animation decoding is not implemented")
+  target
+
+proc decodeWebpScaled*(
+  data: string, width, height: int, fit = fitStretch
+): Image {.raises: [PixieError].} =
+  ## Decodes a WebP scaled to the requested dimensions.
+  if width <= 0 or height <= 0:
+    raise newException(PixieError, "Image width and height must be > 0")
+  result = newImage(width, height)
+  discard decodeWebpScaledInto(data, result, fit)
+
+proc decodeWebpStreamScaledInto*(
+  source: ImageSourceProc, totalLen: int, target: Image, fit = fitStretch
+) {.raises: [PixieError].} =
+  ## Decodes a WebP from a sequential pull source (a spilled download on
+  ## disk) scaled into the target. Unlike PNG or baseline JPEG, a WebP
+  ## bitstream cannot be decoded through a fixed window: VP8 interleaves
+  ## macroblock rows across its coefficient partitions, and VP8L's LZ77
+  ## window is the whole image. The honest tier is therefore "compressed
+  ## body resident, full-size RGBA never" — the body is budget-checked
+  ## before it is pulled back, and the decode plan is checked again once
+  ## the header says what the pixels will cost.
+  if totalLen <= 0:
+    failInvalid("empty WebP stream")
+  if overDecodeBudget(totalLen.int64):
+    raise newException(PixieError,
+      "WebP stream of " & $(totalLen div 1024) & "K is over the " &
+      $(decodeBudgetBytes() div 1024) & "K memory budget"
+    )
+  var data = newString(totalLen)
+  var pos = 0
+  while pos < totalLen:
+    let got = source(addr data[pos], totalLen - pos)
+    if got <= 0:
+      failInvalid("truncated WebP stream")
+    pos += got
+  discard decodeWebpScaledInto(data, target, fit)
 
 {.pop.}
 

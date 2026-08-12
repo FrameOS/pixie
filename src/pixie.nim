@@ -101,6 +101,10 @@ proc copyIntoTarget(target, source: Image) {.raises: [PixieError].} =
       target.width * sizeof(ColorRGBX)
     )
 
+template isWebpData(data: string): bool =
+  data.len > 12 and data.readStr(0, 4) == WebpRiffSignature and
+    data.readStr(8, 4) == WebpSignature
+
 proc decodeImageScaled*(
   data: string, width, height: int, fit = fitStretch
 ): Image {.raises: [PixieError].}
@@ -141,6 +145,8 @@ proc decodeImageScaled*(
     decodeJpegScaled(data, width, height, fit)
   elif data.len > 2 and data.readStr(0, 2) == bmpSignature:
     decodeBmpScaled(data, width, height, fit)
+  elif data.isWebpData:
+    decodeWebpScaled(data, width, height, fit)
   else:
     let image = decodeImage(data)
     if image.width == width and image.height == height:
@@ -161,6 +167,8 @@ proc decodeImageScaled*(
     decodeJpegScaled(data, width, height, fit)
   elif data.len > 2 and data.readStr(0, 2) == bmpSignature:
     decodeBmpScaled(data, width, height, fit)
+  elif data.isWebpData:
+    decodeWebpScaled(data, width, height, fit)
   else:
     let image = decodeImage(data)
     data = ""
@@ -202,6 +210,8 @@ proc decodeImageScaledInto*(
     decodeJpegScaledInto(data, target, fit)
   elif data.len > 2 and data.readStr(0, 2) == bmpSignature:
     decodeBmpScaledInto(data, target, fit)
+  elif data.isWebpData:
+    discard decodeWebpScaledInto(data, target, fit)
   else:
     target.copyIntoTarget(decodeImageScaled(data, target.width, target.height))
   target
@@ -217,6 +227,8 @@ proc decodeImageScaledInto*(
     decodeJpegScaledInto(data, target, fit)
   elif data.len > 2 and data.readStr(0, 2) == bmpSignature:
     decodeBmpScaledInto(data, target, fit)
+  elif data.isWebpData:
+    discard decodeWebpScaledInto(data, target, fit)
   else:
     target.copyIntoTarget(decodeImageScaled(data, target.width, target.height))
   target
