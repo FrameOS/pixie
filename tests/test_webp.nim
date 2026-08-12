@@ -130,11 +130,11 @@ block:
     doAssert streamed.pixelsEqual(reference), path
 
 block:
-  # Downscale sampling against a hand-rolled nearest reference over the
-  # buffered decode, for every fit. The reference samples the decoded image;
-  # the scaled path samples YUV planes (lossy) or the ARGB buffer (lossless)
-  # directly — agreement means the per-pixel conversion matches at sampled
-  # coordinates, not just over full rows.
+  # Downscale sampling against a hand-rolled box-filter reference over the
+  # buffered decode, for every fit. Each target pixel must be the rounded
+  # premultiplied average of its exact source footprint — the same area
+  # filter a smooth resize applies — computed here independently from the
+  # decoded image's pixels.
   for path in [
     "tests/fileformats/webp/test.webp",           # lossy
     "tests/fileformats/webp/lossless1.webp",      # lossless, odd size
@@ -153,17 +153,37 @@ block:
           reference.width, reference.height, targetWidth, targetHeight, fit
         )
       for dstY in rects.dstY ..< rects.dstY + rects.dstH:
-        let srcY = min(
-          rects.srcY + ((dstY - rects.dstY) * rects.srcH) div rects.dstH,
-          reference.height - 1
-        )
+        let
+          relY = dstY - rects.dstY
+          sy0 = min(rects.srcY + (relY * rects.srcH) div rects.dstH,
+            reference.height - 1)
+          sy1 = max(sy0 + 1, min(
+            rects.srcY + ((relY + 1) * rects.srcH) div rects.dstH,
+            reference.height))
         for dstX in rects.dstX ..< rects.dstX + rects.dstW:
-          let srcX = min(
-            rects.srcX + ((dstX - rects.dstX) * rects.srcW) div rects.dstW,
-            reference.width - 1
-          )
-          doAssert scaled.data[scaled.dataIndex(dstX, dstY)] ==
-            reference.data[reference.dataIndex(srcX, srcY)],
+          let
+            relX = dstX - rects.dstX
+            sx0 = min(rects.srcX + (relX * rects.srcW) div rects.dstW,
+              reference.width - 1)
+            sx1 = max(sx0 + 1, min(
+              rects.srcX + ((relX + 1) * rects.srcW) div rects.dstW,
+              reference.width))
+          var sumR, sumG, sumB, sumA: uint32
+          for sy in sy0 ..< sy1:
+            for sx in sx0 ..< sx1:
+              let px = reference.data[reference.dataIndex(sx, sy)]
+              sumR += px.r
+              sumG += px.g
+              sumB += px.b
+              sumA += px.a
+          let
+            area = uint32((sy1 - sy0) * (sx1 - sx0))
+            expected = ColorRGBX(
+              r: ((sumR + area div 2) div area).uint8,
+              g: ((sumG + area div 2) div area).uint8,
+              b: ((sumB + area div 2) div area).uint8,
+              a: ((sumA + area div 2) div area).uint8)
+          doAssert scaled.data[scaled.dataIndex(dstX, dstY)] == expected,
             path & " " & $fit & " at " & $dstX & "," & $dstY
 
 block:

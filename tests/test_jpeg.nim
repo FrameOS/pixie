@@ -77,3 +77,71 @@ block:
     budgetDims.width * budgetDims.height * 4 + 1024 * 1024)
   doAssert decodeJpeg(budgetData).width == budgetDims.width
   setDecodeBudgetBytes(0)
+
+block:
+  # The scaled decode's box sampler: on a non-integer downscale every target
+  # pixel must be the area average of its source footprint, not a nearest
+  # pick — nearest decimation of fine texture is what made downscaled photos
+  # visibly rough. The reference boxes the full decode's pixels with the same
+  # source-centric tiling the sampler folds by. 4:4:4 must agree to within
+  # fixed-point rounding; 4:2:0 adds half-resolution chroma boxes, so its
+  # tolerance is chroma-edge sized. (1:1 and upscales are unchanged nearest:
+  # pinned by the scaled paths staying byte-identical there.)
+  proc boxCeil(value, scale, divisor: int): int =
+    ((value.int64 * scale.int64 + divisor.int64 - 1) div divisor.int64).int
+
+  for (path, tolerance) in [
+    ("tests/fileformats/jpeg/masters/cat_4_4_4.jpg", 2),
+    ("tests/fileformats/jpeg/masters/cat_4_2_0.jpg", 24)
+  ]:
+    let
+      data = readFile(path)
+      full = decodeJpeg(data)
+      w = full.width * 5 div 6
+      h = full.height * 5 div 6
+      scaled = decodeJpegScaled(data, w, h, fitStretch)
+    var maxDiff = 0
+    for dy in 0 ..< h:
+      let
+        sy0 = boxCeil(dy, full.height, h)
+        sy1 = max(sy0 + 1, min(full.height, boxCeil(dy + 1, full.height, h)))
+      for dx in 0 ..< w:
+        let
+          sx0 = boxCeil(dx, full.width, w)
+          sx1 = max(sx0 + 1, min(full.width, boxCeil(dx + 1, full.width, w)))
+        var sr, sg, sb: int
+        for sy in sy0 ..< sy1:
+          for sx in sx0 ..< sx1:
+            let p = full.unsafe[sx, sy]
+            sr += p.r.int
+            sg += p.g.int
+            sb += p.b.int
+        let
+          area = (sy1 - sy0) * (sx1 - sx0)
+          q = scaled.unsafe[dx, dy]
+        maxDiff = max(maxDiff, max(abs(q.r.int - (sr + area div 2) div area),
+          max(abs(q.g.int - (sg + area div 2) div area),
+              abs(q.b.int - (sb + area div 2) div area))))
+    doAssert maxDiff <= tolerance, path & " maxDiff " & $maxDiff
+
+proc streamedMatchesBufferedDownscale() =
+  # The band drain and the streaming window advance together; a streamed
+  # downscale must land on exactly the buffered downscale's pixels.
+  let data = readFile("tests/fileformats/jpeg/masters/cat_4_2_0.jpg")
+  let dims = decodeJpegDimensions(data)
+  let
+    w = dims.width * 5 div 6
+    h = dims.height * 5 div 6
+  var pos = 0
+  let source = proc(dst: pointer, maxBytes: int): int {.gcsafe, raises: [].} =
+    let n = min(min(maxBytes, 977), data.len - pos)
+    if n > 0:
+      copyMem(dst, data[pos].unsafeAddr, n)
+      pos += n
+    n
+  let
+    streamed = decodeJpegStreamScaled(source, data.len, w, h, fitCover)
+    buffered = decodeJpegScaled(data, w, h, fitCover)
+  doAssert streamed.pixelsEqual(buffered)
+
+streamedMatchesBufferedDownscale()

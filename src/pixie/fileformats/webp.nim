@@ -2910,68 +2910,104 @@ proc decodeWebp*(data: string): Image {.raises: [PixieError].} =
   of UnknownWebpCompression:
     raise newException(PixieError, "Invalid WebP, animation decoding is not implemented")
 
+template sampleBoxes(
+  rects: typed, srcWidth, srcHeight: int, body: untyped
+) =
+  ## Iterates the fitted rect's target pixels, injecting each pixel's exact
+  ## source footprint (`sx0..<sx1` x `sy0..<sy1`, at least 1x1). On downscale
+  ## axes the footprints tile the crop — a proper area filter; an upscale
+  ## axis degenerates to the same 1x1 nearest pick the sampler always made.
+  for dstY {.inject.} in rects.dstY ..< rects.dstY + rects.dstH:
+    let
+      relY = dstY - rects.dstY
+      sy0 {.inject.} = min(
+        rects.srcY + (relY * rects.srcH) div rects.dstH, srcHeight - 1)
+      sy1 {.inject.} = max(sy0 + 1, min(
+        rects.srcY + ((relY + 1) * rects.srcH) div rects.dstH, srcHeight))
+    for dstX {.inject.} in rects.dstX ..< rects.dstX + rects.dstW:
+      let
+        relX = dstX - rects.dstX
+        sx0 {.inject.} = min(
+          rects.srcX + (relX * rects.srcW) div rects.dstW, srcWidth - 1)
+        sx1 {.inject.} = max(sx0 + 1, min(
+          rects.srcX + ((relX + 1) * rects.srcW) div rects.dstW, srcWidth))
+      body
+
 proc frameToTargetRect(
   frame: Vp8Frame, alpha: seq[uint8], target: Image, fit: ScaledDecodeFit
 ) =
-  ## Converts the fitted rect of `target` straight from the YUV planes with
-  ## nearest sampling; the full-size RGBA image never exists. Pixels outside
-  ## the fitted rect are left untouched, matching every other scaled-into
-  ## decoder (a contain fit's margins belong to the caller).
+  ## Converts the fitted rect of `target` straight from the YUV planes; the
+  ## full-size RGBA image never exists. Each target pixel box-averages its
+  ## source footprint in the premultiplied domain — what a smooth resize of
+  ## the materialized image would have done — so downscales stay clean
+  ## instead of aliasing. Pixels outside the fitted rect are left untouched,
+  ## matching every other scaled-into decoder (a contain fit's margins
+  ## belong to the caller).
   let
     rects = scaledFitRects(
       frame.width, frame.height, target.width, target.height, fit
     )
     lumaWidth = ((frame.width + 15) div 16) * 16
-  for dstY in rects.dstY ..< rects.dstY + rects.dstH:
-    let
-      srcY = min(
-        rects.srcY + ((dstY - rects.dstY) * rects.srcH) div rects.dstH,
-        frame.height - 1
-      )
-      row = frame.chromaRow(srcY)
-    for dstX in rects.dstX ..< rects.dstX + rects.dstW:
-      let
-        srcX = min(
-          rects.srcX + ((dstX - rects.dstX) * rects.srcW) div rects.dstW,
-          frame.width - 1
-        )
-        (uValue, vValue) = frame.chromaAt(row, srcX)
-        yValue = frame.ybuf[srcY * lumaWidth + srcX]
-        alphaValue =
-          if alpha.len > 0: alpha[srcY * frame.width + srcX] else: 255'u8
-      target.data[target.dataIndex(dstX, dstY)] = rgba(
-        yuvToR(yValue, vValue),
-        yuvToG(yValue, uValue, vValue),
-        yuvToB(yValue, uValue),
-        alphaValue
-      ).rgbx()
+  sampleBoxes(rects, frame.width, frame.height):
+    var sumR, sumG, sumB, sumA: uint32
+    for sy in sy0 ..< sy1:
+      let row = frame.chromaRow(sy)
+      for sx in sx0 ..< sx1:
+        let
+          (uValue, vValue) = frame.chromaAt(row, sx)
+          yValue = frame.ybuf[sy * lumaWidth + sx]
+          alphaValue =
+            if alpha.len > 0: alpha[sy * frame.width + sx] else: 255'u8
+          px = rgba(
+            yuvToR(yValue, vValue),
+            yuvToG(yValue, uValue, vValue),
+            yuvToB(yValue, uValue),
+            alphaValue
+          ).rgbx()
+        sumR += px.r
+        sumG += px.g
+        sumB += px.b
+        sumA += px.a
+    let area = uint32((sy1 - sy0) * (sx1 - sx0))
+    target.data[target.dataIndex(dstX, dstY)] = ColorRGBX(
+      r: ((sumR + area div 2) div area).uint8,
+      g: ((sumG + area div 2) div area).uint8,
+      b: ((sumB + area div 2) div area).uint8,
+      a: ((sumA + area div 2) div area).uint8
+    )
 
 proc rgbaBytesToTargetRect(
   rgbaData: seq[uint8], width, height: int, forceOpaque: bool,
   target: Image, fit: ScaledDecodeFit
 ) =
-  ## The lossless twin: samples the decoded ARGB buffer into the fitted rect.
-  ## `forceOpaque` stands in for the buffered path's whole-buffer alpha
-  ## rewrite when the stream declares no alpha.
+  ## The lossless twin: box-averages the decoded ARGB buffer into the fitted
+  ## rect, premultiplied-domain like above. `forceOpaque` stands in for the
+  ## buffered path's whole-buffer alpha rewrite when the stream declares no
+  ## alpha.
   let rects = scaledFitRects(width, height, target.width, target.height, fit)
-  for dstY in rects.dstY ..< rects.dstY + rects.dstH:
-    let srcY = min(
-      rects.srcY + ((dstY - rects.dstY) * rects.srcH) div rects.dstH,
-      height - 1
+  sampleBoxes(rects, width, height):
+    var sumR, sumG, sumB, sumA: uint32
+    for sy in sy0 ..< sy1:
+      for sx in sx0 ..< sx1:
+        let
+          src = (sy * width + sx) * 4
+          px = rgba(
+            rgbaData[src + 0],
+            rgbaData[src + 1],
+            rgbaData[src + 2],
+            if forceOpaque: 255'u8 else: rgbaData[src + 3]
+          ).rgbx()
+        sumR += px.r
+        sumG += px.g
+        sumB += px.b
+        sumA += px.a
+    let area = uint32((sy1 - sy0) * (sx1 - sx0))
+    target.data[target.dataIndex(dstX, dstY)] = ColorRGBX(
+      r: ((sumR + area div 2) div area).uint8,
+      g: ((sumG + area div 2) div area).uint8,
+      b: ((sumB + area div 2) div area).uint8,
+      a: ((sumA + area div 2) div area).uint8
     )
-    for dstX in rects.dstX ..< rects.dstX + rects.dstW:
-      let
-        srcX = min(
-          rects.srcX + ((dstX - rects.dstX) * rects.srcW) div rects.dstW,
-          width - 1
-        )
-        src = (srcY * width + srcX) * 4
-      target.data[target.dataIndex(dstX, dstY)] = rgba(
-        rgbaData[src + 0],
-        rgbaData[src + 1],
-        rgbaData[src + 2],
-        if forceOpaque: 255'u8 else: rgbaData[src + 3]
-      ).rgbx()
 
 proc decodeWebpScaledInto*(
   data: string, target: Image, fit = fitStretch
