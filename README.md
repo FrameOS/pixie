@@ -1,5 +1,84 @@
 <img src="docs/banner.png">
 
+# This is the FrameOS fork of Pixie
+
+Upstream lives at [treeform/pixie](https://github.com/treeform/pixie); its
+README follows below and still describes the library accurately. This fork adds
+what [FrameOS](https://github.com/FrameOS/frameos) needs to draw pictures on
+hardware that does not have room for them.
+
+A FrameOS scene renders on a Raspberry Pi Zero with 512MB of RAM, or on an
+ESP32-S3 with 8MB of PSRAM and about 100KB of internal heap. Upstream pixie
+decodes an image by allocating the finished image plus every intermediate the
+codec wants, which is the right trade on a desktop and the difference between
+rendering and rebooting on a frame. Everything below follows from that, plus a
+few features FrameOS wanted along the way.
+
+Nothing here removes or renames upstream API: this is a superset, and it tracks
+upstream. `-d:frameosEmbedded` only changes defaults (a conservative decode
+budget), never behaviour you did not ask for.
+
+## What this fork adds
+
+**A memory budget decoders actually respect** (`pixie/decodebudget.nim`).
+`setDecodeBudgetBytes` sets a per-decode ceiling covering intermediates *and*
+output; decoders plan their allocations before making them and raise a catchable
+`PixieError` when the plan does not fit, instead of taking the process down with
+them. `0` means unlimited, which is the default on hosts. An application that
+knows its live free memory can refresh the budget before every decode.
+
+**Decoding straight into the size you want.** `decodeImageScaled`,
+`decodeImageScaledInto` and `readImageScaled` take a target size and a fit mode
+(`fitStretch`, `fitCover`, `fitContain`, see `scaledFitRects`), and the
+downscale happens *during* decoding: a 4000×3000 JPEG headed for a 800×480 panel
+never exists at full size. Sampling is box-filtered rather than nearest, in the
+row-streamed decoders too (`RowBoxSampler`), and JPEG chroma is interpolated
+rather than point-picked, so a heavy downscale does not come out crawling with
+aliasing.
+
+**Streaming decoders that never hold the file.** Every scaled decoder has a
+pull-source form — `decodePngStreamScaledInto`, `decodeJpegStreamScaledInto`,
+`decodeBmpStreamScaledInto`, `decodePpmStreamScaledInto`,
+`decodeWebpStreamScaledInto` — driven by an `ImageSourceProc` callback that
+hands over the next chunk of input. Feed one from a file and neither the
+compressed bytes nor the full-size pixels are ever resident.
+
+**A self-contained streaming inflate** (`pixie/inflatestream.nim`, vendored from
+zippy 0.10.16). PNG scanlines leave a fixed ~64KB window as they are produced,
+are unfiltered in place, and multi-`IDAT` streams are inflated as segments
+rather than concatenated first. The fork depends on stock zippy again as a
+result.
+
+**Images that can borrow pixels.** `view(image, x, y, w, h)` is a window onto
+another image's memory rather than a copy, with `newImageFrom`,
+`toContiguousSeq`, the `forEachSpan` template and `items`/`pairs` iterators as
+the seams that keep flat operations fast for owners and correct for views.
+`pixelsEqual` compares contents. `Image` is `{.acyclic.}` — load-bearing, not an
+optimisation: without it ORC treats every image as a cycle candidate, which
+crashes a host that shares images with a dynamically loaded driver.
+
+**SVG that draws text, and draws into your buffer.** `<text>` and `<tspan>`
+become glyph outlines and then ordinary paths, so fill, stroke, gradients,
+opacity and transforms apply to them exactly as to a `<path>`; font-family
+resolution is the application's to answer through `setSvgTypefaceResolver`,
+since pixie ships no fonts. `parseSvgXml` parses markup the way `<text>` needs
+it. `Svg.renderInto(target)` rasterizes into an image the caller already owns,
+which for a caller that has a correctly sized canvas is the difference between
+one image and two.
+
+**Color emoji.** COLR/CPAL layered glyphs and CBDT/CBLC and sbix bitmap glyphs
+render through `fillText`, with `hasColorGlyph` to ask and `Typeface.fallbacks`
+to supply an emoji face behind a text face.
+
+**Text as paths.** `Arrangement.computePath` returns a whole arrangement's
+outlines as one path and `Font.baselineOffset` gives the distance from the top
+of a typeset block to its first baseline — the two pieces anything that
+positions text by its baseline needs.
+
+**Fixes carried here.** EXIF orientation was silently dropped for little-endian
+(`II`) JPEGs, which is what most Sony and Canon bodies write, so those photos
+decoded sideways. JPEG streaming resync tolerates a window slide.
+
 👏 👏 👏 Check out video about the library: [A full-featured 2D graphics library for Nim (NimConf 2021)](https://www.youtube.com/watch?v=8acDfUIwLnk) 👏 👏 👏
 
 # Pixie - A full-featured 2D graphics library for Nim.
