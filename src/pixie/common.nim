@@ -37,8 +37,18 @@ type
     fitCover   ## fill the whole target, cropping the source centered
     fitContain ## fit the whole source centered, leaving target borders untouched
 
-  Image* = ref object
+  Image* {.acyclic.} = ref object
     ## Image object that holds bitmap data in premultiplied alpha RGBA format.
+    ##
+    ## `{.acyclic.}` is load-bearing, not an optimisation. `root` makes this
+    ## type look cyclic to ORC, but a view's `root` always points at an owner
+    ## (see `subImageView`), never at another view, so no cycle can form.
+    ## Without the pragma every non-final decref registers the image with the
+    ## cycle collector's root list, and FrameOS hands Images across a shared
+    ## library boundary (driver .so files carry their own ORC runtime): the
+    ## .so registers the object in ITS root list, the host later unregisters
+    ## it from ITS OWN, and the host dies in `unregisterCycle`. Marking the
+    ## type acyclic keeps it on plain refcounts, which are safe to share.
     ##
     ## An image either **owns** its pixels or is a **view** into another
     ## image's. A view shares the owner's buffer and addresses a rectangle
