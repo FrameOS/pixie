@@ -209,6 +209,13 @@ proc lineGap(font: Font): float32 =
   else:
     (lineHeight / font.scale) - font.typeface.ascent + font.typeface.descent
 
+proc baselineOffset*(font: Font): float32 {.raises: [].} =
+  ## The distance in pixels from the top of a typeset block down to the
+  ## baseline of its first line. `typeset` starts the first baseline here, so
+  ## a caller that is given a baseline (SVG's `<text y=…>`, for one) positions
+  ## the arrangement at `y - font.baselineOffset`.
+  round((font.typeface.ascent + font.lineGap / 2) * font.scale)
+
 proc paint*(font: Font): Paint {.inline, raises: [].} =
   font.paints[0]
 
@@ -584,6 +591,19 @@ proc computePaths(arrangement: Arrangement): seq[Path] =
 
       spanPath.addPath(path)
     result.add(spanPath)
+
+proc computePath*(arrangement: Arrangement): Path {.raises: [PixieError].} =
+  ## The glyph outlines of an entire arrangement as one path, in the
+  ## arrangement's own space (y = 0 is the top of the first line). Callers that
+  ## want the outlines rather than a rasterization — vector output, or an SVG
+  ## `<text>` element that has to take the same fill, stroke, gradient and
+  ## transform treatment as any other path — start here.
+  ##
+  ## Color (bitmap) glyphs have no outline and contribute nothing; see
+  ## `fillText` for the path that draws those.
+  result = newPath()
+  for path in arrangement.computePaths():
+    result.addPath(path)
 
 proc drawColorGlyphs(
   target: Image,

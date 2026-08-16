@@ -1,7 +1,7 @@
 ## Load SVG files.
 
-import chroma, ../common, ../images, ../internal, ../paints,
-    ../paths, strutils, tables, vmath, xmlparser, xmltree
+import chroma, ../common, ../fonts, ../images, ../internal, ../paints,
+    ../paths, parsexml, strutils, tables, unicode, vmath, xmlparser, xmltree
 
 when defined(pixieDebugSvg):
   import strtabs
@@ -16,6 +16,12 @@ type
     elements: seq[(Path, SvgProperties)]
     linearGradients: Table[string, LinearGradient]
 
+  SvgTextAnchor = enum
+    StartAnchor, MiddleAnchor, EndAnchor
+
+  SvgBaseline = enum
+    AlphabeticBaseline, MiddleBaseline, HangingBaseline, IdeographicBaseline
+
   SvgProperties = object
     display: bool
     fillRule: WindingRule
@@ -28,13 +34,41 @@ type
     strokeDashArray: seq[float32]
     transform: Mat3
     opacity, fillOpacity, strokeOpacity: float32
+    fontFamily: string
+    fontSize: float32
+    fontWeight: int
+    fontItalic: bool
+    textAnchor: SvgTextAnchor
+    baseline: SvgBaseline
 
   LinearGradient = object
     x1, y1, x2, y2: float32
     stops: seq[ColorStop]
 
+  SvgTypefaceResolver* = proc(
+    family: string, weight: int, italic: bool
+  ): Typeface {.gcsafe, raises: [].}
+    ## Turns a CSS font-family name into a typeface for `<text>`. Called once
+    ## per candidate in a `font-family` list, most-preferred first; return nil
+    ## to decline and let the next candidate try. Called a final time with an
+    ## empty family for the default face, so returning nil there means the text
+    ## is skipped rather than the SVG failing.
+
 template failInvalid() =
   raise newException(PixieError, "Invalid SVG data")
+
+var svgTypefaceResolverImpl: SvgTypefaceResolver
+
+proc setSvgTypefaceResolver*(resolver: SvgTypefaceResolver) {.raises: [].} =
+  ## Installs the hook `<text>` uses to find typefaces. Pixie ships no fonts, so
+  ## without one `<text>` elements are skipped: an application that wants text
+  ## rendered supplies its own font lookup here (see `readTypeface`).
+  svgTypefaceResolverImpl = resolver
+
+proc svgTypefaceResolver*(): SvgTypefaceResolver {.raises: [].} =
+  ## The currently installed typeface resolver, or nil.
+  {.cast(gcsafe).}:
+    result = svgTypefaceResolverImpl
 
 proc attrOrDefault(node: XmlNode, name, default: string): string =
   result = node.attr(name)
@@ -50,6 +84,62 @@ proc initSvgProperties(): SvgProperties =
   result.opacity = 1
   result.fillOpacity = 1
   result.strokeOpacity = 1
+  result.fontSize = 16 # CSS initial value
+  result.fontWeight = 400
+
+proc parseSvgFontSize(value: string, inherited: float32): float32 =
+  ## font-size in CSS units, resolved to pixels. An unparseable size inherits
+  ## rather than failing: a broken font-size must not lose the whole drawing.
+  var v = value.strip()
+  if v.len == 0:
+    return inherited
+  case v
+  of "xx-small": return 9
+  of "x-small": return 10
+  of "small": return 13
+  of "medium": return 16
+  of "large": return 18
+  of "x-large": return 24
+  of "xx-large": return 32
+  of "larger": return inherited * 1.2
+  of "smaller": return inherited / 1.2
+  of "inherit": return inherited
+  else: discard
+
+  var scale: float32 = 1
+  template cut(suffix: string, factor: float32) =
+    v.setLen(v.len - suffix.len)
+    scale = factor
+  if v.endsWith("px"): cut("px", 1)
+  elif v.endsWith("rem"): cut("rem", inherited)
+  elif v.endsWith("em"): cut("em", inherited)
+  elif v.endsWith("pt"): cut("pt", 96 / 72)
+  elif v.endsWith("pc"): cut("pc", 16)
+  elif v.endsWith("in"): cut("in", 96)
+  elif v.endsWith("cm"): cut("cm", 96 / 2.54)
+  elif v.endsWith("mm"): cut("mm", 96 / 25.4)
+  elif v.endsWith("%"): cut("%", inherited / 100)
+
+  try:
+    result = parseFloat(v.strip()) * scale
+  except ValueError:
+    result = inherited
+  if result <= 0:
+    result = 0
+
+proc parseSvgFontWeight(value: string, inherited: int): int =
+  case value.strip():
+  of "": inherited
+  of "normal", "book", "regular": 400
+  of "bold": 700
+  of "bolder": min(inherited + 300, 900)
+  of "lighter": max(inherited - 300, 100)
+  of "inherit": inherited
+  else:
+    try:
+      clamp(parseInt(value.strip()), 1, 1000)
+    except ValueError:
+      inherited
 
 proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties =
   result = inherited
@@ -76,6 +166,14 @@ proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties 
     opacity = node.attr("opacity")
     fillOpacity = node.attr("fill-opacity")
     strokeOpacity = node.attr("stroke-opacity")
+    fontFamily = node.attr("font-family")
+    fontSize = node.attr("font-size")
+    fontWeight = node.attr("font-weight")
+    fontStyle = node.attr("font-style")
+    textAnchor = node.attr("text-anchor")
+    baseline = node.attrOrDefault(
+      "dominant-baseline", node.attr("alignment-baseline")
+    )
 
   when defined(pixieDebugSvg):
     proc maybeLogPair(k, v: string) =
@@ -86,7 +184,9 @@ proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties 
           "xmlns", "x", "y", "x1", "x2", "y1", "y2", "id", "d", "cx", "cy",
           "r", "points", "rx", "ry", "enable-background", "xml:space",
           "xmlns:xlink", "data-name", "role", "class", "opacity",
-          "fill-opacity", "stroke-opacity"
+          "fill-opacity", "stroke-opacity", "font-family", "font-size",
+          "font-weight", "font-style", "text-anchor", "dominant-baseline",
+          "alignment-baseline", "dx", "dy"
         ]:
           echo k, ": ", v
 
@@ -136,6 +236,24 @@ proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties 
       of "strokeOpacity":
         if strokeOpacity.len == 0:
           strokeOpacity = parts[1].strip()
+      of "font-family":
+        if fontFamily.len == 0:
+          fontFamily = parts[1].strip()
+      of "font-size":
+        if fontSize.len == 0:
+          fontSize = parts[1].strip()
+      of "font-weight":
+        if fontWeight.len == 0:
+          fontWeight = parts[1].strip()
+      of "font-style":
+        if fontStyle.len == 0:
+          fontStyle = parts[1].strip()
+      of "text-anchor":
+        if textAnchor.len == 0:
+          textAnchor = parts[1].strip()
+      of "dominant-baseline", "alignment-baseline":
+        if baseline.len == 0:
+          baseline = parts[1].strip()
       else:
         when defined(pixieDebugSvg):
           maybeLogPair(parts[0], parts[1])
@@ -229,6 +347,35 @@ proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties 
   else:
     result.strokeMiterLimit = parseFloat(strokeMiterLimit)
 
+  if fontFamily.len > 0 and fontFamily != "inherit":
+    result.fontFamily = fontFamily
+
+  result.fontSize = parseSvgFontSize(fontSize, inherited.fontSize)
+  result.fontWeight = parseSvgFontWeight(fontWeight, inherited.fontWeight)
+
+  case fontStyle.strip():
+  of "": discard # Inherit
+  of "italic", "oblique": result.fontItalic = true
+  of "normal": result.fontItalic = false
+  else: discard # Unknown font-style: keep inheriting rather than fail
+
+  case textAnchor.strip():
+  of "": discard # Inherit
+  of "middle": result.textAnchor = MiddleAnchor
+  of "end": result.textAnchor = EndAnchor
+  of "start": result.textAnchor = StartAnchor
+  else: discard
+
+  case baseline.strip():
+  of "": discard # Inherit
+  of "middle", "central": result.baseline = MiddleBaseline
+  of "hanging", "text-before-edge", "top": result.baseline = HangingBaseline
+  of "text-after-edge", "ideographic", "bottom":
+    result.baseline = IdeographicBaseline
+  of "auto", "alphabetic", "baseline", "mathematical":
+    result.baseline = AlphabeticBaseline
+  else: discard
+
   if strokeDashArray == "":
     discard
   else:
@@ -299,6 +446,228 @@ proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties 
       else:
         failInvalidTransform(transform)
 
+type
+  SvgTextPosition = object
+    hasX, hasY: bool
+    x, y, dx, dy: float32
+
+  SvgTextRun = object
+    text: string
+    props: SvgProperties
+    pos: SvgTextPosition
+
+proc svgEntityText(name: string): string =
+  ## `parsexml` resolves numeric entities and the five predefined ones itself,
+  ## so what reaches an entity node is a named entity. These are the ones that
+  ## turn up in hand-written and generated SVG; anything else contributes
+  ## nothing rather than failing the drawing.
+  case name
+  of "nbsp": " " # A normal space: fonts often lack U+00A0 and would draw tofu
+  of "ndash": "–"
+  of "mdash": "—"
+  of "hellip": "…"
+  of "lsquo": "‘"
+  of "rsquo": "’"
+  of "ldquo": "“"
+  of "rdquo": "”"
+  of "bull": "•"
+  of "middot": "·"
+  of "times": "×"
+  of "deg": "°"
+  of "copy": "©"
+  of "reg": "®"
+  of "trade": "™"
+  of "euro": "€"
+  of "pound": "£"
+  of "yen": "¥"
+  else: ""
+
+proc collapseSvgWhitespace(text: string, lastWasSpace: var bool): string =
+  ## XML whitespace inside `<text>` is layout, not content: newlines and the
+  ## indentation around a `<tspan>` collapse to a single space. `lastWasSpace`
+  ## carries across runs so `<text> a <tspan>b</tspan> </text>` does not gain
+  ## spaces at the seams, and starts true so leading indentation disappears.
+  for c in text:
+    if c in Whitespace:
+      if not lastWasSpace:
+        result.add ' '
+        lastWasSpace = true
+    else:
+      result.add c
+      lastWasSpace = false
+
+proc parseSvgCoordinate(value: string, default: float32 = 0): float32 =
+  ## The first number of an SVG coordinate attribute. `x="10 20 30"` positions
+  ## glyphs individually; v1 takes the first and advances the rest normally.
+  var s = value.strip()
+  let sep = s.find({' ', ',', '\t', '\n', '\r'})
+  if sep > 0:
+    s.setLen(sep)
+  # SVG2 allows units on geometry attributes; treat them as user units.
+  while s.len > 0 and s[^1] in {'a' .. 'z', 'A' .. 'Z', '%'}:
+    s.setLen(s.len - 1)
+  try:
+    parseFloat(s)
+  except ValueError:
+    default
+
+proc resolveSvgTypeface(props: SvgProperties): Typeface =
+  ## Walks the font-family list, most-preferred first, and asks the resolver for
+  ## each. An unknown family falls through to the resolver's default rather than
+  ## failing: text in the wrong face still says what it says.
+  let resolver = svgTypefaceResolver()
+  if resolver == nil:
+    return nil
+  for candidate in props.fontFamily.split(','):
+    let family = candidate.strip().strip(chars = {'"', '\'', ' '})
+    if family.len == 0:
+      continue
+    let typeface = resolver(family, props.fontWeight, props.fontItalic)
+    if typeface != nil:
+      return typeface
+  resolver("", props.fontWeight, props.fontItalic)
+
+proc walkSvgText(
+  node: XmlNode,
+  inherited: SvgProperties,
+  runs: var seq[SvgTextRun],
+  lastWasSpace: var bool,
+  pending: var SvgTextPosition
+) =
+  ## Flattens a `<text>` element (and any nested `<tspan>`s) into runs of text,
+  ## each carrying the properties and the pending position adjustment that apply
+  ## to its first character.
+  let props = node.parseSvgProperties(inherited)
+
+  let
+    x = node.attr("x")
+    y = node.attr("y")
+    dx = node.attr("dx")
+    dy = node.attr("dy")
+  if x.len > 0:
+    pending.hasX = true
+    pending.x = parseSvgCoordinate(x)
+  if y.len > 0:
+    pending.hasY = true
+    pending.y = parseSvgCoordinate(y)
+  if dx.len > 0:
+    pending.dx += parseSvgCoordinate(dx)
+  if dy.len > 0:
+    pending.dy += parseSvgCoordinate(dy)
+
+  for child in node:
+    case child.kind
+    of xnText, xnCData, xnVerbatimText:
+      let text = collapseSvgWhitespace(child.text, lastWasSpace)
+      if text.len > 0:
+        runs.add SvgTextRun(text: text, props: props, pos: pending)
+        pending = SvgTextPosition()
+    of xnEntity:
+      let text = svgEntityText(child.text)
+      if text.len > 0:
+        lastWasSpace = false
+        runs.add SvgTextRun(text: text, props: props, pos: pending)
+        pending = SvgTextPosition()
+    of xnElement:
+      case child.tag
+      of "tspan", "text", "a":
+        child.walkSvgText(props, runs, lastWasSpace, pending)
+      else:
+        # <textPath>, <title>, <desc>, <tref>: no v1 support, and dropping the
+        # element is better than losing the document it sits in.
+        discard
+    else:
+      discard
+
+proc parseSvgText(
+  node: XmlNode, props: SvgProperties
+): seq[(Path, SvgProperties)] =
+  ## Turns a `<text>` element into glyph outlines. They are ordinary paths from
+  ## there on: fill, stroke, gradients, opacity and transforms all apply exactly
+  ## as they do to a `<path>`.
+  if svgTypefaceResolver() == nil:
+    # No font source installed. Skipping the text keeps the rest of the
+    # drawing, which is what a missing font should cost.
+    return
+
+  var
+    runs: seq[SvgTextRun]
+    lastWasSpace = true
+    pending = SvgTextPosition(hasX: true, hasY: true) # x=0 y=0 unless given
+  node.walkSvgText(props, runs, lastWasSpace, pending)
+  if runs.len == 0:
+    return
+
+  if runs[^1].text.endsWith(" "):
+    # Renders nothing, but would widen the chunk that text-anchor centers.
+    runs[^1].text.setLen(runs[^1].text.len - 1)
+
+  var
+    arrangements = newSeq[Arrangement](runs.len)
+    fonts = newSeq[Font](runs.len)
+    origins = newSeq[Vec2](runs.len)
+    widths = newSeq[float32](runs.len)
+    chunkStarts: seq[int]
+    pen: Vec2
+
+  for i, run in runs:
+    if run.pos.hasX:
+      pen.x = run.pos.x
+      chunkStarts.add i
+    if run.pos.hasY:
+      pen.y = run.pos.y
+    pen.x += run.pos.dx
+    pen.y += run.pos.dy
+    origins[i] = pen
+
+    if run.props.fontSize <= 0:
+      continue
+    let typeface = resolveSvgTypeface(run.props)
+    if typeface == nil:
+      continue
+    let font = newFont(typeface)
+    font.size = run.props.fontSize
+    fonts[i] = font
+    # No bounds, no wrapping: SVG text is one line unless the author breaks it
+    # into positioned tspans.
+    arrangements[i] = font.typeset(run.text, wrap = false)
+    widths[i] = arrangements[i].layoutBounds().x
+    pen.x += widths[i]
+
+  for c, start in chunkStarts:
+    let
+      stop = if c + 1 < chunkStarts.len: chunkStarts[c + 1] - 1 else: runs.high
+      anchor = runs[start].props.textAnchor
+    if anchor == StartAnchor:
+      continue
+    let
+      width = origins[stop].x + widths[stop] - origins[start].x
+      shift = if anchor == MiddleAnchor: -width / 2 else: -width
+    for i in start .. stop:
+      origins[i].x += shift
+
+  for i, run in runs:
+    if fonts[i] == nil or run.text.strip().len == 0:
+      continue
+    let
+      font = fonts[i]
+      typeface = font.typeface
+      scale = font.scale
+      baselineShift =
+        case run.props.baseline
+        of AlphabeticBaseline: 0.float32
+        of MiddleBaseline: (typeface.ascent + typeface.descent) / 2 * scale
+        of HangingBaseline: typeface.ascent * scale
+        of IdeographicBaseline: typeface.descent * scale
+      path = arrangements[i].computePath()
+    # `typeset` puts the first baseline at `baselineOffset` below the top of the
+    # block; SVG gives us the baseline itself, so shift the block up by that.
+    path.transform(translate(vec2(
+      origins[i].x,
+      origins[i].y + baselineShift - font.baselineOffset
+    )))
+    result.add (path, run.props)
+
 proc parseSvgElement(
   node: XmlNode, svg: Svg, propertiesStack: var seq[SvgProperties]
 ): seq[(Path, SvgProperties)] =
@@ -320,6 +689,9 @@ proc parseSvgElement(
     for child in node:
       result.add child.parseSvgElement(svg, propertiesStack)
     discard propertiesStack.pop()
+
+  of "text":
+    result.add node.parseSvgText(propertiesStack[^1])
 
   of "path":
     let
@@ -460,6 +832,10 @@ proc parseSvgElement(
     linearGradient.y2 = parseFloat(node.attr("y2"))
 
     for child in node:
+      if child.kind != xnElement:
+        # Whitespace between the stops, reported for documents with text in
+        # them (see parseSvgXml). Not a tag, and `tag` on it would be a defect.
+        continue
       if child.tag == "stop":
         var color = child.attr("stop-color")
 
@@ -544,10 +920,29 @@ proc parseSvg*(
   except:
     raise currentExceptionAsPixieError()
 
+proc parseSvgXml*(data: string): XmlNode {.raises: [PixieError].} =
+  ## Parses SVG markup into XML, the way `parseSvg` needs it. Callers that want
+  ## the tree itself — to rewrite the root transform and render in bands, say —
+  ## should come through here rather than calling `parseXml` directly.
+  ##
+  ## Nim's parser drops whitespace that follows a closing tag unless asked for
+  ## it, which is invisible everywhere except inside `<text>`, where the space
+  ## in `…</tspan> tail` is content. Asking for it costs a node per run of
+  ## whitespace in the document, so only documents with text pay.
+  try:
+    var options = {reportComments}
+    if data.contains("<text") or data.contains("<tspan"):
+      options.incl reportWhitespace
+    result = parseXml(data, options)
+  except PixieError as e:
+    raise e
+  except:
+    raise currentExceptionAsPixieError()
+
 proc parseSvg*(data: string, width = 0, height = 0): Svg {.raises: [PixieError].} =
   ## Parse SVG data. Defaults to the SVG's view box size.
   try:
-    let root = parseXml(data)
+    let root = parseSvgXml(data)
     result = root.parseSvg(width, height)
   except PixieError as e:
     raise e
