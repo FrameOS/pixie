@@ -94,12 +94,32 @@ proc copyIntoTarget(target, source: Image) {.raises: [PixieError].} =
     raise newException(PixieError, "Image dimensions do not match target")
   # Row at a time: either side may be a view, whose rows are `stride` apart
   # rather than adjacent.
+  if target.format != source.format:
+    # A decoded RGBX picture landing in a 565 canvas (or the reverse) goes
+    # through the accessors; the same-format case stays a row memcpy.
+    for y in 0 ..< target.height:
+      var
+        ti = target.dataIndex(0, y)
+        si = source.dataIndex(0, y)
+      for x in 0 ..< target.width:
+        target.setPixel(ti, source.getPixel(si))
+        inc ti
+        inc si
+    return
+  let rowBytes = target.width * target.bytesPerPixel
   for y in 0 ..< target.height:
-    copyMem(
-      target.data[target.dataIndex(0, y)].addr,
-      source.data[source.dataIndex(0, y)].unsafeAddr,
-      target.width * sizeof(ColorRGBX)
-    )
+    if target.format == pfRgb565:
+      copyMem(
+        target.data16[target.dataIndex(0, y)].addr,
+        source.data16[source.dataIndex(0, y)].unsafeAddr,
+        rowBytes
+      )
+    else:
+      copyMem(
+        target.data[target.dataIndex(0, y)].addr,
+        source.data[source.dataIndex(0, y)].unsafeAddr,
+        rowBytes
+      )
 
 template isWebpData(data: string): bool =
   data.len > 12 and data.readStr(0, 4) == WebpRiffSignature and

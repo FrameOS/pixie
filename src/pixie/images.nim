@@ -1,4 +1,4 @@
-import blends, bumpy, chroma, common, internal, simd, vmath
+import blends, bumpy, chroma, common, internal, rgb565, simd, vmath
 
 export Image, copy, dataIndex, newImage
 
@@ -20,19 +20,27 @@ proc inside*(image: Image, x, y: int): bool {.inline, raises: [].} =
 template unsafe*(src: Image): UnsafeImage =
   cast[UnsafeImage](src)
 
-template `[]`*(view: UnsafeImage, x, y: int): var ColorRGBX =
+template `[]`*(view: UnsafeImage, x, y: int): ColorRGBX =
   ## Gets a color from (x, y) coordinates.
   ## * No bounds checking *
   ## Make sure that x, y are in bounds.
   ## Failure in the assumptions will cause unsafe memory reads.
-  cast[Image](view).data[cast[Image](view).dataIndex(x, y)]
+  ##
+  ## Returns by value (it used to return `var`): a 565 image has no
+  ## `ColorRGBX` in memory to hand out a reference to, and reading through
+  ## this is the one accessor that works on every storage format.
+  (block:
+    let img {.inject.} = cast[Image](view)
+    img.getPixel(img.dataIndex(x, y)))
 
 template `[]=`*(view: UnsafeImage, x, y: int, color: ColorRGBX) =
   ## Sets a color from (x, y) coordinates.
   ## * No bounds checking *
   ## Make sure that x, y are in bounds.
   ## Failure in the assumptions will cause unsafe memory writes.
-  cast[Image](view).data[cast[Image](view).dataIndex(x, y)] = color
+  block:
+    let img = cast[Image](view)
+    img.setPixel(img.dataIndex(x, y), color)
 
 proc `[]`*(image: Image, x, y: int): ColorRGBX {.inline, raises: [].} =
   ## Gets a pixel at (x, y) or returns transparent black if outside of bounds.
@@ -56,6 +64,11 @@ proc fill*(image: Image, color: SomeColor) {.inline, raises: [].} =
   ## Fills the image with the color.
   # An owner is a single span, so this stays the one memset it always was.
   # A view fills row by row, which is how a tiled render clears its cell.
+  if image.format == pfRgb565:
+    let packed = rgbxToRgb565(color.asRgbx())
+    image.forEachSpan:
+      fillUnsafe16(image.data16, packed, spanStart, spanLen)
+    return
   image.forEachSpan:
     fillUnsafe(image.data, color, spanStart, spanLen)
 
@@ -93,12 +106,23 @@ proc pixelsEqual*(a, b: Image): bool {.raises: [].} =
     return a.isNil and b.isNil
   if a.width != b.width or a.height != b.height:
     return false
+  if a.format != b.format:
+    # Different storage, same picture? Compare what each would read back.
+    for y in 0 ..< a.height:
+      for x in 0 ..< a.width:
+        if a.unsafe[x, y] != b.unsafe[x, y]:
+          return false
+    return true
+  let rowBytes = a.width * a.bytesPerPixel
   for y in 0 ..< a.height:
-    if not equalMem(
-      a.data[a.dataIndex(0, y)].addr,
-      b.data[b.dataIndex(0, y)].addr,
-      a.width * 4
-    ):
+    let same =
+      if a.format == pfRgb565:
+        equalMem(a.data16[a.dataIndex(0, y)].addr,
+          b.data16[b.dataIndex(0, y)].addr, rowBytes)
+      else:
+        equalMem(a.data[a.dataIndex(0, y)].addr,
+          b.data[b.dataIndex(0, y)].addr, rowBytes)
+    if not same:
       return false
   true
 
@@ -107,6 +131,8 @@ proc isOneColor*(image: Image): bool {.hasSimd, raises: [].} =
   # This is an optimization hint with no callers inside pixie, so a view gets
   # the conservative answer rather than a row walk. The SIMD variants bail out
   # the same way — the dispatch the hasSimd pragma inserts runs before this.
+  if image.format != pfRgbx:
+    return image.isOneColor565()
   if image.isView:
     return false
   result = true
@@ -117,8 +143,9 @@ proc isOneColor*(image: Image): bool {.hasSimd, raises: [].} =
 
 proc isTransparent*(image: Image): bool {.hasSimd, raises: [].} =
   ## Checks if this image is fully transparent or not.
-  # Conservative for a view, for the same reason as isOneColor.
-  if image.isView:
+  # Conservative for a view, for the same reason as isOneColor. A 565 image
+  # has no alpha and reads back opaque, so it is never transparent.
+  if image.isView or image.format == pfRgb565:
     return false
   result = true
   for i in 0 ..< image.dataLen:
@@ -129,6 +156,8 @@ proc isOpaque*(image: Image): bool {.raises: [].} =
   ## Checks if the entire image is opaque (alpha values are all 255).
   # No image-level SIMD variant can bypass this walk, so unlike isOneColor and
   # isTransparent a view can be answered exactly instead of conservatively.
+  if image.format == pfRgb565:
+    return true
   result = true
   image.forEachSpan:
     if not isOpaque(image.data, spanStart, spanLen):
@@ -141,10 +170,16 @@ proc flipHorizontal*(image: Image) {.raises: [].} =
     var
       left = image.dataIndex(0, y)
       right = left + image.width - 1
-    for x in 0 ..< halfWidth:
-      swap(image.data[left], image.data[right])
-      inc left
-      dec right
+    if image.format == pfRgb565:
+      for x in 0 ..< halfWidth:
+        swap(image.data16[left], image.data16[right])
+        inc left
+        dec right
+    else:
+      for x in 0 ..< halfWidth:
+        swap(image.data[left], image.data[right])
+        inc left
+        dec right
 
 proc flipVertical*(image: Image) {.raises: [].} =
   ## Flips the image around the X axis.
@@ -153,8 +188,12 @@ proc flipVertical*(image: Image) {.raises: [].} =
     let
       topStart = image.dataIndex(0, y)
       bottomStart = image.dataIndex(0, image.height - y - 1)
-    for x in 0 ..< image.width:
-      swap(image.data[topStart + x], image.data[bottomStart + x])
+    if image.format == pfRgb565:
+      for x in 0 ..< image.width:
+        swap(image.data16[topStart + x], image.data16[bottomStart + x])
+    else:
+      for x in 0 ..< image.width:
+        swap(image.data[topStart + x], image.data[bottomStart + x])
 
 proc rotate90*(image: Image) {.raises: [PixieError].} =
   ## Rotates the image 90 degrees clockwise.
@@ -163,18 +202,21 @@ proc rotate90*(image: Image) {.raises: [PixieError].} =
   if image.isView:
     raise newException(PixieError, "Cannot rotate90 a view, copy it first")
 
-  let rotated = newImage(image.height, image.width)
+  let rotated = image.newImageLike(image.height, image.width)
   for y in 0 ..< rotated.height:
     for x in 0 ..< rotated.width:
-      rotated.data[rotated.dataIndex(x, y)] =
-        image.data[image.dataIndex(y, image.height - x - 1)]
+      rotated.setPixel(rotated.dataIndex(x, y),
+        image.getPixel(image.dataIndex(y, image.height - x - 1)))
   # The pixels are copied back rather than the buffer handed over, because an
   # image's storage belongs to it: rebinding it to the temporary's would leave
   # this image pointing at pixels that die with the temporary. The pixel count
   # is unchanged, so the existing buffer still fits.
   swap(image.width, image.height)
   image.stride = image.width
-  copyMem(image.data[0].addr, rotated.data[0].addr, image.dataLen * 4)
+  if image.format == pfRgb565:
+    copyMem(image.data16[0].addr, rotated.data16[0].addr, image.dataLen * 2)
+  else:
+    copyMem(image.data[0].addr, rotated.data[0].addr, image.dataLen * 4)
 
 proc subImage*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
   ## Gets a sub image from this image.
@@ -189,7 +231,15 @@ proc subImage*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
       "Params y: " & $y & " h: " & $h & " invalid, image height is " & $image.height
     )
 
-  result = newImage(w, h)
+  result = image.newImageLike(w, h)
+  if image.format == pfRgb565:
+    for y2 in 0 ..< h:
+      copyMem(
+        result.data16[result.dataIndex(0, y2)].addr,
+        image.data16[image.dataIndex(x, y + y2)].addr,
+        w * 2
+      )
+    return
   for y2 in 0 ..< h:
     copyMem(
       result.data[result.dataIndex(0, y2)].addr,
@@ -242,7 +292,9 @@ proc minifyBy2*(
   if power == 0:
     return image.copy()
 
-  var src = image
+  # The box filter below averages raw RGBX; a 565 source is expanded first so
+  # the averaging happens at 8 bits and the result is an ordinary RGBX image.
+  var src = if image.format == pfRgb565: image.toRgbxImage() else: image
   for _ in 1 .. power:
     # When minifying an image of odd size, round the result image size up
     # so a 99 x 99 src image returns a 50 x 50 image.
@@ -304,7 +356,9 @@ proc magnifyBy2*(
   if power < 0:
     raise newException(PixieError, "Cannot magnifyBy2 with negative power")
 
-  let scale = 2 ^ power
+  let
+    scale = 2 ^ power
+    image = if image.format == pfRgb565: image.toRgbxImage() else: image
   result = newImage(image.width * scale, image.height * scale)
 
   for y in 0 ..< image.height:
@@ -336,6 +390,10 @@ proc applyOpacity*(image: Image, opacity: float32) {.hasSimd, raises: [].} =
     image.fill(rgbx(0, 0, 0, 0))
     return
 
+  if image.format != pfRgbx:
+    image.applyOpacity565(opacity)
+    return
+
   image.forEachSpan:
     for i in spanStart ..< spanStart + spanLen:
       var rgbx = image.data[i]
@@ -347,6 +405,9 @@ proc applyOpacity*(image: Image, opacity: float32) {.hasSimd, raises: [].} =
 
 proc invert*(image: Image) {.hasSimd, raises: [].} =
   ## Inverts all of the colors and alpha.
+  if image.format != pfRgbx:
+    image.invert565()
+    return
   image.forEachSpan:
     for i in spanStart ..< spanStart + spanLen:
       var rgbx = image.data[i]
@@ -367,6 +428,9 @@ proc invert*(image: Image) {.hasSimd, raises: [].} =
 
 proc ceil*(image: Image) {.hasSimd, raises: [].} =
   ## A value of 0 stays 0. Anything else turns into 255.
+  if image.format != pfRgbx:
+    image.ceil565()
+    return
   image.forEachSpan:
     for i in spanStart ..< spanStart + spanLen:
       var rgbx = image.data[i]
@@ -385,6 +449,20 @@ proc blur*(
     return
   if radius < 0:
     raise newException(PixieError, "Cannot apply negative blur")
+
+  if image.format == pfRgb565:
+    # Blur at 8 bits in an RGBX copy and quantise the result back in. The
+    # copy is the price of not writing a second blur; a 565 canvas is blurred
+    # rarely enough that paying it beats carrying that code.
+    let tmp = image.toRgbxImage()
+    tmp.blur(radius.float32, outOfBounds)
+    for y in 0 ..< image.height:
+      let
+        src = tmp.dataIndex(0, y)
+        dst = image.dataIndex(0, y)
+      for x in 0 ..< image.width:
+        image.data16[dst + x] = rgbxToRgb565(tmp.data[src + x])
+    return
 
   let
     kernel = gaussianKernel(radius)
@@ -540,15 +618,82 @@ proc blendLineMask(a, b: ptr UncheckedArray[ColorRGBX], len: int) {.hasSimd.} =
   for i in 0 ..< len:
     a[i] = blendMask(a[i], b[i])
 
+template rowAddr(image: Image, x, y: int): pointer =
+  ## Address of pixel (x, y) whatever the storage format.
+  (if image.format == pfRgb565:
+    cast[pointer](image.data16[image.dataIndex(x, y)].addr)
+   else:
+    cast[pointer](image.data[image.dataIndex(x, y)].addr))
+
 template zeroRows(image: Image, y, h: int) =
   ## Clears `h` whole rows starting at row `y`. One memset when the rows are
   ## back to back, which is every owner, and one per row for a strided view —
   ## whose rows must not be zeroed through, since the gaps belong to the parent.
+  ## Zero is "transparent black" for RGBX and "black" for 565 — the same
+  ## answer once a driver reads the colour off either.
+  let bpp = image.bytesPerPixel
   if image.isContiguous:
-    zeroMem(image.data[image.dataIndex(0, y)].addr, h * image.width * 4)
+    zeroMem(image.rowAddr(0, y), h * image.width * bpp)
   else:
     for yy in y ..< y + h:
-      zeroMem(image.data[image.dataIndex(0, yy)].addr, image.width * 4)
+      zeroMem(image.rowAddr(0, yy), image.width * bpp)
+
+proc blendLineAny(
+  a: Image, ax, ay: int, b: Image, bx, by: int, len: int, blendMode: BlendMode
+) =
+  ## One row of `b` blended onto one row of `a` through the format-aware
+  ## accessors: the slow generic path that exists so that any mix of RGBX and
+  ## 565 on either side is correct. The RGBX/RGBX case never comes here.
+  var
+    ai = a.dataIndex(ax, ay)
+    bi = b.dataIndex(bx, by)
+  case blendMode:
+  of OverwriteBlend:
+    for _ in 0 ..< len:
+      a.setPixel(ai, b.getPixel(bi))
+      inc ai
+      inc bi
+  of NormalBlend:
+    for _ in 0 ..< len:
+      a.setPixel(ai, blendNormal(a.getPixel(ai), b.getPixel(bi)))
+      inc ai
+      inc bi
+  of MaskBlend:
+    for _ in 0 ..< len:
+      a.setPixel(ai, blendMask(a.getPixel(ai), b.getPixel(bi)))
+      inc ai
+      inc bi
+  else:
+    let blender = blendMode.blender()
+    for _ in 0 ..< len:
+      a.setPixel(ai, blender(a.getPixel(ai), b.getPixel(bi)))
+      inc ai
+      inc bi
+
+proc blendSampleLineAny(
+  a: Image, ax, ay: int, samples: ptr UncheckedArray[ColorRGBX], len: int,
+  blendMode: BlendMode
+) =
+  ## `blendLineAny` where the source row is already an RGBX scratch line.
+  var ai = a.dataIndex(ax, ay)
+  case blendMode:
+  of OverwriteBlend:
+    for i in 0 ..< len:
+      a.setPixel(ai, samples[i])
+      inc ai
+  of NormalBlend:
+    for i in 0 ..< len:
+      a.setPixel(ai, blendNormal(a.getPixel(ai), samples[i]))
+      inc ai
+  of MaskBlend:
+    for i in 0 ..< len:
+      a.setPixel(ai, blendMask(a.getPixel(ai), samples[i]))
+      inc ai
+  else:
+    let blender = blendMode.blender()
+    for i in 0 ..< len:
+      a.setPixel(ai, blender(a.getPixel(ai), samples[i]))
+      inc ai
 
 proc blendRect(a, b: Image, pos: Ivec2, blendMode: BlendMode) =
   let
@@ -565,6 +710,23 @@ proc blendRect(a, b: Image, pos: Ivec2, blendMode: BlendMode) =
     yStart = max(-py, 0)
     xEnd = min(b.width, a.width - px)
     yEnd = min(b.height, a.height - py)
+
+  if a.format != pfRgbx or b.format != pfRgbx:
+    # Any 565 on either side: the raw-pointer kernels below assume 4-byte
+    # pixels, so go through the accessors. The mask clears stay the same.
+    if blendMode == MaskBlend and yStart + py > 0:
+      a.zeroRows(0, yStart + py)
+    for y in yStart ..< yEnd:
+      if blendMode == MaskBlend:
+        if xStart + px > 0:
+          zeroMem(a.rowAddr(0, y + py), (xStart + px) * a.bytesPerPixel)
+        if xEnd + px < a.width:
+          zeroMem(a.rowAddr(xEnd + px, y + py),
+            (a.width - (xEnd + px)) * a.bytesPerPixel)
+      blendLineAny(a, xStart + px, y + py, b, xStart, y, xEnd - xStart, blendMode)
+    if blendMode == MaskBlend and yEnd + py < a.height:
+      a.zeroRows(yEnd + py, a.height - (yEnd + py))
+    return
 
   case blendMode:
   of NormalBlend:
@@ -673,6 +835,20 @@ proc drawSmooth(a, b: Image, transform: Mat3, blendMode: BlendMode) =
       sampleLine[x] = b.getRgbaSmooth(srcPos.x, srcPos.y)
       srcPos += dx
 
+    if a.format != pfRgbx:
+      # The sample line is RGBX whatever `b` is (getRgbaSmooth reads through
+      # the accessors); only the store into `a` needs the format-aware path.
+      if blendMode == MaskBlend and xStart > 0:
+        zeroMem(a.rowAddr(0, y), xStart * a.bytesPerPixel)
+      blendSampleLineAny(
+        a, xStart, y,
+        cast[ptr UncheckedArray[ColorRGBX]](sampleLine[xStart].addr),
+        xEnd - xStart, blendMode
+      )
+      if blendMode == MaskBlend and a.width - xEnd > 0:
+        zeroMem(a.rowAddr(xEnd, y), (a.width - xEnd) * a.bytesPerPixel)
+      continue
+
     case blendMode:
     of NormalBlend:
       blendLineNormal(
@@ -778,6 +954,7 @@ proc resize*(srcImage: Image, width, height: int): Image {.raises: [PixieError].
 
 proc spread(image: Image, spread: float32) {.raises: [PixieError].} =
   ## Grows the mask by spread.
+  image.requireRgbx("spread")
   let spread = round(spread).int
   if spread == 0:
     return
@@ -794,7 +971,7 @@ proc spread(image: Image, spread: float32) {.raises: [PixieError].} =
             maxValue = value
           if maxValue == 255:
             break
-        spreadX.unsafe[y, x].a = maxValue
+        spreadX.unsafe[y, x] = rgbx(0, 0, 0, maxValue)
 
     # Spread in the Y direction and modify mask.
     for y in 0 ..< image.height:
@@ -840,6 +1017,7 @@ proc shadow*(
   image: Image, offset: Vec2, spread, blur: float32, color: SomeColor
 ): Image {.raises: [PixieError].} =
   ## Create a shadow of the image with the offset, spread and blur.
+  image.requireRgbx("shadow")
   var mask: Image
   if offset == vec2(0, 0):
     mask = image.copy()
@@ -871,6 +1049,9 @@ proc opaqueBounds*(image: Image): Rect =
   ## visible part of the image and then use subImage to cut it out.
   ## Returns zero rect if whole image is transparent.
   ## Returns just the size of the image if no edge is transparent.
+  if image.format == pfRgb565:
+    # Opaque by construction, so every pixel counts.
+    return rect(0, 0, image.width.float32, image.height.float32)
   var
     xMin = image.width
     xMax = 0

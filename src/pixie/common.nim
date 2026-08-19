@@ -37,8 +37,37 @@ type
     fitCover   ## fill the whole target, cropping the source centered
     fitContain ## fit the whole source centered, leaving target borders untouched
 
+  PixelFormat* = enum
+    ## How an image stores its pixels. Everything in pixie composites in
+    ## premultiplied RGBA (`ColorRGBX`); the storage format only decides what
+    ## those values are packed into on the way in and out of memory.
+    pfRgbx   ## 32-bit premultiplied RGBA — the format every image had before
+    pfRgb565 ## 16-bit packed RGB (5/6/5), no alpha; reads back fully opaque
+
   Image* {.acyclic.} = ref object
     ## Image object that holds bitmap data in premultiplied alpha RGBA format.
+    ##
+    ## Or — since `pfRgb565` exists — in a 16-bit RGB format that halves the
+    ## memory and drops alpha. A 565 image is a *presentation surface*: a
+    ## final canvas that opaque geometry and decoded pictures are composited
+    ## onto and that a display driver then reads. Everything that draws onto
+    ## an image works on one (solid fills, antialiased paths and text, image
+    ## draws with any blend mode, gradients, opacity), and so does reading
+    ## pixels back, copying and viewing. What does NOT work is using one as
+    ## an *alpha mask* or as a filter scratch buffer — `shadow`, `spread`,
+    ## `blur`, `minifyBy2`/`magnifyBy2`, `invert`, `ceil`, `rotate90` and
+    ## the opaque/transparent predicates raise `PixieError` rather than
+    ## guess, because those operations are defined by an alpha channel a 565
+    ## image does not have. Drawing a 565 image onto another image works
+    ## (it reads back opaque); scaling one is done through an RGBX copy.
+    ##
+    ## Premultiplied colour written into a 565 image keeps its premultiplied
+    ## RGB and forgets the alpha, which is exactly what a display driver that
+    ## reads `.r/.g/.b` off an RGBA canvas saw anyway: a half-transparent
+    ## pixel over nothing reads as a half-dark one. Reads come back with
+    ## alpha 255, so compositing onto a 565 image is compositing onto an
+    ## opaque backdrop, which is what a canvas filled with a background
+    ## colour is.
     ##
     ## `{.acyclic.}` is load-bearing, not an optimisation. `root` makes this
     ## type look cyclic to ORC, but a view's `root` always points at an owner
@@ -64,9 +93,13 @@ type
     width*, height*: int
     stride*: int  ## elements between vertically adjacent pixels
     origin*: int  ## index of (0, 0) within the shared buffer
-    storage: seq[ColorRGBX] ## owned pixels; empty for a view
+    format*: PixelFormat ## how `pixels` / `pixels16` are laid out
+    storage: seq[ColorRGBX] ## owned pixels; empty for a view or a 565 image
+    storage16: seq[uint16]  ## owned 565 pixels; empty for a view, an RGBX
+                            ## image, or a 565 image over a borrowed buffer
     root: Image             ## the owner whose buffer this views; nil if owner
-    pixels: ptr UncheckedArray[ColorRGBX] ## the buffer, owned or borrowed
+    pixels: ptr UncheckedArray[ColorRGBX] ## the RGBX buffer, owned or borrowed
+    pixels16: ptr UncheckedArray[uint16]  ## the 565 buffer, owned or borrowed
 
   ImageSourceProc* = proc(
     dst: pointer, maxBytes: int
@@ -116,10 +149,76 @@ template data*(image: Image): ptr UncheckedArray[ColorRGBX] =
   ## The pixels this image addresses — its own, or its owner's when it is a
   ## view. Indexed with `dataIndex`, never with a flat running counter unless
   ## `isContiguous` says that is safe.
+  ##
+  ## Only meaningful for a `pfRgbx` image. Code that can be handed a 565 image
+  ## goes through `getPixel`/`setPixel` (or `unsafe[]`), which branch on the
+  ## format, and the flat kernels check `image.format` before touching this.
   image.pixels
+
+template data16*(image: Image): ptr UncheckedArray[uint16] =
+  ## The 565 pixels of a `pfRgb565` image, addressed like `data`.
+  image.pixels16
 
 template dataIndex*(image: Image, x, y: int): int =
   image.origin + image.stride * y + x
+
+template isRgbx*(image: Image): bool =
+  image.format == pfRgbx
+
+template isRgb565*(image: Image): bool =
+  image.format == pfRgb565
+
+proc rgbxToRgb565*(c: ColorRGBX): uint16 {.inline, raises: [].} =
+  ## Packs a premultiplied RGBX colour into 5/6/5, rounding each channel to
+  ## nearest. Alpha is dropped; the premultiplied RGB is what survives, so a
+  ## translucent pixel lands as the darker colour a driver reading the RGBA
+  ## canvas's RGB would have seen.
+  ##
+  ## The multiply-shift forms are exact `round(v * 31 / 255)` and
+  ## `round(v * 63 / 255)` for every byte, and they are idempotent with
+  ## `rgb565ToRgbx`: expanding then re-packing a 565 value gives it back, so
+  ## a read-modify-write that changes nothing changes nothing.
+  let
+    r = (c.r.uint32 * 249 + 1014) shr 11
+    g = (c.g.uint32 * 253 + 505) shr 10
+    b = (c.b.uint32 * 249 + 1014) shr 11
+  uint16((r shl 11) or (g shl 5) or b)
+
+proc rgb565ToRgbx*(p: uint16): ColorRGBX {.inline, raises: [].} =
+  ## Expands a 5/6/5 pixel to an opaque RGBX colour, replicating the top bits
+  ## into the low bits so 0 stays 0 and full scale stays 255.
+  let
+    r = (p.uint32 shr 11) and 31
+    g = (p.uint32 shr 5) and 63
+    b = p.uint32 and 31
+  result.r = ((r shl 3) or (r shr 2)).uint8
+  result.g = ((g shl 2) or (g shr 4)).uint8
+  result.b = ((b shl 3) or (b shr 2)).uint8
+  result.a = 255
+
+template getPixel*(image: Image, index: int): ColorRGBX =
+  ## The pixel at a `dataIndex`, whatever the storage format.
+  (if image.format == pfRgbx: image.pixels[index]
+   else: rgb565ToRgbx(image.pixels16[index]))
+
+template setPixel*(image: Image, index: int, color: ColorRGBX) =
+  ## Stores a premultiplied pixel at a `dataIndex`, whatever the storage format.
+  if image.format == pfRgbx:
+    image.pixels[index] = color
+  else:
+    image.pixels16[index] = rgbxToRgb565(color)
+
+template bytesPerPixel*(image: Image): int =
+  (if image.format == pfRgbx: 4 else: 2)
+
+template requireRgbx*(image: Image, what: string) =
+  ## Guard for operations that are only defined on an RGBA image — the ones
+  ## whose meaning is the alpha channel. Raising is the honest answer: a 565
+  ## image has no alpha to spread, mask, or test, and silently treating it as
+  ## opaque would make a mask-based effect produce a rectangle.
+  if image.format != pfRgbx:
+    raise newException(PixieError, what & " needs an RGBA image, not a " &
+      $image.format & " one")
 
 template isContiguous*(image: Image): bool =
   ## True when the image's rows sit back to back in the buffer, which is what a
@@ -232,12 +331,15 @@ proc writeSampledRow(
         (if sampler.boxX: sampler.colCount[tx].uint64 else: 1'u64)
       base = tx * 4
       half = area div 2
-    target.data[target.dataIndex(sampler.dstX + tx, outY)] = ColorRGBX(
+    # One write point for every row-streamed decode, so a 565 target costs
+    # the decoders nothing: the accumulator is 8-bit-per-channel all the way
+    # to here and only the final store packs.
+    target.setPixel(target.dataIndex(sampler.dstX + tx, outY), ColorRGBX(
       r: ((values[base + 0] + half) div area).uint8,
       g: ((values[base + 1] + half) div area).uint8,
       b: ((values[base + 2] + half) div area).uint8,
       a: ((values[base + 3] + half) div area).uint8
-    )
+    ))
 
 proc flushBoxRow(sampler: var RowBoxSampler, target: Image) =
   if sampler.currentTy < 0 or sampler.rowsInBox == 0:
@@ -292,6 +394,66 @@ proc newImage*(width, height: int): Image {.raises: [PixieError].} =
   result.storage = newSeq[ColorRGBX](width * height)
   result.pixels = cast[ptr UncheckedArray[ColorRGBX]](result.storage[0].addr)
 
+proc newImage565*(width, height: int): Image {.raises: [PixieError].} =
+  ## Creates a new 16-bit RGB (5/6/5) image, half the memory of `newImage`.
+  ## Starts black (which is also what "transparent" packs to). See the notes
+  ## on `Image` for what a 565 image can and cannot do.
+  if width <= 0 or height <= 0:
+    raise newException(PixieError, "Image width and height must be > 0")
+  result = Image()
+  result.width = width
+  result.height = height
+  result.stride = width
+  result.origin = 0
+  result.format = pfRgb565
+  result.storage16 = newSeq[uint16](width * height)
+  result.pixels16 = cast[ptr UncheckedArray[uint16]](result.storage16[0].addr)
+
+proc newImage565Over*(
+  width, height: int, buffer: pointer
+): Image {.raises: [PixieError].} =
+  ## A 565 image over memory the caller owns — `width * height * 2` bytes at
+  ## `buffer`, which must outlive the image and everything viewed from it.
+  ##
+  ## This is how a device keeps one canvas for its whole uptime: allocate the
+  ## block once at boot, before anything can fragment the heap, and hand it
+  ## to pixie every render instead of asking the allocator for a multi-MB
+  ## contiguous run each time. The image is an owner as far as views are
+  ## concerned (it is what `root` points at) but frees nothing.
+  if width <= 0 or height <= 0:
+    raise newException(PixieError, "Image width and height must be > 0")
+  if buffer.isNil:
+    raise newException(PixieError, "newImage565Over needs a buffer")
+  result = Image()
+  result.width = width
+  result.height = height
+  result.stride = width
+  result.origin = 0
+  result.format = pfRgb565
+  result.pixels16 = cast[ptr UncheckedArray[uint16]](buffer)
+
+proc newImageOver*(
+  width, height: int, buffer: pointer
+): Image {.raises: [PixieError].} =
+  ## `newImage565Over` for an RGBX buffer of `width * height * 4` bytes.
+  if width <= 0 or height <= 0:
+    raise newException(PixieError, "Image width and height must be > 0")
+  if buffer.isNil:
+    raise newException(PixieError, "newImageOver needs a buffer")
+  result = Image()
+  result.width = width
+  result.height = height
+  result.stride = width
+  result.origin = 0
+  result.pixels = cast[ptr UncheckedArray[ColorRGBX]](buffer)
+
+proc newImageLike*(image: Image, width, height: int): Image {.raises: [PixieError].} =
+  ## A fresh image in the same storage format as `image`.
+  if image.format == pfRgb565:
+    newImage565(width, height)
+  else:
+    newImage(width, height)
+
 proc newImageFrom*(
   width, height: int, data: sink seq[ColorRGBX]
 ): Image {.raises: [PixieError].} =
@@ -320,12 +482,68 @@ proc toContiguousSeq*(image: Image): seq[ColorRGBX] {.raises: [].} =
   ## mutates `copy` would be scribbling on the image it was asked to read.
   result = newSeq[ColorRGBX](image.width * image.height)
   if image.width * image.height > 0:
+    if image.format == pfRgb565:
+      # A 565 image expands to opaque RGBX on the way out: this is the seam
+      # every encoder reaches the pixels through, so a 565 canvas can still
+      # be saved as a PNG for a preview without the encoders knowing.
+      for y in 0 ..< image.height:
+        let
+          src = image.dataIndex(0, y)
+          dst = y * image.width
+        for x in 0 ..< image.width:
+          result[dst + x] = rgb565ToRgbx(image.pixels16[src + x])
+      return
     for y in 0 ..< image.height:
       copyMem(
         result[y * image.width].addr,
         image.data[image.dataIndex(0, y)].addr,
         image.width * 4
       )
+
+proc toRgbxImage*(image: Image): Image {.raises: [].} =
+  ## An RGBX copy of any image. For an RGBX image this is `copy`; for a 565
+  ## image it is the expansion a filter or scaler that only knows RGBA needs.
+  result = Image()
+  result.width = image.width
+  result.height = image.height
+  result.stride = image.width
+  result.origin = 0
+  result.storage = newSeq[ColorRGBX](image.width * image.height)
+  result.pixels = cast[ptr UncheckedArray[ColorRGBX]](result.storage[0].addr)
+  if image.format == pfRgb565:
+    for y in 0 ..< image.height:
+      let
+        src = image.dataIndex(0, y)
+        dst = y * image.width
+      for x in 0 ..< image.width:
+        result.pixels[dst + x] = rgb565ToRgbx(image.pixels16[src + x])
+  else:
+    for y in 0 ..< image.height:
+      copyMem(
+        result.pixels[y * image.width].addr,
+        image.pixels[image.dataIndex(0, y)].addr,
+        image.width * 4
+      )
+
+proc toRgb565Image*(image: Image): Image {.raises: [].} =
+  ## A 565 copy of any image — the quantising direction.
+  result = Image()
+  result.width = image.width
+  result.height = image.height
+  result.stride = image.width
+  result.origin = 0
+  result.format = pfRgb565
+  result.storage16 = newSeq[uint16](image.width * image.height)
+  result.pixels16 = cast[ptr UncheckedArray[uint16]](result.storage16[0].addr)
+  for y in 0 ..< image.height:
+    let
+      src = image.dataIndex(0, y)
+      dst = y * image.width
+    if image.format == pfRgb565:
+      copyMem(result.pixels16[dst].addr, image.pixels16[src].addr, image.width * 2)
+    else:
+      for x in 0 ..< image.width:
+        result.pixels16[dst + x] = rgbxToRgb565(image.pixels[src + x])
 
 proc newImageFromUnchecked*(
   width, height: int, data: sink seq[ColorRGBX]
@@ -359,16 +577,20 @@ proc view*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
   result.height = h
   result.stride = image.stride
   result.origin = image.dataIndex(x, y)
+  result.format = image.format
   result.root = if image.root.isNil: image else: image.root
   result.pixels = image.pixels
+  result.pixels16 = image.pixels16
 
 template isView*(image: Image): bool =
   ## True when the image borrows another's pixels rather than owning them.
   not image.root.isNil
 
 proc copy*(image: Image): Image {.raises: [].} =
-  ## Copies the image data into a new image. A view copies out, so the result
-  ## always owns its pixels.
+  ## Copies the image data into a new image, in the same storage format. A
+  ## view copies out, so the result always owns its pixels.
+  if image.format == pfRgb565:
+    return image.toRgb565Image()
   result = Image()
   result.width = image.width
   result.height = image.height

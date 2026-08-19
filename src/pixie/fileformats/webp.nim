@@ -2969,12 +2969,12 @@ proc frameToTargetRect(
         sumB += px.b
         sumA += px.a
     let area = uint32((sy1 - sy0) * (sx1 - sx0))
-    target.data[target.dataIndex(dstX, dstY)] = ColorRGBX(
+    target.setPixel(target.dataIndex(dstX, dstY), ColorRGBX(
       r: ((sumR + area div 2) div area).uint8,
       g: ((sumG + area div 2) div area).uint8,
       b: ((sumB + area div 2) div area).uint8,
       a: ((sumA + area div 2) div area).uint8
-    )
+    ))
 
 proc rgbaBytesToTargetRect(
   rgbaData: seq[uint8], width, height: int, forceOpaque: bool,
@@ -3002,12 +3002,12 @@ proc rgbaBytesToTargetRect(
         sumB += px.b
         sumA += px.a
     let area = uint32((sy1 - sy0) * (sx1 - sx0))
-    target.data[target.dataIndex(dstX, dstY)] = ColorRGBX(
+    target.setPixel(target.dataIndex(dstX, dstY), ColorRGBX(
       r: ((sumR + area div 2) div area).uint8,
       g: ((sumG + area div 2) div area).uint8,
       b: ((sumB + area div 2) div area).uint8,
       a: ((sumA + area div 2) div area).uint8
-    )
+    ))
 
 proc decodeWebpScaledInto*(
   data: string, target: Image, fit = fitStretch

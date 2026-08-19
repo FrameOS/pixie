@@ -1,4 +1,4 @@
-import avx, chroma, nimsimd/hassimd, nimsimd/avx2, ../blends, ../common, vmath
+import avx, chroma, nimsimd/hassimd, nimsimd/avx2, ../blends, ../common, ../rgb565, vmath
 
 when defined(gcc) or defined(clang):
   {.localPassC: "-mavx2".}
@@ -42,6 +42,8 @@ template blendMaskSimd(backdrop, source: M256i): M256i =
   mm256_or_si256(backdropEven, mm256_slli_epi16(backdropOdd, 8))
 
 proc isOneColorAvx2*(image: Image): bool {.simd.} =
+  if image.format != pfRgbx:
+    return image.isOneColor565()
   # A view's pixels are not one flat run, and this answer is only ever used to
   # take a shortcut, so declining for views is safe: the caller falls back to
   # the general path.
@@ -78,6 +80,8 @@ proc isOneColorAvx2*(image: Image): bool {.simd.} =
       return false
 
 proc isTransparentAvx2*(image: Image): bool {.simd.} =
+  if image.format != pfRgbx:
+    return false
   # See isOneColorAvx2: a false answer for a view is conservative, not wrong.
   if image.isView:
     return false
@@ -196,6 +200,9 @@ proc toPremultipliedAlphaAvx2*(data: var seq[ColorRGBA | ColorRGBX]) {.simd.} =
       data[i] = rgbx
 
 proc invertAvx2*(image: Image) {.simd.} =
+  if image.format != pfRgbx:
+    image.invert565()
+    return
   image.forEachSpan:
     let spanEnd = spanStart + spanLen
 
@@ -243,6 +250,9 @@ proc invertAvx2*(image: Image) {.simd.} =
         image.data[i] = rgbx
 
 proc applyOpacityAvx2*(image: Image, opacity: float32) {.simd.} =
+  if image.format != pfRgbx:
+    image.applyOpacity565(round(255 * opacity).uint16)
+    return
   let opacity = round(255 * opacity).uint16
   if opacity == 255:
     return
@@ -303,6 +313,9 @@ proc applyOpacityAvx2*(image: Image, opacity: float32) {.simd.} =
       image.data[i] = rgbx
 
 proc ceilAvx2*(image: Image) {.simd.} =
+  if image.format != pfRgbx:
+    image.ceil565()
+    return
   image.forEachSpan:
     let spanEnd = spanStart + spanLen
 
@@ -342,6 +355,8 @@ proc ceilAvx2*(image: Image) {.simd.} =
 
 proc minifyBy2Avx2*(image: Image, power = 1): Image {.simd.} =
   ## Scales the image down by an integer scale.
+  if image.format != pfRgbx:
+    return minifyBy2Avx2(image.toRgbxImage(), power)
   if power < 0:
     raise newException(PixieError, "Cannot minifyBy2 with negative power")
   if power == 0:

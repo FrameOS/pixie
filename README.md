@@ -49,6 +49,23 @@ are unfiltered in place, and multi-`IDAT` streams are inflated as segments
 rather than concatenated first. The fork depends on stock zippy again as a
 result.
 
+**A 16-bit canvas.** `newImage565(w, h)` (and `newImage565Over` for a
+buffer the caller owns) makes an `Image` whose pixels are packed RGB 5/6/5 —
+half the memory of RGBA, no alpha. It is a *presentation surface*: the final
+canvas that opaque geometry, text and decoded pictures are composited onto and
+that a display driver then reads. Every drawing operation works on one —
+fills, antialiased paths and text, `draw` with any blend mode, gradients,
+opacity, views, copies, the scaled and streamed decoders writing straight
+into it — and the result is what you would get by drawing onto RGBA and then
+quantising: bit-for-bit for a single layer over a representable backdrop, one
+5-bit step at most for layers over layers (`tests/test_rgb565.nim` is that
+oracle). What a 565 image refuses is being used *as an alpha mask*:
+`shadow`/`spread` raise, and the mask blend modes blacken rather than clear.
+`Image.format` says which kind you hold; RGBA images are untouched and
+remain the default everywhere — this exists for a 1200×1600 panel on a
+microcontroller with 8 MB of PSRAM, where a 7.3 MB RGBA canvas does not fit
+and a 3.7 MB one does.
+
 **Images that can borrow pixels.** `view(image, x, y, w, h)` is a window onto
 another image's memory rather than a copy, with `newImageFrom`,
 `toContiguousSeq`, the `forEachSpan` template and `items`/`pairs` iterators as

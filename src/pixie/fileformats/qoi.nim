@@ -266,13 +266,7 @@ proc encodeQoi*(image: Image): string {.raises: [PixieError].} =
   qoi.colorspace = Linear
   # Packed copy rather than a flat one: a view's rows are not adjacent, and
   # `image.data` is a pointer into a buffer that may be larger than the image.
-  qoi.data.setLen(image.width * image.height)
-  for y in 0 ..< image.height:
-    copyMem(
-      qoi.data[y * image.width].addr,
-      image.data[image.dataIndex(0, y)].addr,
-      image.width * 4
-    )
+  qoi.data = cast[seq[ColorRGBA]](image.toContiguousSeq())
   qoi.data.toStraightAlpha()
 
   encodeQoi(qoi)

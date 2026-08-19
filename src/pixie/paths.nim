@@ -1437,7 +1437,55 @@ proc clearUnsafe(image: Image, startX, startY, toX, toY: int) =
   let
     start = image.dataIndex(startX, startY)
     len = image.dataIndex(toX, toY) - start
-  fillUnsafe(image.data, rgbx(0, 0, 0, 0), start, len)
+  if image.format == pfRgb565:
+    fillUnsafe16(image.data16, 0, start, len)
+  else:
+    fillUnsafe(image.data, rgbx(0, 0, 0, 0), start, len)
+
+proc fillCoverage565(
+  image: Image,
+  rgbx: ColorRGBX,
+  startX, y: int,
+  coverages: seq[uint8],
+  blendMode: BlendMode
+) =
+  ## `fillCoverage` for a 565 destination. The source colour is scaled by the
+  ## antialiasing coverage exactly as for RGBX — coverage lives in the source
+  ## alpha, which is why AA survives a destination without one — and the
+  ## backdrop is expanded to 8 bits, blended, and packed again per pixel.
+  var idx = image.dataIndex(startX, y)
+  let data16 = image.data16
+  case blendMode:
+  of OverwriteBlend:
+    for i in 0 ..< coverages.len:
+      let coverage = coverages[i]
+      if coverage != 0:
+        data16[idx] = rgbxToRgb565(rgbx * coverage)
+      inc idx
+  of NormalBlend:
+    for i in 0 ..< coverages.len:
+      let coverage = coverages[i]
+      if coverage != 0:
+        data16[idx] = rgbxToRgb565(
+          blendNormal(rgb565ToRgbx(data16[idx]), rgbx * coverage))
+      inc idx
+  of MaskBlend:
+    for i in 0 ..< coverages.len:
+      let coverage = coverages[i]
+      if coverage != 255:
+        data16[idx] = rgbxToRgb565(
+          blendMask(rgb565ToRgbx(data16[idx]), rgbx * coverage))
+      inc idx
+    image.clearUnsafe(0, y, startX, y)
+    image.clearUnsafe(startX + coverages.len, y, image.width, y)
+  else:
+    let blender = blendMode.blender()
+    for i in 0 ..< coverages.len:
+      let coverage = coverages[i]
+      if coverage != 0:
+        data16[idx] = rgbxToRgb565(
+          blender(rgb565ToRgbx(data16[idx]), rgbx * coverage))
+      inc idx
 
 proc blendLineCoverageOverwrite(
   line: ptr UncheckedArray[ColorRGBX],
@@ -1483,6 +1531,10 @@ proc fillCoverage(
   coverages: seq[uint8],
   blendMode: BlendMode
 ) =
+  if image.format == pfRgb565:
+    image.fillCoverage565(rgbx, startX, y, coverages, blendMode)
+    return
+
   var
     x = startX
     dataIndex = image.dataIndex(x, y)
@@ -1537,6 +1589,61 @@ proc blendLineMask(
   for i in 0 ..< len:
     line[i] = blendMask(line[i], rgbx)
 
+proc fillHits565(
+  image: Image,
+  rgbx: ColorRGBX,
+  startX, y: int,
+  hits: seq[(Fixed32, int16)],
+  numHits: int,
+  windingRule: WindingRule,
+  blendMode: BlendMode,
+  maskClears: bool
+) =
+  ## `fillHits` for a 565 destination: the same span walk, with the solid
+  ## spans stored packed and the blended ones done per pixel at 8 bits.
+  let
+    data16 = image.data16
+    packed = rgbxToRgb565(rgbx)
+  case blendMode:
+  of OverwriteBlend:
+    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+      fillUnsafe16(data16, packed, image.dataIndex(start, y), len)
+
+  of NormalBlend:
+    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+      if rgbx.a == 255:
+        fillUnsafe16(data16, packed, image.dataIndex(start, y), len)
+      else:
+        var idx = image.dataIndex(start, y)
+        for _ in 0 ..< len:
+          data16[idx] = rgbxToRgb565(blendNormal(rgb565ToRgbx(data16[idx]), rgbx))
+          inc idx
+
+  of MaskBlend:
+    var filledTo = startX
+    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+      if maskClears:
+        let gapBetween = start - filledTo
+        if gapBetween > 0:
+          fillUnsafe16(data16, 0, image.dataIndex(filledTo, y), gapBetween)
+      if rgbx.a != 255:
+        var idx = image.dataIndex(start, y)
+        for _ in 0 ..< len:
+          data16[idx] = rgbxToRgb565(blendMask(rgb565ToRgbx(data16[idx]), rgbx))
+          inc idx
+      filledTo = start + len
+    if maskClears:
+      image.clearUnsafe(0, y, startX, y)
+      image.clearUnsafe(filledTo, y, image.width, y)
+
+  else:
+    let blender = blendMode.blender()
+    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+      var idx = image.dataIndex(start, y)
+      for _ in 0 ..< len:
+        data16[idx] = rgbxToRgb565(blender(rgb565ToRgbx(data16[idx]), rgbx))
+        inc idx
+
 proc fillHits(
   image: Image,
   rgbx: ColorRGBX,
@@ -1547,6 +1654,11 @@ proc fillHits(
   blendMode: BlendMode,
   maskClears = true
 ) =
+  if image.format == pfRgb565:
+    image.fillHits565(
+      rgbx, startX, y, hits, numHits, windingRule, blendMode, maskClears)
+    return
+
   case blendMode:
   of OverwriteBlend:
     for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
@@ -1657,7 +1769,10 @@ proc fillShapes(
           let
             start = image.dataIndex(0, y)
             len = image.dataIndex(0, y + partitionHeight) - start
-          fillUnsafe(image.data, rgbx, start, len)
+          if image.format == pfRgb565:
+            fillUnsafe16(image.data16, rgbxToRgb565(rgbx), start, len)
+          else:
+            fillUnsafe(image.data, rgbx, start, len)
         else:
           for r in 0 ..< partitionHeight:
             hits[0] = (cast[Fixed32](minX * 256), 1.int16)
@@ -1800,13 +1915,13 @@ proc fillShapes(
                       ((y + 1).float32 - prevPenY) * run
                   area = triangleArea + rectArea + rightRectArea
                   dataIndex = image.dataIndex(x, y)
-                  backdrop = image.data[dataIndex]
+                  backdrop = image.getPixel(dataIndex)
                   source =
                     when allowSimd and defined(amd64):
                       applyOpacity(vecRgbx, area)
                     else:
                       rgbx * area
-                image.data[dataIndex] = blender(backdrop, source)
+                image.setPixel(dataIndex, blender(backdrop, source))
 
             block: # Right-side partial coverage
               let
@@ -1838,13 +1953,13 @@ proc fillShapes(
                       ((y + 1).float32 - penY) * run
                   area = leftRectArea + triangleArea + rectArea
                   dataIndex = image.dataIndex(x, y)
-                  backdrop = image.data[dataIndex]
+                  backdrop = image.getPixel(dataIndex)
                   source =
                     when allowSimd and defined(amd64):
                       applyOpacity(vecRgbx, area)
                     else:
                       rgbx * area
-                image.data[dataIndex] = blender(backdrop, source)
+                image.setPixel(dataIndex, blender(backdrop, source))
 
             let
               fillBegin = leftCoverEnd.clamp(0, image.width)
