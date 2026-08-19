@@ -1,4 +1,4 @@
-import chroma, nimsimd/hassimd, nimsimd/neon, ../blends, ../common, vmath
+import chroma, nimsimd/hassimd, nimsimd/neon, ../blends, ../common, ../rgb565, vmath
 
 when defined(release):
   {.push checks: off.}
@@ -55,6 +55,8 @@ proc fillUnsafeNeon*(
     data[i] = rgbx
 
 proc isOneColorNeon*(image: Image): bool {.simd.} =
+  if image.format != pfRgbx:
+    return image.isOneColor565()
   # A view's pixels are not one flat run, and this answer is only ever used to
   # take a shortcut, so declining for views is safe: the caller falls back to
   # the general path.
@@ -100,6 +102,8 @@ proc isOneColorNeon*(image: Image): bool {.simd.} =
       return false
 
 proc isTransparentNeon*(image: Image): bool {.simd.} =
+  if image.format != pfRgbx:
+    return false
   # See isOneColorNeon: a false answer for a view is conservative, not wrong.
   if image.isView:
     return false
@@ -199,6 +203,9 @@ proc toPremultipliedAlphaNeon*(data: var seq[ColorRGBA | ColorRGBX]) {.simd.} =
       data[i] = c
 
 proc invertNeon*(image: Image) {.simd.} =
+  if image.format != pfRgbx:
+    image.invert565()
+    return
   image.forEachSpan:
     let spanEnd = spanStart + spanLen
 
@@ -247,6 +254,9 @@ proc invertNeon*(image: Image) {.simd.} =
         image.data[i] = rgbx
 
 proc applyOpacityNeon*(image: Image, opacity: float32) {.simd.} =
+  if image.format != pfRgbx:
+    image.applyOpacity565(round(255 * opacity).uint16)
+    return
   let opacity = round(255 * opacity).uint8
   if opacity == 255:
     return
@@ -286,6 +296,9 @@ proc applyOpacityNeon*(image: Image, opacity: float32) {.simd.} =
       image.data[i] = rgbx
 
 proc ceilNeon*(image: Image) {.simd.} =
+  if image.format != pfRgbx:
+    image.ceil565()
+    return
   image.forEachSpan:
     let spanEnd = spanStart + spanLen
 
@@ -315,6 +328,8 @@ proc ceilNeon*(image: Image) {.simd.} =
 
 proc minifyBy2Neon*(image: Image, power = 1): Image {.simd.} =
   ## Scales the image down by an integer scale.
+  if image.format != pfRgbx:
+    return minifyBy2Neon(image.toRgbxImage(), power)
   if power < 0:
     raise newException(PixieError, "Cannot minifyBy2 with negative power")
   if power == 0:
@@ -413,6 +428,8 @@ proc minifyBy2Neon*(image: Image, power = 1): Image {.simd.} =
 
 proc magnifyBy2Neon*(image: Image, power = 1): Image {.simd.} =
   ## Scales image up by 2 ^ power.
+  if image.format != pfRgbx:
+    return magnifyBy2Neon(image.toRgbxImage(), power)
   if power < 0:
     raise newException(PixieError, "Cannot magnifyBy2 with negative power")
 

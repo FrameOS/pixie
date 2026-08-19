@@ -120,7 +120,7 @@ proc fillGradientLinear(image: Image, paint: Paint) =
     var x: int
     while x < image.width:
       when allowSimd and (defined(amd64) or defined(arm64)):
-        if x + 4 <= image.width:
+        if x + 4 <= image.width and image.format == pfRgbx:
           var colors: array[4, ColorRGBX]
           for i in 0 ..< 4:
             let
@@ -155,16 +155,17 @@ proc fillGradientLinear(image: Image, paint: Paint) =
         rgbx = paint.gradientColor(t)
       var x: int
       when allowSimd:
-        when defined(amd64):
-          let colorVec = mm_set1_epi32(cast[int32](rgbx))
-          for _ in 0 ..< image.width div 4:
-            mm_storeu_si128(image.data[image.dataIndex(x, y)].addr, colorVec)
-            x += 4
-        elif defined(arm64):
-          let colorVec = vmovq_n_u32(cast[uint32](rgbx))
-          for _ in 0 ..< image.width div 4:
-            vst1q_u32(image.data[image.dataIndex(x, y)].addr, colorVec)
-            x += 4
+        if image.format == pfRgbx:
+          when defined(amd64):
+            let colorVec = mm_set1_epi32(cast[int32](rgbx))
+            for _ in 0 ..< image.width div 4:
+              mm_storeu_si128(image.data[image.dataIndex(x, y)].addr, colorVec)
+              x += 4
+          elif defined(arm64):
+            let colorVec = vmovq_n_u32(cast[uint32](rgbx))
+            for _ in 0 ..< image.width div 4:
+              vst1q_u32(image.data[image.dataIndex(x, y)].addr, colorVec)
+              x += 4
       for x in x ..< image.width:
         image.unsafe[x, y] = rgbx
 

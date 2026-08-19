@@ -65,6 +65,23 @@ proc fillUnsafe*(
     for i in start ..< start + len:
       data[i] = rgbx
 
+template getUncheckedArray16*(
+  image: Image, x, y: int
+): ptr UncheckedArray[uint16] =
+  cast[ptr UncheckedArray[uint16]](image.data16[image.dataIndex(x, y)].addr)
+
+proc fillUnsafe16*(
+  data: ptr UncheckedArray[uint16], packed: uint16, start, len: int
+) {.raises: [].} =
+  ## `fillUnsafe` for a 565 buffer: stores `packed` `len` times from `start`.
+  ## One memset when both bytes of the value agree (black, white, and the
+  ## greys that pack that way), a plain store loop otherwise.
+  if (packed and 0xFF) == (packed shr 8):
+    nimSetMem(data[start].addr, (packed and 0xFF).cint, len * 2)
+  else:
+    for i in start ..< start + len:
+      data[i] = packed
+
 const straightAlphaTable = block:
   var table: array[256, array[256, uint8]]
   for a in 0 ..< 256:
@@ -88,6 +105,8 @@ proc toStraightAlpha*(image: Image) {.raises: [].} =
   ## is one span, so this is the same single pass it always was. The seq
   ## overload below keeps the SIMD path for decoders that hold their pixels
   ## outside an Image.
+  if image.format == pfRgb565:
+    return # opaque: straight and premultiplied coincide
   image.forEachSpan:
     for i in spanStart ..< spanStart + spanLen:
       var c = image.data[i]
@@ -98,6 +117,8 @@ proc toStraightAlpha*(image: Image) {.raises: [].} =
 
 proc toPremultipliedAlpha*(image: Image) {.raises: [].} =
   ## Converts an image to premultiplied alpha from straight alpha, in place.
+  if image.format == pfRgb565:
+    return # opaque: straight and premultiplied coincide
   image.forEachSpan:
     for i in spanStart ..< spanStart + spanLen:
       var c = image.data[i]

@@ -1,4 +1,4 @@
-import chroma, nimsimd/hassimd, nimsimd/sse2, ../blends, ../common, vmath
+import chroma, nimsimd/hassimd, nimsimd/sse2, ../blends, ../common, ../rgb565, vmath
 
 when defined(release):
   {.push checks: off.}
@@ -74,6 +74,8 @@ proc fillUnsafeSse2*(
     data[i] = rgbx
 
 proc isOneColorSse2*(image: Image): bool {.simd.} =
+  if image.format != pfRgbx:
+    return image.isOneColor565()
   # A view's pixels are not one flat run, and this answer is only ever used to
   # take a shortcut, so declining for views is safe: the caller falls back to
   # the general path.
@@ -118,6 +120,8 @@ proc isOneColorSse2*(image: Image): bool {.simd.} =
       return false
 
 proc isTransparentSse2*(image: Image): bool {.simd.} =
+  if image.format != pfRgbx:
+    return false
   # See isOneColorSse2: a false answer for a view is conservative, not wrong.
   if image.isView:
     return false
@@ -236,6 +240,9 @@ proc toPremultipliedAlphaSse2*(data: var seq[ColorRGBA | ColorRGBX]) {.simd.} =
       data[i] = rgbx
 
 proc invertSse2*(image: Image) {.simd.} =
+  if image.format != pfRgbx:
+    image.invert565()
+    return
   image.forEachSpan:
     let spanEnd = spanStart + spanLen
 
@@ -287,6 +294,9 @@ proc invertSse2*(image: Image) {.simd.} =
         image.data[i] = rgbx
 
 proc applyOpacitySse2*(image: Image, opacity: float32) {.simd.} =
+  if image.format != pfRgbx:
+    image.applyOpacity565(round(255 * opacity).uint16)
+    return
   let opacity = round(255 * opacity).uint16
   if opacity == 255:
     return
@@ -345,6 +355,9 @@ proc applyOpacitySse2*(image: Image, opacity: float32) {.simd.} =
       image.data[i] = rgbx
 
 proc ceilSse2*(image: Image) {.simd.} =
+  if image.format != pfRgbx:
+    image.ceil565()
+    return
   image.forEachSpan:
     let spanEnd = spanStart + spanLen
 
@@ -389,6 +402,8 @@ proc ceilSse2*(image: Image) {.simd.} =
 
 proc minifyBy2Sse2*(image: Image, power = 1): Image {.simd.} =
   ## Scales the image down by an integer scale.
+  if image.format != pfRgbx:
+    return minifyBy2Sse2(image.toRgbxImage(), power)
   if power < 0:
     raise newException(PixieError, "Cannot minifyBy2 with negative power")
   if power == 0:
@@ -496,6 +511,8 @@ proc minifyBy2Sse2*(image: Image, power = 1): Image {.simd.} =
 
 proc magnifyBy2Sse2*(image: Image, power = 1): Image {.simd.} =
   ## Scales image up by 2 ^ power.
+  if image.format != pfRgbx:
+    return magnifyBy2Sse2(image.toRgbxImage(), power)
   if power < 0:
     raise newException(PixieError, "Cannot magnifyBy2 with negative power")
 
