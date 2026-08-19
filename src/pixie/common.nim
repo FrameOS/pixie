@@ -211,6 +211,19 @@ template setPixel*(image: Image, index: int, color: ColorRGBX) =
 template bytesPerPixel*(image: Image): int =
   (if image.format == pfRgbx: 4 else: 2)
 
+template bufferPointer*(image: Image): pointer =
+  ## The start of the pixel buffer this image addresses, whatever its format.
+  ## Two images share memory (one is a view of the other, or of the same
+  ## owner) exactly when this is equal — the identity question "does this
+  ## value alias my canvas?" asked in a way that is not fooled by one side
+  ## being RGBX and the other 565.
+  (if image.format == pfRgb565: cast[pointer](image.pixels16)
+   else: cast[pointer](image.pixels))
+
+template byteSize*(image: Image): int =
+  ## Bytes the image's own pixels occupy: width * height * bytesPerPixel.
+  image.width * image.height * image.bytesPerPixel
+
 template requireRgbx*(image: Image, what: string) =
   ## Guard for operations that are only defined on an RGBA image — the ones
   ## whose meaning is the alpha channel. Raising is the honest answer: a 565
