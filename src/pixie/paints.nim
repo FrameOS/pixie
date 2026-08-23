@@ -92,8 +92,10 @@ proc gradientColor(paint: Paint, t: float32): ColorRGBX =
   color.a *= paint.opacity
   color.rgbx()
 
-proc fillGradientLinear(image: Image, paint: Paint) =
-  ## Fills a linear gradient.
+proc fillGradientLinear(image: Image, paint: Paint, origin: Vec2) =
+  ## Fills a linear gradient. Pixel (x, y) of `image` takes the colour the
+  ## gradient has at `origin + (x, y)`, so a strip of a larger surface can be
+  ## filled with exactly the colours the whole surface would get.
 
   if paint.gradientHandlePositions.len != 2:
     raise newException(PixieError, "Linear gradient requires 2 handles")
@@ -124,7 +126,7 @@ proc fillGradientLinear(image: Image, paint: Paint) =
           var colors: array[4, ColorRGBX]
           for i in 0 ..< 4:
             let
-              xy = vec2((x + i).float32, 0.float32)
+              xy = vec2((x + i).float32 + origin.x, origin.y)
               t = toLineSpace(at, to, xy)
               rgbx = paint.gradientColor(t)
             colors[i] = rgbx
@@ -140,7 +142,7 @@ proc fillGradientLinear(image: Image, paint: Paint) =
           continue
 
       let
-        xy = vec2(x.float32, 0.float32)
+        xy = vec2(x.float32 + origin.x, origin.y)
         t = toLineSpace(at, to, xy)
         rgbx = paint.gradientColor(t)
       for y in 0 ..< image.height:
@@ -150,7 +152,7 @@ proc fillGradientLinear(image: Image, paint: Paint) =
   elif at.x == to.x: # Vertical gradient
     for y in 0 ..< image.height:
       let
-        xy = vec2(0.float32, y.float32)
+        xy = vec2(origin.x, y.float32 + origin.y)
         t = toLineSpace(at, to, xy)
         rgbx = paint.gradientColor(t)
       var x: int
@@ -173,11 +175,11 @@ proc fillGradientLinear(image: Image, paint: Paint) =
     for y in 0 ..< image.height:
       for x in 0 ..< image.width:
         let
-          xy = vec2(x.float32, y.float32)
+          xy = vec2(x.float32 + origin.x, y.float32 + origin.y)
           t = toLineSpace(at, to, xy)
         image.unsafe[x, y] = paint.gradientColor(t)
 
-proc fillGradientRadial(image: Image, paint: Paint) =
+proc fillGradientRadial(image: Image, paint: Paint, origin: Vec2) =
   ## Fills a radial gradient.
 
   if paint.gradientHandlePositions.len != 3:
@@ -205,11 +207,11 @@ proc fillGradientRadial(image: Image, paint: Paint) =
   for y in 0 ..< image.height:
     for x in 0 ..< image.width:
       let
-        xy = vec2(x.float32, y.float32)
+        xy = vec2(x.float32 + origin.x, y.float32 + origin.y)
         t = (mat * xy).length()
       image.unsafe[x, y] = paint.gradientColor(t)
 
-proc fillGradientAngular(image: Image, paint: Paint) =
+proc fillGradientAngular(image: Image, paint: Paint, origin: Vec2) =
   ## Fills an angular gradient.
 
   if paint.gradientHandlePositions.len != 3:
@@ -231,19 +233,24 @@ proc fillGradientAngular(image: Image, paint: Paint) =
   for y in 0 ..< image.height:
     for x in 0 ..< image.width:
       let
-        xy = vec2(x.float32, y.float32)
+        xy = vec2(x.float32 + origin.x, y.float32 + origin.y)
         angle = normalize(xy - center).angle()
         t = (angle + gradientAngle + f32PI / 2).fixAngle() / 2 / f32PI + 0.5.float32
       image.unsafe[x, y] = paint.gradientColor(t)
 
-proc fillGradient*(image: Image, paint: Paint) {.raises: [PixieError].} =
-  ## Fills with the Paint gradient.
+proc fillGradient*(
+  image: Image, paint: Paint, origin = vec2(0, 0)
+) {.raises: [PixieError].} =
+  ## Fills with the Paint gradient. `origin` is where the image's top-left
+  ## pixel sits in the gradient's coordinate space: filling a strip at
+  ## `origin = (0, y)` lands exactly the colours rows y.. of a whole-surface
+  ## fill would, which is what lets `fillPath` paint in strips.
   case paint.kind:
   of LinearGradientPaint:
-    image.fillGradientLinear(paint)
+    image.fillGradientLinear(paint, origin)
   of RadialGradientPaint:
-    image.fillGradientRadial(paint)
+    image.fillGradientRadial(paint, origin)
   of AngularGradientPaint:
-    image.fillGradientAngular(paint)
+    image.fillGradientAngular(paint, origin)
   else:
     raise newException(PixieError, "Paint must be a gradient")

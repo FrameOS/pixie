@@ -1,5 +1,5 @@
-import blends, bumpy, chroma, common, images, internal, paints, simd, std/fenv,
-    std/strutils, vmath
+import blends, bumpy, chroma, common, decodebudget, images, internal, paints,
+    simd, std/fenv, std/strutils, vmath
 
 type
   WindingRule* = enum
@@ -2205,6 +2205,91 @@ proc parseSomePath(
   elif type(path) is Path:
     path.commandsToShapes(closeSubpaths, pixelScale)
 
+const paintStripMinRows = 4
+
+proc paintStripRows*(width, height: int): int {.raises: [].} =
+  ## Rows per strip when a path is filled with a paint server (gradient or
+  ## image paint). Such a fill goes through a coverage mask and a paint image
+  ## the size of the strip, and pixie used to size both to the whole target:
+  ## on a 1200x960 canvas that pair is 9.2 MB, which no ESP32 has spare. The
+  ## pair may take half the decode budget and each image must fit the
+  ## contiguous budget; with both unlimited (the host default) the strip is
+  ## the whole image and nothing changes.
+  if width <= 0 or height <= 0:
+    return max(1, height)
+  let rowBytes = width.int64 * 4
+  var rows = height.int64
+  let budget = decodeBudgetBytes()
+  if budget > 0:
+    rows = min(rows, budget.int64 div (4 * rowBytes))
+  let contiguous = decodeContiguousBudgetBytes()
+  if contiguous > 0:
+    rows = min(rows, contiguous.int64 div rowBytes)
+  max(min(height.int64, paintStripMinRows.int64), rows).int
+
+template paintThroughMask(
+  image: Image, paint: Paint, transform: Mat3, rasterise: untyped
+) =
+  ## The paint-server half of fillPath and strokePath: rasterise the shape
+  ## as a coverage mask, paint the gradient or image, multiply, composite.
+  ## `rasterise` draws the shape into `mask` under `stripTransform`, both
+  ## injected.
+  ##
+  ## Done in horizontal strips of `paintStripRows` so the mask and paint
+  ## images are strip-sized. Each strip re-rasterises the shape with the
+  ## geometry moved up by the strip's integer row offset, so the mask holds
+  ## the same scanlines the whole-image render would (a translation by a
+  ## whole number of pixels moves coverage, not its shape — only float32
+  ## rounding of the moved coordinates can nudge an antialiased edge sample).
+  ## The paint is evaluated at the strip's true coordinates, so gradient
+  ## colours are identical. One strip covering everything is the original
+  ## algorithm, untouched.
+  let
+    stripRows = paintStripRows(image.width, image.height)
+    savedOpacity = paint.opacity
+  var stripY = 0
+  while stripY < image.height:
+    let
+      stripHeight = min(stripRows, image.height - stripY)
+      wholeImage = stripHeight == image.height
+      stripOffset = vec2(0, -stripY.float32)
+      stripTransform {.inject.} =
+        if wholeImage: transform else: translate(stripOffset) * transform
+      mask {.inject.} = newImage(image.width, stripHeight)
+      fill = newImage(image.width, stripHeight)
+
+    rasterise
+
+    # Draw the image (maybe tiled) or gradients. Do this with opaque paint and
+    # and then apply the paint's opacity to the mask.
+    paint.opacity = 1
+
+    case paint.kind:
+      of SolidPaint:
+        discard # Handled by the caller
+      of ImagePaint:
+        fill.draw(paint.image,
+          if wholeImage: paint.imageMat else: translate(stripOffset) * paint.imageMat)
+      of TiledImagePaint:
+        fill.drawTiled(paint.image,
+          if wholeImage: paint.imageMat else: translate(stripOffset) * paint.imageMat)
+      of LinearGradientPaint, RadialGradientPaint, AngularGradientPaint:
+        fill.fillGradient(paint, -stripOffset)
+
+    paint.opacity = savedOpacity
+
+    if paint.opacity != 1:
+      mask.applyOpacity(paint.opacity)
+
+    fill.draw(mask, blendMode = MaskBlend)
+    if wholeImage:
+      image.draw(fill, blendMode = paint.blendMode)
+    else:
+      image.view(0, stripY, image.width, stripHeight).draw(
+        fill, blendMode = paint.blendMode)
+
+    stripY += stripHeight
+
 proc fillPath*(
   image: Image,
   path: SomePath,
@@ -2227,34 +2312,8 @@ proc fillPath*(
       image.fillShapes(shapes, color, windingRule, paint.blendMode)
     return
 
-  let
-    mask = newImage(image.width, image.height)
-    fill = newImage(image.width, image.height)
-
-  mask.fillPath(path, color(1, 1, 1, 1), transform, windingRule)
-
-  # Draw the image (maybe tiled) or gradients. Do this with opaque paint and
-  # and then apply the paint's opacity to the mask.
-  let savedOpacity = paint.opacity
-  paint.opacity = 1
-
-  case paint.kind:
-    of SolidPaint:
-      discard # Handled above
-    of ImagePaint:
-      fill.draw(paint.image, paint.imageMat)
-    of TiledImagePaint:
-      fill.drawTiled(paint.image, paint.imageMat)
-    of LinearGradientPaint, RadialGradientPaint, AngularGradientPaint:
-      fill.fillGradient(paint)
-
-  paint.opacity = savedOpacity
-
-  if paint.opacity != 1:
-    mask.applyOpacity(paint.opacity)
-
-  fill.draw(mask, blendMode = MaskBlend)
-  image.draw(fill, blendMode = paint.blendMode)
+  image.paintThroughMask(paint, transform):
+    mask.fillPath(path, color(1, 1, 1, 1), stripTransform, windingRule)
 
 proc strokePath*(
   image: Image,
@@ -2290,43 +2349,17 @@ proc strokePath*(
       image.fillShapes(strokeShapes, color, NonZero, paint.blendMode)
     return
 
-  let
-    mask = newImage(image.width, image.height)
-    fill = newImage(image.width, image.height)
-
-  mask.strokePath(
-    path,
-    color(1, 1, 1, 1),
-    transform,
-    strokeWidth,
-    lineCap,
-    lineJoin,
-    miterLimit,
-    dashes
-  )
-
-  # Draw the image (maybe tiled) or gradients. Do this with opaque paint and
-  # and then apply the paint's opacity to the mask.
-  let savedOpacity = paint.opacity
-  paint.opacity = 1
-
-  case paint.kind:
-    of SolidPaint:
-      discard # Handled above
-    of ImagePaint:
-      fill.draw(paint.image, paint.imageMat)
-    of TiledImagePaint:
-      fill.drawTiled(paint.image, paint.imageMat)
-    of LinearGradientPaint, RadialGradientPaint, AngularGradientPaint:
-      fill.fillGradient(paint)
-
-  paint.opacity = savedOpacity
-
-  if paint.opacity != 1:
-    mask.applyOpacity(paint.opacity)
-
-  fill.draw(mask, blendMode = MaskBlend)
-  image.draw(fill, blendMode = paint.blendMode)
+  image.paintThroughMask(paint, transform):
+    mask.strokePath(
+      path,
+      color(1, 1, 1, 1),
+      stripTransform,
+      strokeWidth,
+      lineCap,
+      lineJoin,
+      miterLimit,
+      dashes
+    )
 
 proc overlaps(
   shapes: seq[Polygon],
