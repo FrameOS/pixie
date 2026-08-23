@@ -94,6 +94,10 @@ type
     stride*: int  ## elements between vertically adjacent pixels
     origin*: int  ## index of (0, 0) within the shared buffer
     format*: PixelFormat ## how `pixels` / `pixels16` are laid out
+    ditherStores*: bool ## 565 only: offset each store by a per-pixel
+                        ## fraction of one step before rounding, so smooth
+                        ## gradients survive quantisation for a later
+                        ## error-diffusion pass. See rgbxToRgb565Dithered.
     storage: seq[ColorRGBX] ## owned pixels; empty for a view or a 565 image
     storage16: seq[uint16]  ## owned 565 pixels; empty for a view, an RGBX
                             ## image, or a 565 image over a borrowed buffer
@@ -201,10 +205,58 @@ template getPixel*(image: Image, index: int): ColorRGBX =
   (if image.format == pfRgbx: image.pixels[index]
    else: rgb565ToRgbx(image.pixels16[index]))
 
+proc rgbxToRgb565Dithered*(c: ColorRGBX, index: int): uint16 {.inline, raises: [].} =
+  ## `rgbxToRgb565` with a per-pixel rounding offset chosen by the pixel
+  ## index, for canvases that will be error-diffused afterwards.
+  ##
+  ## Rounding every pixel to the nearest 5/6-bit level turns a smooth
+  ## gradient into plateaus — a 480-row sky holds 11 blue levels instead of
+  ## 90 — and a Floyd–Steinberg pass over plateaus settles into one uniform
+  ## texture per plateau, so the plateau edges show on the panel as lines.
+  ## Offsetting each pixel by a position-dependent fraction of one 565 step
+  ## before rounding keeps the local mean of the stored colour equal to the
+  ## true colour; the diffusion pass then sees a gradient again.
+  ##
+  ## Idempotence is kept the way the plain pack keeps it: a channel that is
+  ## already an exact 565 representative (what `rgb565ToRgbx` expands to)
+  ## is stored without any offset, so a read-modify-write that changes
+  ## nothing still changes nothing, and a blend can be repeated over the
+  ## canvas without the stored colour drifting.
+  # A multiplicative hash of the index, not a Bayer cell: the store only
+  # knows the flat index, and any pattern keyed on it alone lines up row
+  # over row whenever the width is a multiple of the pattern's period (800
+  # and 1200 both are), which prints vertical stripes. Sixteen hash buckets
+  # give offsets of -8..+7 eight-bit units (one 5-bit step is 8.2, one
+  # 6-bit step 4.05, so the 6-bit offset is halved); the mean offset is
+  # -0.5, well inside a step.
+  let
+    cell = (index.uint32 * 0x9E3779B1'u32) shr 28
+    off5 = cell.int - 8
+    off6 = (cell.int - 8) div 2
+  template pack5(v: uint8, off: int): uint32 =
+    let exact = ((v.uint32 * 249 + 1014) shr 11)
+    if ((exact shl 3) or (exact shr 2)) == v.uint32: exact
+    else:
+      let d = clamp(v.int + off, 0, 255).uint32
+      (d * 249 + 1014) shr 11
+  template pack6(v: uint8, off: int): uint32 =
+    let exact = ((v.uint32 * 253 + 505) shr 10)
+    if ((exact shl 2) or (exact shr 4)) == v.uint32: exact
+    else:
+      let d = clamp(v.int + off, 0, 255).uint32
+      (d * 253 + 505) shr 10
+  let
+    r = pack5(c.r, off5)
+    g = pack6(c.g, off6)
+    b = pack5(c.b, off5)
+  uint16((r shl 11) or (g shl 5) or b)
+
 template setPixel*(image: Image, index: int, color: ColorRGBX) =
   ## Stores a premultiplied pixel at a `dataIndex`, whatever the storage format.
   if image.format == pfRgbx:
     image.pixels[index] = color
+  elif image.ditherStores:
+    image.pixels16[index] = rgbxToRgb565Dithered(color, index)
   else:
     image.pixels16[index] = rgbxToRgb565(color)
 
@@ -591,6 +643,7 @@ proc view*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
   result.stride = image.stride
   result.origin = image.dataIndex(x, y)
   result.format = image.format
+  result.ditherStores = image.ditherStores
   result.root = if image.root.isNil: image else: image.root
   result.pixels = image.pixels
   result.pixels16 = image.pixels16
