@@ -2072,6 +2072,10 @@ proc parsePairPos(buf: string, offset: int): PairPos =
                 inc ci
           else:
             discard
+      # The pair sets were only read to build glyphPairAdjustments; the
+      # lookup never touches them again.
+      result.pairSets = @[]
+      result.pairSetOffsets = @[]
     of 2: # Class pairs
       buf.eofCheck(i + 14)
 
@@ -2140,6 +2144,15 @@ proc parsePairPos(buf: string, offset: int): PairPos =
             if class2Record.valueRecord1.xAdvance != 0:
               result.classPairAdjustments[(class1.uint16, class2.uint16)] =
                 class2Record.valueRecord1.xAdvance
+      # class1Count x class2Count records of two ValueRecords each is the
+      # bulk of a parsed typeface (Ubuntu-Regular: 1.6 MB of its 2 MB), and
+      # everything the kerning lookup needs from them now lives in the three
+      # tables above. Drop the raw matrix and the class definitions it was
+      # read with; on a 16 MB microcontroller a typeface cached for the life
+      # of the process must not cost a fifth of the free heap.
+      result.class1Records = @[]
+      result.classDef1 = ClassDef()
+      result.classDef2 = ClassDef()
     else:
       failUnsupported("pair pos format")
 

@@ -79,6 +79,9 @@ type
     bandIndex: int          ## which band bandPixels holds; -1 = none
     nextSourceY: int        ## first source row the drain has not folded yet
     colCount: seq[uint16]   ## source columns per target column (X box)
+    winX0, winX1: int       ## sampled source-column window at this
+                            ## component's resolution ([winX0, winX1))
+    winY0, winY1: int       ## sampled source-row window
     horizSums: seq[uint32]  ## one source row folded to target width
     rowSums: seq[uint32]    ## vertical accumulator for the target row in flight
     rowSumsTy: int          ## which target row rowSums is accumulating
@@ -124,6 +127,11 @@ type
       ## (the fitted resolution, after any budget clamp). fillImage maps
       ## target pixels straight into this grid — one floor mapping, no round
       ## trip through image coordinates.
+    winOX, winOY, winOW, winOH: int
+      ## The oriented source rectangle that grid samples — the whole source
+      ## except for fitCover, where it is the crop: sampling what the fill
+      ## will discard would only buy larger channel masks (a 3:2 photo
+      ## covered onto a 3:4 panel paid double before this window existed).
     plannedDecodeBytes: int64 ## what the SOF plan check accounted for, so the
                               ## build step can budget its output image on top
 
@@ -136,6 +144,45 @@ type
 
 when defined(release):
   {.push checks: off.}
+
+template failInvalid(reason = "unable to load") =
+  ## Throw exception with a reason.
+  raise newException(PixieError, "Invalid JPEG, " & reason)
+
+proc orientedDimensions(state: DecoderState): tuple[width, height: int] =
+  case state.orientation:
+  of 0, 1, 2, 3, 4:
+    (state.imageWidth, state.imageHeight)
+  of 5, 6, 7, 8:
+    (state.imageHeight, state.imageWidth)
+  else:
+    failInvalid("invalid orientation")
+
+proc sourceCoords(
+  state: DecoderState, orientedX, orientedY, width, height: int
+): tuple[x, y: int] =
+  ## Maps oriented coordinates back to storage order, in whatever grid the
+  ## caller is addressing — the image itself, or a scaled decode's sample
+  ## grid (`width`/`height` are that grid's storage-order dimensions).
+  case state.orientation:
+  of 0, 1:
+    (orientedX, orientedY)
+  of 2:
+    (width - orientedX - 1, orientedY)
+  of 3:
+    (width - orientedX - 1, height - orientedY - 1)
+  of 4:
+    (orientedX, height - orientedY - 1)
+  of 5:
+    (orientedY, orientedX)
+  of 6:
+    (orientedY, height - orientedX - 1)
+  of 7:
+    (width - orientedY - 1, height - orientedX - 1)
+  of 8:
+    (width - orientedY - 1, orientedX)
+  else:
+    failInvalid("invalid orientation")
 
 proc newMask(width, height: int): Mask {.raises: [PixieError].} =
   ## Creates a new mask with the parameter dimensions.
@@ -166,10 +213,6 @@ template `[]=`(view: UnsafeMask, x, y: int, color: uint8) =
   ## Make sure that x, y are in bounds.
   ## Failure in the assumptions will case unsafe memory writes.
   cast[Mask](view).data[cast[Mask](view).dataIndex(x, y)] = color
-
-template failInvalid(reason = "unable to load") =
-  ## Throw exception with a reason.
-  raise newException(PixieError, "Invalid JPEG, " & reason)
 
 proc scaledCeil(value, scale, divisor: int): int {.inline.} =
   ((value.int64 * scale.int64 + divisor.int64 - 1) div divisor.int64).int
@@ -516,6 +559,7 @@ proc decodeSOF0(state: var DecoderState) =
   var
     totalBlockBytes: int64
     totalMaskBytes: int64
+    largestSingleBytes: int64
 
   for component in state.components.mitems:
     state.maxXScale = max(state.maxXScale, component.xScale)
@@ -531,27 +575,41 @@ proc decodeSOF0(state: var DecoderState) =
   var
     effectiveTargetWidth = state.scaledTargetWidth
     effectiveTargetHeight = state.scaledTargetHeight
+  # The sampled window: which oriented source rectangle the channels will
+  # hold. Everything except a cover crop samples the whole source.
+  block:
+    let oriented = state.orientedDimensions()
+    state.winOX = 0
+    state.winOY = 0
+    state.winOW = oriented.width
+    state.winOH = oriented.height
   if state.useScaledChannels():
     if state.scaledFit == fitCover:
-      # Cover crops the source to the target aspect; inflate the sampling
-      # resolution so the cropped region still gets target-density masks.
-      let
-        orientedWidth =
-          if state.orientation in {5, 6, 7, 8}: state.imageHeight
-          else: state.imageWidth
-        orientedHeight =
-          if state.orientation in {5, 6, 7, 8}: state.imageWidth
-          else: state.imageHeight
-      if orientedWidth.int64 * effectiveTargetHeight.int64 >
-          effectiveTargetWidth.int64 * orientedHeight.int64:
-        # Source is wider: the crop discards width, so sample more of it.
-        effectiveTargetWidth = min(orientedWidth, max(1, (
-          effectiveTargetHeight.int64 * orientedWidth.int64 div
-          max(1'i64, orientedHeight.int64)).int))
+      # Cover discards everything outside the crop, so sample only the crop
+      # (same integer math as scaledFitRects, which must land on the same
+      # rectangle at fill time). Sampling the whole source at crop density
+      # doubled the luma mask for a 3:2 photo covered onto a 3:4 panel — a
+      # 6000x4000 into 1200x1600 planned a 2400x1600 (3.7 MB) luma channel
+      # where the crop needs 1200x1600 (1.9 MB).
+      let oriented = state.orientedDimensions()
+      if oriented.width.int64 * effectiveTargetHeight.int64 >
+          effectiveTargetWidth.int64 * oriented.height.int64:
+        let cropW = max(1, (
+          oriented.height.int64 * effectiveTargetWidth.int64 div
+          max(1'i64, effectiveTargetHeight.int64)).int)
+        state.winOX = (oriented.width - cropW) div 2
+        state.winOW = cropW
       else:
-        effectiveTargetHeight = min(orientedHeight, max(1, (
-          effectiveTargetWidth.int64 * orientedHeight.int64 div
-          max(1'i64, orientedWidth.int64)).int))
+        let cropH = max(1, (
+          oriented.width.int64 * effectiveTargetHeight.int64 div
+          max(1'i64, effectiveTargetWidth.int64)).int)
+        state.winOY = (oriented.height - cropH) div 2
+        state.winOH = cropH
+      # A grid denser than the window's own pixels buys nothing (the fill
+      # upscales nearest either way) and costs mask memory; the old
+      # full-source grid had the same cap through its oriented-dims min.
+      effectiveTargetWidth = min(effectiveTargetWidth, state.winOW)
+      effectiveTargetHeight = min(effectiveTargetHeight, state.winOH)
 
     # Clamp the sampling resolution to what the memory budget allows,
     # trading sharpness for a decode that succeeds.
@@ -570,6 +628,19 @@ proc decodeSOF0(state: var DecoderState) =
       let maskBudget = budget.int64 - blockTotal
       if maskBudget > 0 and maskTotal > maskBudget:
         let factor = sqrt(maskBudget.float64 / maskTotal.float64)
+        effectiveTargetWidth = max(64,
+          (effectiveTargetWidth.float64 * factor).int)
+        effectiveTargetHeight = max(64,
+          (effectiveTargetHeight.float64 * factor).int)
+    # The same clamp against the largest single buffer: the full-resolution
+    # channel (luma, or every channel of an unsubsampled image) is one
+    # allocation of effectiveWidth x effectiveHeight bytes, and a plan that
+    # fits the heap in total still dies when no free block is that big.
+    let contiguous = decodeContiguousBudgetBytes()
+    if contiguous > 0:
+      let largestMask = effectiveTargetWidth.int64 * effectiveTargetHeight.int64
+      if largestMask > contiguous.int64:
+        let factor = sqrt(contiguous.float64 / largestMask.float64)
         effectiveTargetWidth = max(64,
           (effectiveTargetWidth.float64 * factor).int)
         effectiveTargetHeight = max(64,
@@ -625,11 +696,38 @@ proc decodeSOF0(state: var DecoderState) =
       component.nextSourceY = 0
       component.rowSumsTy = -1
       component.rowSumsRows = 0
-      if component.sampleWidth <= component.width:
+      # The sampled window at this component's resolution: the oriented
+      # window mapped back to storage order (its two corners through
+      # sourceCoords — exact for every flip and transpose), then scaled by
+      # the component's subsampling. Ceil on the far edge so a chroma
+      # window never loses the last half-pixel of the crop.
+      block:
+        let
+          (ax, ay) = state.sourceCoords(
+            state.winOX, state.winOY, state.imageWidth, state.imageHeight)
+          (bx, by) = state.sourceCoords(
+            state.winOX + state.winOW - 1, state.winOY + state.winOH - 1,
+            state.imageWidth, state.imageHeight)
+          x0 = min(ax, bx)
+          x1 = max(ax, bx) + 1
+          y0 = min(ay, by)
+          y1 = max(ay, by) + 1
+        component.winX0 = clamp(
+          (x0 * component.yScale) div state.maxYScale, 0, component.width - 1)
+        component.winX1 = clamp(
+          (x1 * component.yScale + state.maxYScale - 1) div state.maxYScale,
+          component.winX0 + 1, component.width)
+        component.winY0 = clamp(
+          (y0 * component.xScale) div state.maxXScale, 0, component.height - 1)
+        component.winY1 = clamp(
+          (y1 * component.xScale + state.maxXScale - 1) div state.maxXScale,
+          component.winY0 + 1, component.height)
+      let winW = component.winX1 - component.winX0
+      if component.sampleWidth <= winW:
         component.colCount = newSeq[uint16](component.sampleWidth)
-        for sx in 0 ..< component.width:
+        for sx in 0 ..< winW:
           inc component.colCount[
-            (sx.int64 * component.sampleWidth.int64).int div component.width]
+            (sx.int64 * component.sampleWidth.int64).int div winW]
 
     block:
       let
@@ -662,6 +760,15 @@ proc decodeSOF0(state: var DecoderState) =
               fullBytes + fullBytes div 2
       totalBlockBytes += blockBytes
       totalMaskBytes += maskBytes
+      # The channel mask is one allocation; on the reconstruction path the
+      # magnified full-stride plane is the biggest one instead.
+      let largestBuffer =
+        if state.useScaledChannels():
+          channelWidth.int64 * channelHeight.int64
+        else:
+          (state.numMcuWide * state.maxYScale * 8).int64 *
+            (state.numMcuHigh * state.maxXScale * 8).int64
+      largestSingleBytes = max(largestSingleBytes, largestBuffer)
 
     component.channelWidth = channelWidth
     component.channelHeight = channelHeight
@@ -677,6 +784,14 @@ proc decodeSOF0(state: var DecoderState) =
   # image-sized allocation happens, so oversized inputs fail with a
   # catchable error instead of exhausting memory.
   state.plannedDecodeBytes = totalBlockBytes + totalMaskBytes
+  if overContiguousBudget(largestSingleBytes):
+    failInvalid(
+      "JPEG decode of " & $state.imageWidth & "x" & $state.imageHeight &
+      (if state.progressive: " (progressive)" else: "") &
+      " needs one " & $(largestSingleBytes div 1024) &
+      "K buffer, over the " & $(decodeContiguousBudgetBytes() div 1024) &
+      "K contiguous memory budget"
+    )
   if overDecodeBudget(state.plannedDecodeBytes):
     failInvalid(
       "JPEG decode of " & $state.imageWidth & "x" & $state.imageHeight &
@@ -1342,43 +1457,48 @@ proc writeScaledTargetRow(component: var Component, ty: int) =
   component.rowSumsTy = -1
 
 proc foldScaledSourceRow(component: var Component, sy, rowStart: int) =
-  ## Folds one full-width source row from the band into the target grid:
-  ## X first (box average on downscale, nearest gather on upscale), then Y
-  ## (box accumulate on downscale, replicate on upscale).
+  ## Folds the sampled-window span of one source row from the band into the
+  ## target grid: X first (box average on downscale, nearest gather on
+  ## upscale), then Y (box accumulate on downscale, replicate on upscale).
+  ## `sy` is inside [winY0, winY1) — the drain skips rows the window
+  ## excludes — and all mappings are window-relative, which reduces to the
+  ## old full-source arithmetic when the window is the whole component.
   let
-    width = component.width
-    height = component.height
+    winX0 = component.winX0
+    winW = component.winX1 - winX0
+    winH = component.winY1 - component.winY0
+    wy = sy - component.winY0
     sampleWidth = component.sampleWidth
     sampleHeight = component.sampleHeight
 
   if component.colCount.len > 0:
     for tx in 0 ..< sampleWidth:
       component.horizSums[tx] = 0
-    for sx in 0 ..< width:
-      component.horizSums[(sx.int64 * sampleWidth.int64).int div width] +=
-        component.bandPixels[rowStart + sx]
+    for wx in 0 ..< winW:
+      component.horizSums[(wx.int64 * sampleWidth.int64).int div winW] +=
+        component.bandPixels[rowStart + winX0 + wx]
   else:
     for tx in 0 ..< sampleWidth:
       component.horizSums[tx] =
-        component.bandPixels[rowStart + (tx * width) div sampleWidth]
+        component.bandPixels[rowStart + winX0 + (tx * winW) div sampleWidth]
 
-  if sampleHeight <= height:
+  if sampleHeight <= winH:
     # Box: this source row belongs to exactly one target row; footprints
-    # tile the source, so partial sums never overlap.
-    let ty = (sy.int64 * sampleHeight.int64).int div height
+    # tile the window, so partial sums never overlap.
+    let ty = (wy.int64 * sampleHeight.int64).int div winH
     component.rowSumsTy = ty
     for tx in 0 ..< sampleWidth:
       component.rowSums[tx] += component.horizSums[tx]
     inc component.rowSumsRows
-    if sy == height - 1 or
-        (int64(sy + 1) * sampleHeight.int64).int div height != ty:
+    if wy == winH - 1 or
+        (int64(wy + 1) * sampleHeight.int64).int div winH != ty:
       component.writeScaledTargetRow(ty)
   else:
     # Upscale: every target row sampling this source row gets it now, which
     # is the same nearest replication the sampler always did.
     let
-      tyLo = scaledCeil(sy, sampleHeight, height)
-      tyHi = min(sampleHeight, scaledCeil(sy + 1, sampleHeight, height))
+      tyLo = scaledCeil(wy, sampleHeight, winH)
+      tyHi = min(sampleHeight, scaledCeil(wy + 1, sampleHeight, winH))
     for ty in tyLo ..< tyHi:
       let outPos = ty * component.channel.width
       if component.colCount.len > 0:
@@ -1391,14 +1511,16 @@ proc foldScaledSourceRow(component: var Component, sy, rowStart: int) =
           component.channel.data[outPos + tx] = component.horizSums[tx].uint8
 
 proc drainScaledBand(component: var Component) =
-  ## Folds every not-yet-folded source row of the current band.
+  ## Folds every not-yet-folded source row of the current band that the
+  ## sampled window includes.
   if component.bandIndex < 0:
     return
   let
     bandY0 = component.bandIndex * component.bandRows
     bandY1 = min(component.height, bandY0 + component.bandRows)
   for sy in max(bandY0, component.nextSourceY) ..< bandY1:
-    component.foldScaledSourceRow(sy, (sy - bandY0) * component.width)
+    if sy >= component.winY0 and sy < component.winY1:
+      component.foldScaledSourceRow(sy, (sy - bandY0) * component.width)
     component.nextSourceY = sy + 1
   component.bandIndex = -1
 
@@ -1660,41 +1782,6 @@ proc grayScaleToRgbx(gray: uint8): ColorRGBX {.inline.} =
   ## Takes a single gray scale component output and populates image.
   rgbx(gray, gray, gray, 255)
 
-proc orientedDimensions(state: DecoderState): tuple[width, height: int] =
-  case state.orientation:
-  of 0, 1, 2, 3, 4:
-    (state.imageWidth, state.imageHeight)
-  of 5, 6, 7, 8:
-    (state.imageHeight, state.imageWidth)
-  else:
-    failInvalid("invalid orientation")
-
-proc sourceCoords(
-  state: DecoderState, orientedX, orientedY, width, height: int
-): tuple[x, y: int] =
-  ## Maps oriented coordinates back to storage order, in whatever grid the
-  ## caller is addressing — the image itself, or a scaled decode's sample
-  ## grid (`width`/`height` are that grid's storage-order dimensions).
-  case state.orientation:
-  of 0, 1:
-    (orientedX, orientedY)
-  of 2:
-    (width - orientedX - 1, orientedY)
-  of 3:
-    (width - orientedX - 1, height - orientedY - 1)
-  of 4:
-    (orientedX, height - orientedY - 1)
-  of 5:
-    (orientedY, orientedX)
-  of 6:
-    (orientedY, height - orientedX - 1)
-  of 7:
-    (width - orientedY - 1, height - orientedX - 1)
-  of 8:
-    (width - orientedY - 1, orientedX)
-  else:
-    failInvalid("invalid orientation")
-
 proc channelAxis(
   gridCoord, gridSize, sampleSize, nativeSize: int
 ): tuple[lo, hi, frac, den: int] {.inline.} =
@@ -1806,17 +1893,22 @@ proc fillImage(state: var DecoderState, result: Image) =
       if state.orientation in {5, 6, 7, 8}: effHeight else: effWidth
     gridHeight =
       if state.orientation in {5, 6, 7, 8}: effWidth else: effHeight
-    # The image-space crop, mapped onto the (oriented) sample grid. Rounded,
-    # so a cover-inflated grid built to give the crop target density comes
-    # back as exactly one grid pixel per target pixel when it can.
-    sampleSrcX = (rects.srcX.int64 * effWidth.int64 +
-      oriented.width div 2) div oriented.width
-    sampleSrcY = (rects.srcY.int64 * effHeight.int64 +
-      oriented.height div 2) div oriented.height
+    # The image-space crop, mapped onto the (oriented) sample grid. The
+    # grid covers the sampled window, not always the whole source — for
+    # cover it IS the crop (same integer math in the SOF window and in
+    # scaledFitRects), so this comes back as (0, 0, effWidth, effHeight)
+    # and one grid pixel per target pixel when densities match. Rounded,
+    # and window-relative; a full-source window reduces to the old math.
+    winOW = max(1, state.winOW)
+    winOH = max(1, state.winOH)
+    sampleSrcX = ((rects.srcX - state.winOX).int64 * effWidth.int64 +
+      winOW div 2) div winOW
+    sampleSrcY = ((rects.srcY - state.winOY).int64 * effHeight.int64 +
+      winOH div 2) div winOH
     sampleSrcW = max(1'i64, (rects.srcW.int64 * effWidth.int64 +
-      oriented.width div 2) div oriented.width)
+      winOW div 2) div winOW)
     sampleSrcH = max(1'i64, (rects.srcH.int64 * effHeight.int64 +
-      oriented.height div 2) div oriented.height)
+      winOH div 2) div winOH)
 
   template orientedYFor(y: int): int =
     min(
