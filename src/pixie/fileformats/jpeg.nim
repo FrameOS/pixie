@@ -516,6 +516,7 @@ proc decodeSOF0(state: var DecoderState) =
   var
     totalBlockBytes: int64
     totalMaskBytes: int64
+    largestSingleBytes: int64
 
   for component in state.components.mitems:
     state.maxXScale = max(state.maxXScale, component.xScale)
@@ -570,6 +571,19 @@ proc decodeSOF0(state: var DecoderState) =
       let maskBudget = budget.int64 - blockTotal
       if maskBudget > 0 and maskTotal > maskBudget:
         let factor = sqrt(maskBudget.float64 / maskTotal.float64)
+        effectiveTargetWidth = max(64,
+          (effectiveTargetWidth.float64 * factor).int)
+        effectiveTargetHeight = max(64,
+          (effectiveTargetHeight.float64 * factor).int)
+    # The same clamp against the largest single buffer: the full-resolution
+    # channel (luma, or every channel of an unsubsampled image) is one
+    # allocation of effectiveWidth x effectiveHeight bytes, and a plan that
+    # fits the heap in total still dies when no free block is that big.
+    let contiguous = decodeContiguousBudgetBytes()
+    if contiguous > 0:
+      let largestMask = effectiveTargetWidth.int64 * effectiveTargetHeight.int64
+      if largestMask > contiguous.int64:
+        let factor = sqrt(contiguous.float64 / largestMask.float64)
         effectiveTargetWidth = max(64,
           (effectiveTargetWidth.float64 * factor).int)
         effectiveTargetHeight = max(64,
@@ -662,6 +676,15 @@ proc decodeSOF0(state: var DecoderState) =
               fullBytes + fullBytes div 2
       totalBlockBytes += blockBytes
       totalMaskBytes += maskBytes
+      # The channel mask is one allocation; on the reconstruction path the
+      # magnified full-stride plane is the biggest one instead.
+      let largestBuffer =
+        if state.useScaledChannels():
+          channelWidth.int64 * channelHeight.int64
+        else:
+          (state.numMcuWide * state.maxYScale * 8).int64 *
+            (state.numMcuHigh * state.maxXScale * 8).int64
+      largestSingleBytes = max(largestSingleBytes, largestBuffer)
 
     component.channelWidth = channelWidth
     component.channelHeight = channelHeight
@@ -677,6 +700,14 @@ proc decodeSOF0(state: var DecoderState) =
   # image-sized allocation happens, so oversized inputs fail with a
   # catchable error instead of exhausting memory.
   state.plannedDecodeBytes = totalBlockBytes + totalMaskBytes
+  if overContiguousBudget(largestSingleBytes):
+    failInvalid(
+      "JPEG decode of " & $state.imageWidth & "x" & $state.imageHeight &
+      (if state.progressive: " (progressive)" else: "") &
+      " needs one " & $(largestSingleBytes div 1024) &
+      "K buffer, over the " & $(decodeContiguousBudgetBytes() div 1024) &
+      "K contiguous memory budget"
+    )
   if overDecodeBudget(state.plannedDecodeBytes):
     failInvalid(
       "JPEG decode of " & $state.imageWidth & "x" & $state.imageHeight &
