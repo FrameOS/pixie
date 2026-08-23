@@ -8,6 +8,7 @@ import
   test_images_draw,
   test_jpeg,
   test_paints,
+  test_paint_strips,
   test_paths,
   test_png,
   test_ppm,
