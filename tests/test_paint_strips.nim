@@ -209,4 +209,25 @@ block: # svg with a gradient background renders the same in strips
     parseSvg(svg).renderInto(composedReference)
     checkClose("svg renderInto", composedReference, composed)
 
+block: # svg with a radial gradient background: rgbx and 565 targets, in strips
+  let svg = """<svg xmlns="http://www.w3.org/2000/svg" width="300" height="240" viewBox="0 0 300 240">
+<defs><radialGradient id="bg" gradientUnits="userSpaceOnUse" cx="150" cy="120" r="180">
+<stop offset="0" stop-color="#7a1f4b"/><stop offset="1" stop-color="#12305a"/></radialGradient>
+<radialGradient id="spot" gradientUnits="userSpaceOnUse" cx="90" cy="80" r="60" gradientTransform="rotate(30 90 80) scale(1 0.6)">
+<stop offset="0" stop-color="#ffcc33" stop-opacity="0.9"/><stop offset="1" stop-color="#ffcc33" stop-opacity="0"/></radialGradient></defs>
+<rect x="0" y="0" width="300" height="240" fill="url(#bg)"/>
+<circle cx="150" cy="120" r="70" fill="#ffcc33" fill-opacity="0.7"/>
+<path d="M 20 40 Q 120 -20 260 90 L 240 200 z" fill="url(#spot)"/>
+</svg>"""
+  for format in [pfRgbx, pfRgb565]:
+    let reference = backdrop(W, H, format)
+    parseSvg(svg).renderInto(reference)
+    withBudget(4 * W * 4 * 13):
+      let strips = backdrop(W, H, format)
+      parseSvg(svg).renderInto(strips)
+      # The rotated spot has antialiased edges; where one of those rounds a
+      # level differently, a 565 target may cross a bucket (8 or 9 levels).
+      checkClose("svg radial " & $format, reference, strips,
+        maxWorst = if format == pfRgb565: 9 else: 4)
+
 echo "test_paint_strips: ok"
