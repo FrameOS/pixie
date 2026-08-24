@@ -14,7 +14,8 @@ type
   Svg* = ref object
     width*, height*: int
     elements: seq[(Path, SvgProperties)]
-    linearGradients: Table[string, LinearGradient]
+    gradients: Table[string, SvgGradient]
+    viewBoxWidth, viewBoxHeight: float32 # what percentage lengths refer to
 
   SvgTextAnchor = enum
     StartAnchor, MiddleAnchor, EndAnchor
@@ -41,8 +42,11 @@ type
     textAnchor: SvgTextAnchor
     baseline: SvgBaseline
 
-  LinearGradient = object
-    x1, y1, x2, y2: float32
+  SvgGradient = object
+    kind: PaintKind         # LinearGradientPaint or RadialGradientPaint
+    x1, y1, x2, y2: float32 # linear: the gradient vector, user space
+    cx, cy, r: float32      # radial: centre and radius, user space
+    transform: Mat3         # gradientTransform
     stops: seq[ColorStop]
 
   SvgTypefaceResolver* = proc(
@@ -141,15 +145,78 @@ proc parseSvgFontWeight(value: string, inherited: int): int =
     except ValueError:
       inherited
 
+proc splitArgs(s: string): seq[string] =
+  # Handles (1,1) or (1 1) or (1, 1) or (1,1 2,2) etc
+  let tmp = s.replace(',', ' ').split(' ')
+  for entry in tmp:
+    if entry.len > 0:
+      result.add(entry)
+
+proc parseSvgTransform(transform: string): Mat3 =
+  ## A `transform` (or `gradientTransform`) attribute: a list of matrix,
+  ## translate, rotate and scale functions, composed left to right.
+  template failInvalidTransform(transform: string) =
+    raise newException(
+        PixieError, "Unsupported SVG transform: " & transform
+      )
+
+  result = mat3()
+  var remaining = transform
+  while remaining.len > 0:
+    let index = remaining.find(")")
+    if index == -1:
+      failInvalidTransform(transform)
+    let f = remaining[0 .. index].strip()
+    remaining = remaining[index + 1 .. ^1]
+
+    if f.startsWith("matrix("):
+      let arr = splitArgs(f[7 .. ^2])
+      if arr.len != 6:
+        failInvalidTransform(transform)
+      var m = mat3()
+      m[0, 0] = parseFloat(arr[0])
+      m[0, 1] = parseFloat(arr[1])
+      m[1, 0] = parseFloat(arr[2])
+      m[1, 1] = parseFloat(arr[3])
+      m[2, 0] = parseFloat(arr[4])
+      m[2, 1] = parseFloat(arr[5])
+      result = result * m
+    elif f.startsWith("translate("):
+      let
+        components = splitArgs(f[10 .. ^2])
+        tx = parseFloat(components[0])
+        ty =
+          if components.len == 1:
+            0.0
+          else:
+            parseFloat(components[1])
+      result = result * translate(vec2(tx, ty))
+    elif f.startsWith("rotate("):
+      let
+        values = splitArgs(f[7 .. ^2])
+        angle: float32 = parseFloat(values[0]) * PI / 180
+      var cx, cy: float32
+      if values.len > 1:
+        cx = parseFloat(values[1])
+      if values.len > 2:
+        cy = parseFloat(values[2])
+      let center = vec2(cx, cy)
+      result = result * translate(center) * rotate(angle) * translate(-center)
+    elif f.startsWith("scale("):
+      let
+        values = splitArgs(f[6 .. ^2])
+        sx: float32 = parseFloat(values[0])
+        sy: float32 =
+          if values.len > 1:
+            parseFloat(values[1])
+          else:
+            sx
+      result = result * scale(vec2(sx, sy))
+    else:
+      failInvalidTransform(transform)
+
 proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties =
   result = inherited
-
-  proc splitArgs(s: string): seq[string] =
-    # Handles (1,1) or (1 1) or (1, 1) or (1,1 2,2) etc
-    let tmp = s.replace(',', ' ').split(' ')
-    for entry in tmp:
-      if entry.len > 0:
-        result.add(entry)
 
   var
     fillRule = node.attr("fill-rule")
@@ -386,65 +453,7 @@ proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties 
   if transform == "":
     discard # Inherit
   else:
-    template failInvalidTransform(transform: string) =
-      raise newException(
-          PixieError, "Unsupported SVG transform: " & transform
-        )
-
-    var remaining = transform
-    while remaining.len > 0:
-      let index = remaining.find(")")
-      if index == -1:
-        failInvalidTransform(transform)
-      let f = remaining[0 .. index].strip()
-      remaining = remaining[index + 1 .. ^1]
-
-      if f.startsWith("matrix("):
-        let arr = splitArgs(f[7 .. ^2])
-        if arr.len != 6:
-          failInvalidTransform(transform)
-        var m = mat3()
-        m[0, 0] = parseFloat(arr[0])
-        m[0, 1] = parseFloat(arr[1])
-        m[1, 0] = parseFloat(arr[2])
-        m[1, 1] = parseFloat(arr[3])
-        m[2, 0] = parseFloat(arr[4])
-        m[2, 1] = parseFloat(arr[5])
-        result.transform = result.transform * m
-      elif f.startsWith("translate("):
-        let
-          components = splitArgs(f[10 .. ^2])
-          tx = parseFloat(components[0])
-          ty =
-            if components.len == 1:
-              0.0
-            else:
-              parseFloat(components[1])
-        result.transform = result.transform * translate(vec2(tx, ty))
-      elif f.startsWith("rotate("):
-        let
-          values = splitArgs(f[7 .. ^2])
-          angle: float32 = parseFloat(values[0]) * PI / 180
-        var cx, cy: float32
-        if values.len > 1:
-          cx = parseFloat(values[1])
-        if values.len > 2:
-          cy = parseFloat(values[2])
-        let center = vec2(cx, cy)
-        result.transform = result.transform *
-          translate(center) * rotate(angle) * translate(-center)
-      elif f.startsWith("scale("):
-        let
-          values = splitArgs(f[6 .. ^2])
-          sx: float32 = parseFloat(values[0])
-          sy: float32 =
-            if values.len > 1:
-              parseFloat(values[1])
-            else:
-              sx
-        result.transform = result.transform * scale(vec2(sx, sy))
-      else:
-        failInvalidTransform(transform)
+    result.transform = result.transform * parseSvgTransform(transform)
 
 type
   SvgTextPosition = object
@@ -668,6 +677,104 @@ proc parseSvgText(
     )))
     result.add (path, run.props)
 
+proc parseSvgLength(value: string, reference: float32): float32 =
+  ## A gradient coordinate: a user-space number, or a percentage of
+  ## `reference` (the viewport's width, height or normalised diagonal).
+  let v = value.strip()
+  if v.endsWith("%"):
+    parseFloat(v[0 .. ^2]).float32 / 100 * reference
+  else:
+    parseFloat(v)
+
+proc parseSvgGradientStops(node: XmlNode): seq[ColorStop] =
+  for child in node:
+    if child.kind != xnElement:
+      # Whitespace between the stops, reported for documents with text in
+      # them (see parseSvgXml). Not a tag, and `tag` on it would be a defect.
+      continue
+    if child.tag == "stop":
+      var
+        color = child.attr("stop-color")
+        opacity = child.attr("stop-opacity")
+
+      let
+        style = child.attr("style")
+        pairs = style.split(';')
+      for pair in pairs:
+        let parts = pair.split(':')
+        if parts.len == 2:
+          # Do not override element properties
+          case parts[0].strip():
+          of "stop-color":
+            if color == "":
+              color = parts[1].strip()
+          of "stop-opacity":
+            if opacity == "":
+              opacity = parts[1].strip()
+          else:
+            when defined(pixieDebugSvg):
+              echo parts[0], ": ", parts[1]
+        elif pair.len > 0:
+          when defined(pixieDebugSvg):
+            echo "Invalid style pair: ", pair
+
+      if color == "":
+        raise newException(
+          PixieError, "Invalid SVG gradient, missing stop-color"
+        )
+
+      var stop = ColorStop(
+        color: color.parseHtmlColor(),
+        position: parseSvgLength(child.attr("offset"), 1)
+      )
+      if opacity != "":
+        stop.color.a *= parseFloat(opacity).clamp(0, 1)
+      result.add stop
+    else:
+      raise newException(PixieError, "Unexpected SVG tag: " & child.tag)
+
+proc parseSvgGradient(node: XmlNode, svg: Svg) =
+  ## `<linearGradient>` and `<radialGradient>`, registered by id for fills to
+  ## reference as `url(#id)`. Coordinates are user space (`gradientUnits=
+  ## "userSpaceOnUse"`, the only supported units), numbers or percentages of
+  ## the viewport, with the SVG defaults when absent; `gradientTransform`
+  ## applies on top. A radial gradient's focal point (fx, fy) and
+  ## `spreadMethod` are read as their defaults: the ramp is centred and pads.
+  let
+    id = node.attr("id")
+    gradientUnits = node.attr("gradientUnits")
+    gradientTransform = node.attr("gradientTransform")
+
+  if gradientUnits != "userSpaceOnUse":
+    raise newException(
+      PixieError, "Unsupported gradient units: " & gradientUnits
+    )
+
+  var gradient: SvgGradient
+  gradient.transform =
+    if gradientTransform == "": mat3()
+    else: parseSvgTransform(gradientTransform)
+
+  let
+    w = svg.viewBoxWidth
+    h = svg.viewBoxHeight
+  if node.tag == "linearGradient":
+    gradient.kind = LinearGradientPaint
+    gradient.x1 = parseSvgLength(node.attrOrDefault("x1", "0%"), w)
+    gradient.y1 = parseSvgLength(node.attrOrDefault("y1", "0%"), h)
+    gradient.x2 = parseSvgLength(node.attrOrDefault("x2", "100%"), w)
+    gradient.y2 = parseSvgLength(node.attrOrDefault("y2", "0%"), h)
+  else:
+    gradient.kind = RadialGradientPaint
+    gradient.cx = parseSvgLength(node.attrOrDefault("cx", "50%"), w)
+    gradient.cy = parseSvgLength(node.attrOrDefault("cy", "50%"), h)
+    gradient.r = parseSvgLength(
+      node.attrOrDefault("r", "50%"), sqrt((w * w + h * h) / 2)
+    )
+
+  gradient.stops = node.parseSvgGradientStops()
+  svg.gradients[id] = gradient
+
 proc parseSvgElement(
   node: XmlNode, svg: Svg, propertiesStack: var seq[SvgProperties]
 ): seq[(Path, SvgProperties)] =
@@ -680,8 +787,15 @@ proc parseSvgElement(
     discard
 
   of "defs":
-    when defined(pixieDebugSvg):
-      echo node
+    # Where documents keep their gradients. Anything else defined here
+    # (patterns, clip paths, symbols) is not drawn, as before.
+    for child in node:
+      if child.kind == xnElement and
+          child.tag in ["linearGradient", "radialGradient"]:
+        child.parseSvgGradient(svg)
+      else:
+        when defined(pixieDebugSvg):
+          echo child
 
   of "g":
     let props = node.parseSvgProperties(propertiesStack[^1])
@@ -806,71 +920,8 @@ proc parseSvgElement(
 
     result.add (path, props)
 
-  of "radialGradient":
-    discard
-
-  of "linearGradient":
-    let
-      props = node.parseSvgProperties(propertiesStack[^1])
-      id = node.attr("id")
-      gradientUnits = node.attr("gradientUnits")
-      gradientTransform = node.attr("gradientTransform")
-
-    if gradientUnits != "userSpaceOnUse":
-      raise newException(
-        PixieError, "Unsupported gradient units: " & gradientUnits
-      )
-    if gradientTransform != "":
-      raise newException(
-        PixieError, "Unsupported gradient transform: " & gradientTransform
-      )
-
-    var linearGradient: LinearGradient
-    linearGradient.x1 = parseFloat(node.attr("x1"))
-    linearGradient.y1 = parseFloat(node.attr("y1"))
-    linearGradient.x2 = parseFloat(node.attr("x2"))
-    linearGradient.y2 = parseFloat(node.attr("y2"))
-
-    for child in node:
-      if child.kind != xnElement:
-        # Whitespace between the stops, reported for documents with text in
-        # them (see parseSvgXml). Not a tag, and `tag` on it would be a defect.
-        continue
-      if child.tag == "stop":
-        var color = child.attr("stop-color")
-
-        if color == "":
-          let
-            style = child.attr("style")
-            pairs = style.split(';')
-          for pair in pairs:
-            let parts = pair.split(':')
-            if parts.len == 2:
-              # Do not override element properties
-              case parts[0].strip():
-              of "stop-color":
-                if color == "":
-                  color = parts[1].strip()
-              else:
-                when defined(pixieDebugSvg):
-                  maybeLogPair(parts[0], parts[1])
-            elif pair.len > 0:
-              when defined(pixieDebugSvg):
-                echo "Invalid style pair: ", pair
-
-        if color == "":
-          raise newException(
-            PixieError, "Invalid SVG gradient, missing stop-color"
-          )
-
-        linearGradient.stops.add(ColorStop(
-          color: color.parseHtmlColor(),
-          position: parseFloat(child.attr("offset"))
-        ))
-      else:
-        raise newException(PixieError, "Unexpected SVG tag: " & child.tag)
-
-    svg.linearGradients[id] = linearGradient
+  of "linearGradient", "radialGradient":
+    node.parseSvgGradient(svg)
 
   else:
     raise newException(PixieError, "Unsupported SVG tag: " & node.tag)
@@ -898,7 +949,10 @@ proc parseSvg*(
       let viewBoxMin = vec2(-viewBoxMinX.float32, -viewBoxMinY.float32)
       rootProps.transform = rootProps.transform * translate(viewBoxMin)
 
-    result = Svg()
+    result = Svg(
+      viewBoxWidth: viewBoxWidth.float32,
+      viewBoxHeight: viewBoxHeight.float32
+    )
 
     if width == 0 and height == 0: # Default to the view box size
       result.width = viewBoxWidth
@@ -963,14 +1017,27 @@ proc renderSvg(
             if closingParen == -1:
               raise newException(PixieError, "Malformed fill: " & props.fill)
             let id = props.fill[5 .. closingParen - 1]
-            if id in svg.linearGradients:
-              let linearGradient = svg.linearGradients[id]
-              paint = newPaint(LinearGradientPaint)
-              paint.gradientHandlePositions = @[
-                props.transform * vec2(linearGradient.x1, linearGradient.y1),
-                props.transform * vec2(linearGradient.x2, linearGradient.y2)
-              ]
-              paint.gradientStops = linearGradient.stops
+            if id in svg.gradients:
+              let
+                gradient = svg.gradients[id]
+                transform = props.transform * gradient.transform
+              paint = newPaint(gradient.kind)
+              case gradient.kind
+              of RadialGradientPaint:
+                # pixie's radial paint takes the centre plus a point on the
+                # circle along each axis; the transform turns those into the
+                # ellipse the SVG asks for.
+                paint.gradientHandlePositions = @[
+                  transform * vec2(gradient.cx, gradient.cy),
+                  transform * vec2(gradient.cx + gradient.r, gradient.cy),
+                  transform * vec2(gradient.cx, gradient.cy + gradient.r)
+                ]
+              else:
+                paint.gradientHandlePositions = @[
+                  transform * vec2(gradient.x1, gradient.y1),
+                  transform * vec2(gradient.x2, gradient.y2)
+                ]
+              paint.gradientStops = gradient.stops
             else:
               raise newException(PixieError, "Missing SVG resource " & id)
           else:

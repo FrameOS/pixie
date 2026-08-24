@@ -88,3 +88,77 @@ block:
     doAssert worst <= 4, &"renderInto differs from draw by {worst}"
     doAssert differing * 100 div fused.dataLen <= 25,
       &"renderInto differs on {differing * 100 div fused.dataLen}% of pixels"
+
+block:
+  # Radial gradients, and the gradient features documents actually use: kept
+  # in <defs>, percentage lengths, gradientTransform, stop-opacity. The focal
+  # point (fx, fy) is accepted and ignored.
+  let data = """<svg xmlns="http://www.w3.org/2000/svg" width="200" height="120" viewBox="0 0 200 120">
+<defs>
+  <clipPath id="unused"><rect width="10" height="10"/></clipPath>
+  <radialGradient id="glow" gradientUnits="userSpaceOnUse" cx="60" cy="60" r="50" fx="60" fy="60">
+    <stop offset="0" stop-color="#ffffff"/>
+    <stop offset="0.6" stop-color="#ffcc33"/>
+    <stop offset="1" stop-color="#7a1f4b"/>
+  </radialGradient>
+  <radialGradient id="soft" gradientUnits="userSpaceOnUse" cx="50%" cy="50%" r="30%"
+    gradientTransform="translate(150 60) scale(1 0.5) translate(-100 -60)">
+    <stop offset="0%" stop-color="#12305a" stop-opacity="1"/>
+    <stop offset="100%" stop-color="#12305a" style="stop-opacity:0"/>
+  </radialGradient>
+</defs>
+<rect width="200" height="120" fill="#101010"/>
+<circle cx="60" cy="60" r="50" fill="url(#glow)"/>
+<rect x="100" y="0" width="100" height="120" fill="url(#soft)"/>
+</svg>"""
+  let image = newImage(parseSvg(data))
+  image.xray("tests/fileformats/svg/masters/radialGradient.png")
+
+  proc near(a, b: ColorRGBX, tolerance = 3): bool =
+    abs(a.r.int - b.r.int) <= tolerance and abs(a.g.int - b.g.int) <= tolerance and
+    abs(a.b.int - b.b.int) <= tolerance and abs(a.a.int - b.a.int) <= tolerance
+
+  # glow: first stop at the centre, the 0.6 stop 30px out, background past r.
+  doAssert image[60, 60] == rgbx(255, 255, 255, 255)
+  doAssert image[90, 60].near(rgbx(255, 204, 51, 255)), $image[90, 60]
+  doAssert image[60, 90].near(rgbx(255, 204, 51, 255)), $image[60, 90]
+  doAssert image[60, 5] == rgbx(16, 16, 16, 255)
+  # soft: cx/cy = 50% of the viewport = (100, 60), r = 30% of the normalised
+  # diagonal ~ 49.5, moved to (150, 60) and squashed to half height. Opaque
+  # at the centre, gone at the rim, half-and-half at t = 0.5 on either axis.
+  doAssert image[150, 60] == rgbx(18, 48, 90, 255)
+  doAssert image[199, 60].near(rgbx(16, 16, 16, 255), 2), $image[199, 60]
+  doAssert image[150, 5] == rgbx(16, 16, 16, 255)
+  doAssert image[175, 60].near(rgbx(17, 32, 53, 255)), $image[175, 60]
+  doAssert image[150, 72].near(rgbx(17, 32, 53, 255)), $image[150, 72]
+
+block:
+  # gradientTransform on a linear gradient, and the SVG defaults for a
+  # gradient vector (left to right across the viewport).
+  let data = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50">
+<linearGradient id="lr" gradientUnits="userSpaceOnUse">
+  <stop offset="0" stop-color="#000000"/><stop offset="1" stop-color="#ffffff"/>
+</linearGradient>
+<linearGradient id="tb" gradientUnits="userSpaceOnUse" gradientTransform="rotate(90 50 25)">
+  <stop offset="0" stop-color="#000000"/><stop offset="1" stop-color="#ffffff"/>
+</linearGradient>
+<rect width="100" height="25" fill="url(#lr)"/>
+<rect y="25" width="100" height="25" fill="url(#tb)"/>
+</svg>"""
+  let image = newImage(parseSvg(data))
+  doAssert image[0, 10] == rgbx(0, 0, 0, 255)
+  doAssert image[99, 10].r > 250
+  doAssert image[0, 10].r < image[50, 10].r and image[50, 10].r < image[99, 10].r
+  # rotate(90 50 25) turns the (0,0)->(100,0) vector into (75,-25)->(75,75):
+  # the lower rect brightens downwards and is constant across x.
+  doAssert image[10, 49].r == image[90, 49].r, "rotated: constant across x"
+  doAssert image[10, 49].r > image[10, 26].r, "rotated: brighter downwards"
+  doAssert image[10, 26].r > 100 and image[10, 49].r < 200
+
+block:
+  # Gradient units other than user space are still refused, whole document.
+  let data = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">
+<radialGradient id="g"><stop offset="0" stop-color="#000"/></radialGradient>
+<rect width="10" height="10" fill="url(#g)"/></svg>"""
+  doAssertRaises PixieError:
+    discard parseSvg(data)

@@ -26,8 +26,55 @@ timeIt "GradientLinear horizontal":
   ]
   image.fillGradient(paint)
 
-# timeIt "GradientLinear radial":
-#   discard
+timeIt "GradientLinear diagonal":
+  let paint = newPaint(LinearGradientPaint)
+  paint.gradientHandlePositions = @[
+    vec2(0, 0),
+    vec2(1000, 700),
+  ]
+  paint.gradientStops = @[
+    ColorStop(color: color(1, 0, 0, 1), position: 0),
+    ColorStop(color: color(1, 0, 0, 0.15625), position: 1.0),
+  ]
+  image.fillGradient(paint)
+
+timeIt "GradientLinear diagonal exact":
+  let paint = newPaint(LinearGradientPaint)
+  paint.gradientHandlePositions = @[
+    vec2(0, 0),
+    vec2(1000, 700),
+  ]
+  paint.gradientStops = @[
+    ColorStop(color: color(1, 0, 0, 1), position: 0),
+    ColorStop(color: color(1, 0, 0, 0.15625), position: 1.0),
+  ]
+  image.fillGradient(paint, exact = true)
+
+timeIt "GradientRadial":
+  let paint = newPaint(RadialGradientPaint)
+  paint.gradientHandlePositions = @[
+    vec2(500, 500),
+    vec2(1000, 500),
+    vec2(500, 1000)
+  ]
+  paint.gradientStops = @[
+    ColorStop(color: color(1, 0, 0, 1), position: 0),
+    ColorStop(color: color(1, 0, 0, 0.15625), position: 1.0),
+  ]
+  image.fillGradient(paint)
+
+timeIt "GradientRadial exact":
+  let paint = newPaint(RadialGradientPaint)
+  paint.gradientHandlePositions = @[
+    vec2(500, 500),
+    vec2(1000, 500),
+    vec2(500, 1000)
+  ]
+  paint.gradientStops = @[
+    ColorStop(color: color(1, 0, 0, 1), position: 0),
+    ColorStop(color: color(1, 0, 0, 0.15625), position: 1.0),
+  ]
+  image.fillGradient(paint, exact = true)
 
 let image100 = newImage(100, 100)
 
