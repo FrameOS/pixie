@@ -2,7 +2,15 @@ import
   std/[os, strutils],
   bumpy, chroma, flatty/binny, vmath,
   pixie/[common, contexts, fonts, imagebase64, images, internal, paints, paths],
-  pixie/fileformats/[bmp, gif, jpeg, png, ppm, qoi, svg, webp]
+  pixie/fileformats/[bmp, gif, jpeg, png, qoi, svg, webp]
+
+when not defined(pixieNoPpm):
+  # Netpbm (P3/P6) is a rarity next to the other formats, and on a
+  # flash-constrained target (FrameOS' ESP32 firmware) its decoder is dead
+  # weight. `-d:pixieNoPpm` drops the module: `PpmFormat` stays in the enum so
+  # the API does not change shape, but decoding a P3/P6 file and encoding to
+  # PPM both raise "Unsupported file format".
+  import pixie/fileformats/ppm
 
 export bumpy, chroma, common, contexts, fonts, imagebase64, images, paints,
     paths, vmath
@@ -37,16 +45,18 @@ proc decodeImageDimensions*(
     decodeGifDimensions(data, len)
   elif len > (14 + 8) and equalMem(data, qoiSignature.cstring, 4):
     decodeQoiDimensions(data, len)
-  elif len > 9 and (
-    equalMem(data, ppmSignatures[0].cstring, 2) or
-    equalMem(data, ppmSignatures[1].cstring, 2)
-  ):
-    decodePpmDimensions(data, len)
   elif len > 12 and
       equalMem(data, WebpRiffSignature.cstring, 4) and
       equalMem(cast[pointer](cast[uint](data) + 8), WebpSignature.cstring, 4):
     decodeWebpDimensions(data, len)
   else:
+    # PPM last: its two-byte signature cannot collide with the formats above.
+    when not defined(pixieNoPpm):
+      if len > 9 and (
+        equalMem(data, ppmSignatures[0].cstring, 2) or
+        equalMem(data, ppmSignatures[1].cstring, 2)
+      ):
+        return decodePpmDimensions(data, len)
     raise newException(PixieError, "Unsupported image file format")
 
 proc decodeImageDimensions*(
@@ -70,12 +80,14 @@ proc decodeImage*(data: string): Image {.raises: [PixieError].} =
     newImage(decodeGif(data))
   elif data.len > (14+8) and data.readStr(0, 4) == qoiSignature:
     decodeQoi(data).convertToImage()
-  elif data.len > 9 and data.readStr(0, 2) in ppmSignatures:
-    decodePpm(data)
   elif data.len > 12 and data.readStr(0, 4) == WebpRiffSignature and
       data.readStr(8, 4) == WebpSignature:
     decodeWebp(data)
   else:
+    # PPM last: its two-byte signature cannot collide with the formats above.
+    when not defined(pixieNoPpm):
+      if data.len > 9 and data.readStr(0, 2) in ppmSignatures:
+        return decodePpm(data)
     raise newException(PixieError, "Unsupported image file format")
 
 proc validateScaledImageTarget(width, height: int) {.raises: [PixieError].} =
@@ -295,7 +307,10 @@ proc encodeImage*(
   of GifFormat:
     raise newException(PixieError, "Unsupported file format")
   of PpmFormat:
-    image.encodePpm()
+    when defined(pixieNoPpm):
+      raise newException(PixieError, "Unsupported file format")
+    else:
+      image.encodePpm()
   of WebpFormat:
     raise newException(PixieError, "Unsupported file format")
 
