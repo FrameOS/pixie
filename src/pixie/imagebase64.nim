@@ -3,7 +3,10 @@ import
   std/strutils,
   flatty/binny,
   common,
-  fileformats/[bmp, gif, jpeg, png, ppm, qoi, svg]
+  fileformats/[bmp, gif, jpeg, png, qoi, svg]
+
+when not defined(pixieNoPpm):
+  import fileformats/ppm
 
 proc decodeImageData(data: string): Image {.raises: [PixieError].} =
   ## Decodes supported image bytes into an image.
@@ -22,9 +25,11 @@ proc decodeImageData(data: string): Image {.raises: [PixieError].} =
     newImage(decodeGif(data))
   elif data.len > (14 + 8) and data.readStr(0, 4) == qoiSignature:
     decodeQoi(data).convertToImage()
-  elif data.len > 9 and data.readStr(0, 2) in ppmSignatures:
-    decodePpm(data)
   else:
+    # PPM last: its two-byte signature cannot collide with the formats above.
+    when not defined(pixieNoPpm):
+      if data.len > 9 and data.readStr(0, 2) in ppmSignatures:
+        return decodePpm(data)
     raise newException(PixieError, "Unsupported image file format")
 
 proc getPayload(data: string): string {.raises: [PixieError].} =
