@@ -1,4 +1,4 @@
-import pixie, pixie/fileformats/svg, strformat, xrays, xmlparser, xmltree
+import pixie, pixie/fileformats/svg, strformat, strutils, xrays, xmlparser, xmltree
 
 const files = [
   "line01",
@@ -162,3 +162,38 @@ block:
 <rect width="10" height="10" fill="url(#g)"/></svg>"""
   doAssertRaises PixieError:
     discard parseSvg(data)
+
+block:
+  # No viewBox: the root's width/height are the user coordinate box, and a
+  # requested size scales onto it exactly as a viewBox would. This used to
+  # raise `invalid integer` for any size but the declared one.
+  let data = """<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="20" height="20" fill="#ff0000"/><rect x="20" width="20" height="20" fill="#0000ff"/></svg>"""
+  let natural = newImage(parseSvg(data))
+  doAssert natural.width == 40 and natural.height == 20
+  doAssert natural[5, 10] == rgbx(255, 0, 0, 255)
+  doAssert natural[35, 10] == rgbx(0, 0, 255, 255)
+  let scaled = newImage(parseSvg(data, 8, 4))
+  doAssert scaled.width == 8 and scaled.height == 4
+  doAssert scaled[1, 2] == rgbx(255, 0, 0, 255), $scaled[1, 2]
+  doAssert scaled[6, 2] == rgbx(0, 0, 255, 255), $scaled[6, 2]
+
+block:
+  # viewBox with commas and decimals; unit suffixes on width/height dropped.
+  let data = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0,0,40.0,20" width="40px" height="20px"><rect width="40" height="20" fill="#00ff00"/></svg>"""
+  let image = newImage(parseSvg(data))
+  doAssert image.width == 40 and image.height == 20
+  doAssert image[20, 10] == rgbx(0, 255, 0, 255)
+
+block:
+  # Neither a viewBox nor a size on the document: the requested size is the
+  # box (drawn unscaled), and no size at all is refused by name.
+  let data = """<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" fill="#ff0000"/></svg>"""
+  let image = newImage(parseSvg(data, 20, 20))
+  doAssert image[5, 5] == rgbx(255, 0, 0, 255)
+  doAssert image[15, 15] == rgbx(0, 0, 0, 0)
+  var refused = ""
+  try:
+    discard parseSvg(data)
+  except PixieError as e:
+    refused = e.msg
+  doAssert refused.contains("no viewBox"), refused
