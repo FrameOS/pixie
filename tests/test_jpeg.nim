@@ -145,3 +145,44 @@ proc streamedMatchesBufferedDownscale() =
   doAssert streamed.pixelsEqual(buffered)
 
 streamedMatchesBufferedDownscale()
+
+block:
+  # A budget that admits the channel planes but not the bands and accumulator
+  # rows beside them must clamp the sampling grid a little further, not
+  # refuse: the plan check counts all three, so the clamp has to as well.
+  # Before this the refusal handed the caller's degrade ladder a photo that a
+  # 94% grid would have decoded, and every 4:4:4 photo bigger than a 13.3"
+  # panel came out at half resolution.
+  let data = readFile("tests/fileformats/jpeg/masters/cat_4_4_4.jpg")
+  let dims = decodeJpegDimensions(data)
+  let
+    targetW = dims.width div 2
+    targetH = dims.height div 2
+  # A 1-byte budget clamps the grid to its 64x64 floor and refuses with that
+  # floor plan's size — the smallest plan any budget can be asked to hold.
+  setDecodeBudgetBytes(1)
+  var floorK = 0
+  try:
+    discard decodeJpegScaled(data, targetW, targetH)
+    doAssert false, "a 1-byte budget cannot admit any scaled decode plan"
+  except PixieError as e:
+    doAssert "memory budget" in e.msg, e.msg
+    let needsAt = e.msg.find("needs ") + 6
+    let kAt = e.msg.find("K of decode")
+    floorK = parseInt(e.msg[needsAt ..< kAt])
+  # The full-grid plan for a 4:4:4 source: three target-sized planes, a band
+  # of 8 source rows per plane and two accumulator rows per plane.
+  let fullPlan = 3 * (targetW * targetH + dims.width * 8 + 2 * targetW * 4)
+  doAssert (floorK + 1) * 1024 < fullPlan
+  # Every budget between the floor plan and the full plan must decode (at a
+  # shaved grid), and the output is always target-sized.
+  for budget in [(floorK + 2) * 1024, (fullPlan + (floorK + 2) * 1024) div 2,
+      fullPlan - 1024]:
+    setDecodeBudgetBytes(budget)
+    # Into an existing target, as the frames decode: the plan is the only
+    # thing the budget has to hold.
+    let target = newImage(targetW, targetH)
+    decodeJpegScaledInto(data, target)
+    doAssert target.width == targetW and target.height == targetH,
+      "budget " & $budget & " refused a decode the floor plan fits"
+  setDecodeBudgetBytes(0)

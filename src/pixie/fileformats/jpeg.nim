@@ -612,26 +612,58 @@ proc decodeSOF0(state: var DecoderState) =
       effectiveTargetHeight = min(effectiveTargetHeight, state.winOH)
 
     # Clamp the sampling resolution to what the memory budget allows,
-    # trading sharpness for a decode that succeeds.
+    # trading sharpness for a decode that succeeds. Count exactly what the
+    # plan check below counts — each channel plane plus its band and the two
+    # accumulator rows — so the clamped grid passes its own check. Counting
+    # the planes alone left the bands and accumulators (~180 KB for a
+    # 6336-wide 4:4:4 photo into 1200x1600) outside the estimate, so a grid
+    # shaved to fit the planes was refused by ~3%, and the caller's degrade
+    # ladder then fell to a half-resolution rung when a 94% grid would have
+    # done (every 4:4:4 photo on the 13.3" panel, 2026-09-05).
     let budget = decodeBudgetBytes()
     if budget > 0:
-      var blockTotal, maskTotal: int64
+      var blockTotal: int64
       for component in state.components:
         if not (state.streamBaselineBlocks and not state.progressive):
           blockTotal += (state.numMcuWide * component.yScale).int64 *
             (state.numMcuHigh * component.xScale).int64 * 64 * sizeof(int16)
-        maskTotal +=
-          max(1'i64, (effectiveTargetWidth.int64 * component.yScale.int64 +
-            state.maxYScale - 1) div state.maxYScale) *
-          max(1'i64, (effectiveTargetHeight.int64 * component.xScale.int64 +
-            state.maxXScale - 1) div state.maxXScale)
+      let
+        swapped = state.orientation in {5, 6, 7, 8}
+        maxYScale = state.maxYScale
+        maxXScale = state.maxXScale
+        imageWidth = state.imageWidth
+      var scales: seq[(int, int)]
+      for component in state.components:
+        scales.add((component.yScale, component.xScale))
+      proc scaledMaskBytes(tw, th: int): int64 =
+        let
+          gridW = if swapped: th else: tw
+          gridH = if swapped: tw else: th
+        for (yScale, xScale) in scales:
+          let
+            sampleW = max(1, scaledCeil(gridW, yScale, maxYScale))
+            sampleH = max(1, scaledCeil(gridH, xScale, maxXScale))
+            compWidth = scaledCeil(imageWidth, yScale, maxYScale)
+          result += sampleW.int64 * sampleH.int64 +
+            compWidth.int64 * (8 * xScale).int64 +
+            2'i64 * sampleW.int64 * sizeof(uint32).int64
       let maskBudget = budget.int64 - blockTotal
-      if maskBudget > 0 and maskTotal > maskBudget:
-        let factor = sqrt(maskBudget.float64 / maskTotal.float64)
+      if maskBudget > 0 and
+          scaledMaskBytes(effectiveTargetWidth, effectiveTargetHeight) > maskBudget:
+        # First guess from the area ratio (the planes dominate), then shave
+        # in 1/64 steps until the exact count fits — the bands and
+        # accumulators shrink slower than the planes, so the guess alone
+        # lands a hair over.
+        let factor = sqrt(maskBudget.float64 /
+          scaledMaskBytes(effectiveTargetWidth, effectiveTargetHeight).float64)
         effectiveTargetWidth = max(64,
           (effectiveTargetWidth.float64 * factor).int)
         effectiveTargetHeight = max(64,
           (effectiveTargetHeight.float64 * factor).int)
+        while (effectiveTargetWidth > 64 or effectiveTargetHeight > 64) and
+            scaledMaskBytes(effectiveTargetWidth, effectiveTargetHeight) > maskBudget:
+          effectiveTargetWidth = max(64, effectiveTargetWidth - max(1, effectiveTargetWidth div 64))
+          effectiveTargetHeight = max(64, effectiveTargetHeight - max(1, effectiveTargetHeight div 64))
     # The same clamp against the largest single buffer: the full-resolution
     # channel (luma, or every channel of an unsubsampled image) is one
     # allocation of effectiveWidth x effectiveHeight bytes, and a plan that
