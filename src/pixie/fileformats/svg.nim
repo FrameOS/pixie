@@ -926,6 +926,42 @@ proc parseSvgElement(
   else:
     raise newException(PixieError, "Unsupported SVG tag: " & node.tag)
 
+proc parseSvgViewBox(
+  root: XmlNode, width, height: int
+): tuple[minX, minY, width, height: float32] =
+  ## The user coordinate box the document is drawn in. `viewBox` when there is
+  ## one (four numbers, whitespace and/or commas between them, decimals
+  ## allowed). Otherwise the root's own width/height: an SVG without a viewBox
+  ## maps user units 1:1 onto that viewport, so those ARE its box — a document
+  ## a JS app hand-builds as `<svg width="600" height="480">` used to fail here
+  ## with `invalid integer` the moment it was rasterized at any other size.
+  ## Otherwise the size the caller asked for, so a bare document still renders
+  ## unscaled at that size. Only a document with none of the three is refused,
+  ## and by name.
+  let viewBox = root.attr("viewBox").strip()
+  if viewBox.len > 0:
+    let box = strutils.splitWhitespace(viewBox.replace(",", " "))
+    if box.len != 4:
+      raise newException(PixieError, "Invalid SVG viewBox: " & viewBox)
+    result = (
+      parseFloat(box[0]).float32, parseFloat(box[1]).float32,
+      parseFloat(box[2]).float32, parseFloat(box[3]).float32
+    )
+    if result.width <= 0 or result.height <= 0:
+      raise newException(PixieError, "Invalid SVG viewBox: " & viewBox)
+    return
+  # A percentage has nothing to be a percentage of without a viewBox.
+  let
+    rootWidth = root.attr("width").strip()
+    rootHeight = root.attr("height").strip()
+    w = if rootWidth.endsWith("%"): -1f32 else: parseSvgCoordinate(rootWidth, -1)
+    h = if rootHeight.endsWith("%"): -1f32 else: parseSvgCoordinate(rootHeight, -1)
+  if w > 0 and h > 0:
+    return (0f32, 0f32, w, h)
+  if width > 0 and height > 0:
+    return (0f32, 0f32, width.float32, height.float32)
+  raise newException(PixieError, "SVG has no viewBox and no width/height")
+
 proc parseSvg*(
   root: XmlNode, width = 0, height = 0
 ): Svg {.raises: [PixieError].} =
@@ -934,36 +970,30 @@ proc parseSvg*(
     if root.tag != "svg":
       failInvalid()
 
-    let
-      viewBox = root.attr("viewBox")
-      box = viewBox.split(" ")
-      viewBoxMinX = parseInt(box[0])
-      viewBoxMinY = parseInt(box[1])
-      viewBoxWidth = parseInt(box[2])
-      viewBoxHeight = parseInt(box[3])
+    let box = parseSvgViewBox(root, width, height)
 
     var rootProps = initSvgProperties()
     rootProps = root.parseSvgProperties(rootProps)
 
-    if viewBoxMinX != 0 or viewBoxMinY != 0:
-      let viewBoxMin = vec2(-viewBoxMinX.float32, -viewBoxMinY.float32)
+    if box.minX != 0 or box.minY != 0:
+      let viewBoxMin = vec2(-box.minX, -box.minY)
       rootProps.transform = rootProps.transform * translate(viewBoxMin)
 
     result = Svg(
-      viewBoxWidth: viewBoxWidth.float32,
-      viewBoxHeight: viewBoxHeight.float32
+      viewBoxWidth: box.width,
+      viewBoxHeight: box.height
     )
 
     if width == 0 and height == 0: # Default to the view box size
-      result.width = viewBoxWidth
-      result.height = viewBoxHeight
+      result.width = round(box.width).int
+      result.height = round(box.height).int
     else:
       result.width = width
       result.height = height
 
       let
-        scaleX = width.float32 / viewBoxWidth.float32
-        scaleY = height.float32 / viewBoxHeight.float32
+        scaleX = width.float32 / box.width
+        scaleY = height.float32 / box.height
       rootProps.transform = rootProps.transform * scale(vec2(scaleX, scaleY))
 
     var propertiesStack = @[rootProps]
