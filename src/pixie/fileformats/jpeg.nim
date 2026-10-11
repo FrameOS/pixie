@@ -106,7 +106,10 @@ type
     imageHeight, imageWidth: int
     progressive: bool
     quantizationTables: array[4, array[64, uint8]]
-    huffmanTables: array[2, array[4, Huffman]] # 0 = DC, 1 = AC
+    ## 0 = DC, 1 = AC. On the heap: eight tables are ~14.5 KB, and a value
+    ## DecoderState lives on the caller's stack — on an ESP32 render task
+    ## with 40 KB that left ~1.4 KB free after every streamed JPEG.
+    huffmanTables: ref array[2, array[4, Huffman]]
     components: seq[Component]
     maxYScale, maxXScale: int
     mcuWidth, mcuHeight, numMcuWide, numMcuHigh: int
@@ -493,11 +496,13 @@ proc decodeDHT(state: var DecoderState) =
 
     len -= 17
 
-    state.huffmanTables[tableCurrent][tableId] = Huffman()
-    state.huffmanTables[tableCurrent][tableId].buildHuffman(counts)
+    if state.huffmanTables.isNil:
+      new(state.huffmanTables)
+    state.huffmanTables[][tableCurrent][tableId] = Huffman()
+    state.huffmanTables[][tableCurrent][tableId].buildHuffman(counts)
 
     for i in 0 ..< numSymbols:
-      state.huffmanTables[tableCurrent][tableId].symbols[i] = state.readUint8()
+      state.huffmanTables[][tableCurrent][tableId].symbols[i] = state.readUint8()
 
     len -= numSymbols
 
@@ -1111,7 +1116,9 @@ proc fillBitBuffer(state: var DecoderState) =
 
 proc huffmanDecode(state: var DecoderState, tableCurrent, table: int): uint8 =
   ## Decode a uint8 from the huffman table.
-  var huffman {.byaddr.} = state.huffmanTables[tableCurrent][table]
+  if state.huffmanTables.isNil:
+    failInvalid("scan before any huffman table")
+  var huffman {.byaddr.} = state.huffmanTables[][tableCurrent][table]
 
   state.fillBitBuffer()
 
