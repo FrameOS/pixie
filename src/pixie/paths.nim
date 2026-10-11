@@ -1434,13 +1434,29 @@ proc clearUnsafe(image: Image, startX, startY, toX, toY: int) =
   ## Clears data from [start, to).
   if startX == image.width or startY == image.height:
     return
-  let
-    start = image.dataIndex(startX, startY)
-    len = image.dataIndex(toX, toY) - start
-  if image.format == pfRgb565:
-    fillUnsafe16(image.data16, 0, start, len)
-  else:
-    fillUnsafe(image.data, rgbx(0, 0, 0, 0), start, len)
+  if image.isContiguous:
+    let
+      start = image.dataIndex(startX, startY)
+      len = image.dataIndex(toX, toY) - start
+    if image.format == pfRgb565:
+      fillUnsafe16(image.data16, 0, start, len)
+    else:
+      fillUnsafe(image.data, rgbx(0, 0, 0, 0), start, len)
+    return
+  # A view: [start, to) wraps row by row inside the view, never into the
+  # owner's pixels beside it.
+  var y = startY
+  var x = startX
+  while y < toY or (y == toY and x < toX):
+    let rowEnd = if y == toY: toX else: image.width
+    if rowEnd > x:
+      let start = image.dataIndex(x, y)
+      if image.format == pfRgb565:
+        fillUnsafe16(image.data16, 0, start, rowEnd - x)
+      else:
+        fillUnsafe(image.data, rgbx(0, 0, 0, 0), start, rowEnd - x)
+    x = 0
+    inc y
 
 proc fillCoverage565(
   image: Image,
@@ -1765,14 +1781,24 @@ proc fillShapes(
             blendMode == OverwriteBlend or
             (blendMode == NormalBlend and rgbx.a == 255)
         if skipBlending and minX == 0 and maxX == image.width:
-          # We can be greedy, just do one big mult-row fill
-          let
-            start = image.dataIndex(0, y)
-            len = image.dataIndex(0, y + partitionHeight) - start
-          if image.format == pfRgb565:
-            fillUnsafe16(image.data16, rgbxToRgb565(rgbx), start, len)
+          if image.isContiguous:
+            # We can be greedy, just do one big mult-row fill
+            let
+              start = image.dataIndex(0, y)
+              len = image.dataIndex(0, y + partitionHeight) - start
+            if image.format == pfRgb565:
+              fillUnsafe16(image.data16, rgbxToRgb565(rgbx), start, len)
+            else:
+              fillUnsafe(image.data, rgbx, start, len)
           else:
-            fillUnsafe(image.data, rgbx, start, len)
+            # A view: its rows are not back to back in the buffer, so one
+            # flat run would spill into the owner's pixels beside it.
+            for r in 0 ..< partitionHeight:
+              let start = image.dataIndex(0, y + r)
+              if image.format == pfRgb565:
+                fillUnsafe16(image.data16, rgbxToRgb565(rgbx), start, image.width)
+              else:
+                fillUnsafe(image.data, rgbx, start, image.width)
         else:
           for r in 0 ..< partitionHeight:
             hits[0] = (cast[Fixed32](minX * 256), 1.int16)
