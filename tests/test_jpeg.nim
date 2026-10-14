@@ -309,3 +309,72 @@ block:
   except PixieError as e:
     doAssert "memory budget" in e.msg, e.msg
   setDecodeBudgetBytes(0)
+
+block:
+  # The sink: a decode into a target no longer finishes target-sized channel
+  # planes and fills the target from them; it keeps a ring of channel rows
+  # and draws each target line as soon as every component has its samples.
+  # It must land on exactly the pixels the whole-plane fill draws (which
+  # decodeJpegScaled, building a new image, still does): every subsampling,
+  # a grayscale, restart markers, every orientation, every fit, downscales,
+  # upscales, 1:1, a tiny target, and the progressive files in strips.
+  var fixtures = @[
+    "cat_4_2_0", "cat_4_4_4", "cat_4_2_2", "cat_4_1_1", "mandrill",
+    "grayscale_test", "cat_restart_markers_5", "restartmarker", "testimg",
+    "cat_4_2_0_progressive", "cat_4_4_4_progressive",
+    "cat_restart_markers_5_progressive", "progressive", "testprog"]
+  for n in 1 .. 8:
+    fixtures.add("f" & $n & "-exif")
+    fixtures.add("f" & $n & "-exif-progressive")
+  for name in fixtures:
+    let
+      path = "tests/fileformats/jpeg/masters/" & name & ".jpg"
+      data = readFile(path)
+      dims = decodeJpegDimensions(data)
+      progressive = decodeJpegInfo(data).progressive
+    for fit in [fitStretch, fitCover, fitContain]:
+      for (w, h) in [
+        (max(1, dims.width * 5 div 6), max(1, dims.height * 5 div 6)),
+        (dims.width * 3 div 2 + 1, max(1, dims.height div 3)),
+        (dims.width, dims.height),
+        (max(1, dims.width div 4), max(1, dims.height div 4)),
+        (7, 5),
+        (dims.width * 4 + 3, dims.height * 3 + 1)
+      ]:
+        setJpegStripMcuRows(0)
+        let whole = decodeJpegScaled(data, w, h, fit)
+        for rows in (if progressive: @[0, 1, 3] else: @[0]):
+          setJpegStripMcuRows(rows)
+          let target = newImage(w, h)
+          decodeJpegScaledInto(data, target, fit)
+          doAssert target.pixelsEqual(whole),
+            path & " " & $fit & " " & $w & "x" & $h & " strips " & $rows
+  setJpegStripMcuRows(0)
+
+block:
+  # What the sink is for: a budget far below the target-sized planes used
+  # to clamp the sampling grid, and the picture came out soft. With rings
+  # the same budget decodes at full resolution, pixel for pixel what no
+  # budget at all decodes.
+  # (On a 200-pixel image the bands and accumulators alone are a quarter
+  # of the planes, and the grid clamps as it should; the point is the
+  # panel-sized ones.)
+  for (name, divisor) in [("progressive", 1), ("mandrill", 1)]:
+    let
+      data = readFile("tests/fileformats/jpeg/masters/" & name & ".jpg")
+      info = decodeJpegInfo(data)
+      w = info.width div divisor
+      h = info.height div divisor
+    setDecodeBudgetBytes(0)
+    let whole = decodeJpegScaled(data, w, h, fitStretch)
+    var planes: int64
+    for scale in info.componentScales:
+      planes += ((w * scale.yScale + info.maxYScale - 1) div info.maxYScale).int64 *
+        ((h * scale.xScale + info.maxXScale - 1) div info.maxXScale).int64
+    # A quarter of the planes: rings, bands, accumulators and a strip or
+    # two of coefficients fit; the planes never did.
+    setDecodeBudgetBytes(int(planes div 4))
+    let target = newImage(w, h)
+    decodeJpegScaledInto(data, target, fitStretch)
+    doAssert target.pixelsEqual(whole), name & " softened under a budget of planes/4"
+    setDecodeBudgetBytes(0)

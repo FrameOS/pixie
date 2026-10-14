@@ -86,6 +86,13 @@ type
     rowSums: seq[uint32]    ## vertical accumulator for the target row in flight
     rowSumsTy: int          ## which target row rowSums is accumulating
     rowSumsRows: int        ## source rows folded into rowSums so far
+    # A decode straight into a target keeps a ring of channel rows instead
+    # of a target-sized plane (see sinkReady): rows are written into the
+    # target as soon as every component has them, and a slot is reused
+    # once the rows it held are drawn.
+    ringRows: int           ## rows the ring holds; 0 = the whole channel
+    rowsDone: int           ## channel rows finished, counted from the top
+    ringNeedFrom: int       ## the lowest channel row the sink still needs
 
   JpegSourceProc* = ImageSourceProc
     ## Pull callback for streaming decodes: fill `dst` with up to `maxBytes`
@@ -143,6 +150,25 @@ type
     strip: int        ## the strip this pass over the file decodes
     scanIndex: int    ## the scan this pass is in, counted from 0
     scanBookmarks: seq[ScanBookmark] ## per scan: where the next strip starts
+    sink: Image       ## the target a scaled decode writes as it goes; nil
+                      ## fills an image from whole channel planes at the end
+    sinkActive: bool  ## the channels are rings and the sink draws the lines
+    sinkGeometry: FillGeometry
+    sinkLine: int     ## the next target line (row, or column when the
+                      ## orientation transposes) the sink will draw
+    sinkLineStep: int ## +1 or -1: lines in the order their grid rows finish
+    sinkLinesLeft: int
+
+  FillGeometry = object
+    ## Where the target's pixels sample the decoded grid: the fit's crop and
+    ## placement in oriented image space, and the grid's extent. fillImage
+    ## and the sink share it, so a line drawn early lands on the pixels the
+    ## whole fill would have drawn.
+    rects: tuple[srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH: int]
+    effWidth, effHeight: int
+    gridWidth, gridHeight: int
+    sampleSrcX, sampleSrcY, sampleSrcW, sampleSrcH: int64
+    transposed: bool
 
   JpegRewindProc* = proc(): bool {.gcsafe, raises: [].}
     ## Puts a streamed source back at its first byte, for a decode that
@@ -249,6 +275,43 @@ template `[]=`(view: UnsafeMask, x, y: int, color: uint8) =
 
 proc scaledCeil(value, scale, divisor: int): int {.inline.} =
   ((value.int64 * scale.int64 + divisor.int64 - 1) div divisor.int64).int
+
+proc ringRowsFor(sampleHeight, windowRows, bandRows: int): int =
+  ## Channel rows a sink ring must hold: what one band of source rows can
+  ## finish (a box downscale finishes about bandRows * sampleHeight /
+  ## windowRows of them, an upscale replicates each source row into
+  ## several), twice over, since a band is drained only when the next one
+  ## begins, plus the few rows the sink waits on while the subsampled
+  ## chroma it interpolates between catches up. Never more than the whole
+  ## channel.
+  let perBand =
+    if sampleHeight <= windowRows:
+      (bandRows * sampleHeight + windowRows - 1) div windowRows + 1
+    else:
+      bandRows * ((sampleHeight + windowRows - 1) div windowRows) + 1
+  min(sampleHeight, 2 * perBand + 8)
+
+template channelRow(component: Component, row: int): int =
+  ## Where channel row `row` lives: in a ring, its slot.
+  (if component.ringRows > 0: row mod component.ringRows else: row)
+
+template channelIndex(component: Component, x, row: int): int =
+  component.channel.width * component.channelRow(row) + x
+
+proc claimRingRow(component: var Component, row: int) =
+  ## Before writing channel row `row`: its ring slot held row - ringRows,
+  ## which the sink must be done with. Sizing keeps it so; this is the
+  ## check that a bug there is an error, not a wrong pixel.
+  if component.ringRows > 0 and row >= component.ringRows and
+      row - component.ringRows >= component.ringNeedFrom:
+    failInvalid("channel ring overrun")
+
+# The sink (defined with fillImage, below) is set up by the frame header
+# and fed by the scan and IDCT loops.
+proc fillGeometry(state: DecoderState, width, height: int): FillGeometry {.raises: [PixieError].}
+proc sinkStart(state: var DecoderState) {.raises: [PixieError].}
+proc sinkAfterMcuRow(state: var DecoderState) {.raises: [PixieError].}
+proc sinkRelease(state: var DecoderState) {.raises: [PixieError].}
 
 proc useScaledChannels(state: DecoderState): bool {.inline.} =
   ## Scaled (target-sized) channel masks are used whenever a scaled decode
@@ -705,6 +768,9 @@ proc decodeSOF0(state: var DecoderState) =
       var scales: seq[(int, int)]
       for component in state.components:
         scales.add((component.yScale, component.xScale))
+      let
+        ringSink = not state.sink.isNil
+        windowStorageRows = if swapped: state.winOW else: state.winOH
       proc scaledMaskBytes(tw, th: int): int64 =
         let
           gridW = if swapped: th else: tw
@@ -714,7 +780,15 @@ proc decodeSOF0(state: var DecoderState) =
             sampleW = max(1, scaledCeil(gridW, yScale, maxYScale))
             sampleH = max(1, scaledCeil(gridH, xScale, maxXScale))
             compWidth = scaledCeil(imageWidth, yScale, maxYScale)
-          result += sampleW.int64 * sampleH.int64 +
+            # A sink keeps a ring of rows, not the plane.
+            rows =
+              if ringSink:
+                ringRowsFor(sampleH,
+                  max(1, scaledCeil(windowStorageRows, xScale, maxXScale)),
+                  8 * xScale)
+              else:
+                sampleH
+          result += sampleW.int64 * rows.int64 +
             compWidth.int64 * (8 * xScale).int64 +
             2'i64 * sampleW.int64 * sizeof(uint32).int64
       let maskBudget = budget.int64 - blockTotal
@@ -830,6 +904,12 @@ proc decodeSOF0(state: var DecoderState) =
         for sx in 0 ..< winW:
           inc component.colCount[
             (sx.int64 * component.sampleWidth.int64).int div winW]
+      if not state.sink.isNil:
+        # Into a target: a ring of channel rows, drawn as they finish.
+        component.ringRows = ringRowsFor(component.sampleHeight,
+          component.winY1 - component.winY0, component.bandRows)
+        if component.ringRows < component.sampleHeight:
+          channelHeight = component.ringRows
 
     block:
       let
@@ -837,7 +917,8 @@ proc decodeSOF0(state: var DecoderState) =
         streamsBlocks = state.streamBaselineBlocks and not state.progressive
         maskBytes =
           if state.useScaledChannels():
-            # Channel plus the box sampler's band and accumulators.
+            # Channel (or its ring) plus the box sampler's band and
+            # accumulators.
             channelWidth.int64 * channelHeight.int64 +
               component.width.int64 * (8 * component.xScale).int64 +
               2'i64 * channelWidth.int64 * sizeof(uint32).int64
@@ -937,6 +1018,8 @@ proc decodeSOF0(state: var DecoderState) =
         newSeq[array[64, int16]](state.numMcuWide * component.yScale)
       )
     component.channel = newMask(component.channelWidth, component.channelHeight)
+    if component.ringRows >= component.sampleHeight:
+      component.ringRows = 0 # the whole channel: no ring arithmetic
     if state.useScaledChannels():
       # The box sampler's working set, counted in the plan above and
       # allocated only now that the plan passed the budget.
@@ -944,6 +1027,11 @@ proc decodeSOF0(state: var DecoderState) =
         component.width * component.bandRows)
       component.horizSums = newSeq[uint32](component.sampleWidth)
       component.rowSums = newSeq[uint32](component.sampleWidth)
+
+  if not state.sink.isNil and state.useScaledChannels():
+    state.sinkActive = true
+    state.sinkGeometry = state.fillGeometry(state.sink.width, state.sink.height)
+    state.sinkStart()
 
 proc decodeSOF1(state: var DecoderState) =
   failInvalid("unsupported extended sequential DCT format")
@@ -1148,6 +1236,10 @@ proc decodeSOS(state: var DecoderState) =
 
   if len != 0:
     failInvalid()
+
+  if state.scanComponents == 1 and state.components.len > 1 and
+      not state.progressive:
+    state.sinkRelease()
 
   state.reset()
 
@@ -1613,9 +1705,10 @@ proc writeScaledTargetRow(component: var Component, ty: int) =
   ## and writes the finished channel row.
   if ty < 0 or ty >= component.sampleHeight:
     return
+  component.claimRingRow(ty)
   let
     rows = max(1, component.rowSumsRows).uint32
-    outPos = ty * component.channel.width
+    outPos = component.channelIndex(0, ty)
   if component.colCount.len > 0:
     for tx in 0 ..< component.sampleWidth:
       let area = rows * component.colCount[tx].uint32
@@ -1629,6 +1722,7 @@ proc writeScaledTargetRow(component: var Component, ty: int) =
     component.rowSums[tx] = 0
   component.rowSumsRows = 0
   component.rowSumsTy = -1
+  component.rowsDone = max(component.rowsDone, ty + 1)
 
 proc foldScaledSourceRow(component: var Component, sy, rowStart: int) =
   ## Folds the sampled-window span of one source row from the band into the
@@ -1674,7 +1768,8 @@ proc foldScaledSourceRow(component: var Component, sy, rowStart: int) =
       tyLo = scaledCeil(wy, sampleHeight, winH)
       tyHi = min(sampleHeight, scaledCeil(wy + 1, sampleHeight, winH))
     for ty in tyLo ..< tyHi:
-      let outPos = ty * component.channel.width
+      component.claimRingRow(ty)
+      let outPos = component.channelIndex(0, ty)
       if component.colCount.len > 0:
         for tx in 0 ..< sampleWidth:
           let area = component.colCount[tx].uint32
@@ -1683,6 +1778,7 @@ proc foldScaledSourceRow(component: var Component, sy, rowStart: int) =
       else:
         for tx in 0 ..< sampleWidth:
           component.channel.data[outPos + tx] = component.horizSums[tx].uint8
+    component.rowsDone = max(component.rowsDone, tyHi)
 
 proc drainScaledBand(component: var Component) =
   ## Folds every not-yet-folded source row of the current band that the
@@ -1867,6 +1963,11 @@ proc decodeBlocks(state: var DecoderState) =
         else:
           state.decodeBlock(comp, row, column)
         state.checkRestart()
+      if streamBaselineBlocks and state.components.len == 1 and
+          ((column + 1) mod state.components[comp].xScale == 0 or column == h - 1):
+        # A single-component image: each band is complete as its block
+        # rows finish, and the sink can draw.
+        state.sinkAfterMcuRow()
   else:
     # Interleaved regular component pass.
     let
@@ -1885,6 +1986,8 @@ proc decodeBlocks(state: var DecoderState) =
               else:
                 state.decodeBlock(comp, row, col)
         state.checkRestart()
+      if streamBaselineBlocks:
+        state.sinkAfterMcuRow()
 
 proc decodeScan(state: var DecoderState) =
   ## The entropy-coded data after a SOS header. A whole-image decode reads
@@ -1917,18 +2020,32 @@ proc idctStrip(state: var DecoderState) =
 
   let lastStrip = (state.strip + 1) * state.stripMcuRows >= state.numMcuHigh
   for comp in 0 ..< state.components.len:
-    let
-      w = (state.components[comp].width + 7) div 8
-      h = (state.components[comp].height + 7) div 8
-      qTableId = state.components[comp].quantizationTableId
-      rows = state.stripBlockRows(comp)
-    if qTableId.int notin 0 ..< state.quantizationTables.len:
+    if state.components[comp].quantizationTableId.int notin
+        0 ..< state.quantizationTables.len:
       failInvalid()
-    for column in rows.first ..< min(h, rows.last):
-      for row in 0 ..< w:
-        var data {.byaddr.} =
-          state.components[comp].blocks[column - rows.first][row]
-        state.dequantizeAndIDCTBlock(comp, row, column, data)
+  # MCU row by MCU row, every component's blocks of it: per component that
+  # is still raster order, and after each row the sink has a complete band
+  # from every component to draw from.
+  let
+    firstMcuY = state.strip * state.stripMcuRows
+    lastMcuY = min(state.numMcuHigh, firstMcuY + state.stripMcuRows)
+  for mcuY in firstMcuY ..< lastMcuY:
+    for comp in 0 ..< state.components.len:
+      let
+        w = (state.components[comp].width + 7) div 8
+        h = (state.components[comp].height + 7) div 8
+        xScale = state.components[comp].xScale
+        first = firstMcuY * xScale
+      for compY in 0 ..< xScale:
+        let column = mcuY * xScale + compY
+        if column >= h:
+          break
+        for row in 0 ..< w:
+          var data {.byaddr.} =
+            state.components[comp].blocks[column - first][row]
+          state.dequantizeAndIDCTBlock(comp, row, column, data)
+    state.sinkAfterMcuRow()
+  for comp in 0 ..< state.components.len:
     if lastStrip:
       state.components[comp].blocks = @[]
       state.components[comp].coeff = @[]
@@ -2039,12 +2156,12 @@ proc channelAt(
     ax = channelAxis(sourceX, sourceWidth, sampleWidth, component.width)
     ay = channelAxis(sourceY, sourceHeight, sampleHeight, component.height)
   if ax.frac == 0 and ay.frac == 0:
-    return component.channel.data[component.channel.dataIndex(ax.lo, ay.lo)]
+    return component.channel.data[component.channelIndex(ax.lo, ay.lo)]
   let
-    c00 = component.channel.data[component.channel.dataIndex(ax.lo, ay.lo)].int
-    c10 = component.channel.data[component.channel.dataIndex(ax.hi, ay.lo)].int
-    c01 = component.channel.data[component.channel.dataIndex(ax.lo, ay.hi)].int
-    c11 = component.channel.data[component.channel.dataIndex(ax.hi, ay.hi)].int
+    c00 = component.channel.data[component.channelIndex(ax.lo, ay.lo)].int
+    c10 = component.channel.data[component.channelIndex(ax.hi, ay.lo)].int
+    c01 = component.channel.data[component.channelIndex(ax.lo, ay.hi)].int
+    c11 = component.channel.data[component.channelIndex(ax.hi, ay.hi)].int
     top = c00 * (ax.den - ax.frac) + c10 * ax.frac
     bottom = c01 * (ax.den - ax.frac) + c11 * ax.frac
     total = top * (ay.den - ay.frac) + bottom * ay.frac
@@ -2092,88 +2209,195 @@ proc scaledFitRects(
       result.dstX = (targetWidth - fitW) div 2
       result.dstW = fitW
 
-proc fillImage(state: var DecoderState, result: Image) =
-  ## Takes a jpeg image object and fills a target-sized pixie Image from it.
-  ## With fitContain, pixels outside the fitted rectangle keep their current
-  ## contents (callers pre-fill the background).
-  ##
+proc fillGeometry(state: DecoderState, width, height: int): FillGeometry {.raises: [PixieError].} =
   ## Geometry — the crop and where it lands — is decided in image space; the
   ## pixel walk then addresses the sample grid the channels were actually
   ## decoded on. It used to go target -> image -> sample instead, and the
   ## double floor division duplicated some sample columns and skipped others:
   ## extra aliasing, on top of nearest, for every non-integer downscale.
+  let oriented = state.orientedDimensions()
+  result.rects = state.scaledFitRects(width, height)
+  result.effWidth =
+    if state.effectiveWidth > 0: state.effectiveWidth else: oriented.width
+  result.effHeight =
+    if state.effectiveHeight > 0: state.effectiveHeight else: oriented.height
+  result.transposed = state.orientation in {5, 6, 7, 8}
+  result.gridWidth = if result.transposed: result.effHeight else: result.effWidth
+  result.gridHeight = if result.transposed: result.effWidth else: result.effHeight
+  # The image-space crop, mapped onto the (oriented) sample grid. The grid
+  # covers the sampled window, not always the whole source — for cover it
+  # IS the crop (same integer math in the SOF window and in
+  # scaledFitRects), so this comes back as (0, 0, effWidth, effHeight) and
+  # one grid pixel per target pixel when densities match. Rounded, and
+  # window-relative; a full-source window reduces to the old math.
   let
-    oriented = state.orientedDimensions()
-    rects = state.scaledFitRects(result.width, result.height)
-    effWidth =
-      if state.effectiveWidth > 0: state.effectiveWidth else: oriented.width
-    effHeight =
-      if state.effectiveHeight > 0: state.effectiveHeight else: oriented.height
-    gridWidth =
-      if state.orientation in {5, 6, 7, 8}: effHeight else: effWidth
-    gridHeight =
-      if state.orientation in {5, 6, 7, 8}: effWidth else: effHeight
-    # The image-space crop, mapped onto the (oriented) sample grid. The
-    # grid covers the sampled window, not always the whole source — for
-    # cover it IS the crop (same integer math in the SOF window and in
-    # scaledFitRects), so this comes back as (0, 0, effWidth, effHeight)
-    # and one grid pixel per target pixel when densities match. Rounded,
-    # and window-relative; a full-source window reduces to the old math.
     winOW = max(1, state.winOW)
     winOH = max(1, state.winOH)
-    sampleSrcX = ((rects.srcX - state.winOX).int64 * effWidth.int64 +
-      winOW div 2) div winOW
-    sampleSrcY = ((rects.srcY - state.winOY).int64 * effHeight.int64 +
-      winOH div 2) div winOH
-    sampleSrcW = max(1'i64, (rects.srcW.int64 * effWidth.int64 +
-      winOW div 2) div winOW)
-    sampleSrcH = max(1'i64, (rects.srcH.int64 * effHeight.int64 +
-      winOH div 2) div winOH)
+  result.sampleSrcX = ((result.rects.srcX - state.winOX).int64 *
+    result.effWidth.int64 + winOW div 2) div winOW
+  result.sampleSrcY = ((result.rects.srcY - state.winOY).int64 *
+    result.effHeight.int64 + winOH div 2) div winOH
+  result.sampleSrcW = max(1'i64, (result.rects.srcW.int64 *
+    result.effWidth.int64 + winOW div 2) div winOW)
+  result.sampleSrcH = max(1'i64, (result.rects.srcH.int64 *
+    result.effHeight.int64 + winOH div 2) div winOH)
 
-  template orientedYFor(y: int): int =
-    min(
-      (sampleSrcY + ((y - rects.dstY).int64 * sampleSrcH) div rects.dstH).int,
-      effHeight - 1
+template orientedYFor(g: FillGeometry, y: int): int =
+  min(
+    (g.sampleSrcY + ((y - g.rects.dstY).int64 * g.sampleSrcH) div g.rects.dstH).int,
+    g.effHeight - 1
+  )
+
+template orientedXFor(g: FillGeometry, x: int): int =
+  min(
+    (g.sampleSrcX + ((x - g.rects.dstX).int64 * g.sampleSrcW) div g.rects.dstW).int,
+    g.effWidth - 1
+  )
+
+proc samplePixel(
+  state: DecoderState, g: FillGeometry, orientedX, orientedY: int
+): ColorRGBX {.inline.} =
+  let source = state.sourceCoords(orientedX, orientedY, g.gridWidth, g.gridHeight)
+  if state.components.len == 3:
+    yCbCrToRgbx(
+      state.components[0].channelAt(source.x, source.y, g.gridWidth, g.gridHeight),
+      state.components[1].channelAt(source.x, source.y, g.gridWidth, g.gridHeight),
+      state.components[2].channelAt(source.x, source.y, g.gridWidth, g.gridHeight)
     )
-
-  template orientedXFor(x: int): int =
-    min(
-      (sampleSrcX + ((x - rects.dstX).int64 * sampleSrcW) div rects.dstW).int,
-      effWidth - 1
-    )
-
-  case state.components.len:
-  of 3:
-    let
-      yComponent = state.components[0]
-      cbComponent = state.components[1]
-      crComponent = state.components[2]
-    for y in rects.dstY ..< rects.dstY + rects.dstH:
-      let orientedY = orientedYFor(y)
-      for x in rects.dstX ..< rects.dstX + rects.dstW:
-        let
-          orientedX = orientedXFor(x)
-          source = state.sourceCoords(orientedX, orientedY, gridWidth, gridHeight)
-        result.unsafe[x, y] = yCbCrToRgbx(
-          yComponent.channelAt(source.x, source.y, gridWidth, gridHeight),
-          cbComponent.channelAt(source.x, source.y, gridWidth, gridHeight),
-          crComponent.channelAt(source.x, source.y, gridWidth, gridHeight)
-        )
-
-  of 1:
-    let yComponent = state.components[0]
-    for y in rects.dstY ..< rects.dstY + rects.dstH:
-      let orientedY = orientedYFor(y)
-      for x in rects.dstX ..< rects.dstX + rects.dstW:
-        let
-          orientedX = orientedXFor(x)
-          source = state.sourceCoords(orientedX, orientedY, gridWidth, gridHeight)
-        result.unsafe[x, y] = grayScaleToRgbx(
-          yComponent.channelAt(source.x, source.y, gridWidth, gridHeight)
-        )
-
   else:
+    grayScaleToRgbx(
+      state.components[0].channelAt(source.x, source.y, g.gridWidth, g.gridHeight)
+    )
+
+proc fillImage(state: var DecoderState, result: Image) =
+  ## Takes a jpeg image object and fills a target-sized pixie Image from it.
+  ## With fitContain, pixels outside the fitted rectangle keep their current
+  ## contents (callers pre-fill the background).
+  if state.components.len notin {1, 3}:
     failInvalid()
+  let g = state.fillGeometry(result.width, result.height)
+  for y in g.rects.dstY ..< g.rects.dstY + g.rects.dstH:
+    let orientedY = g.orientedYFor(y)
+    for x in g.rects.dstX ..< g.rects.dstX + g.rects.dstW:
+      result.unsafe[x, y] = state.samplePixel(g, g.orientedXFor(x), orientedY)
+
+# ----------------------------------------------------------------- the sink
+#
+# A decode into a target used to finish every channel plane, target-sized,
+# and then fill the target from them: 1.5 bytes per target pixel at 4:2:0,
+# 2.9 MB for a 13.3" panel, which the budget on an 8 MB board clamped to a
+# soft 646x862 grid. With a sink the planes are rings of rows (ringRowsFor),
+# and after every MCU row the lines whose samples every component has
+# finished are drawn into the target, the way fillImage would have drawn
+# them: same geometry, same samples, so the pixels are the same.
+#
+# A line is a target row, or a target column when the EXIF orientation
+# transposes, and it reads one row of the sample grid. Lines are drawn in
+# the order their grid rows finish, which a flip makes bottom-up.
+
+proc gridRowOfLine(state: DecoderState, line: int): int =
+  ## The grid row (storage order) a target line samples.
+  let g = state.sinkGeometry
+  if g.transposed:
+    state.sourceCoords(g.orientedXFor(line), 0, g.gridWidth, g.gridHeight).y
+  else:
+    state.sourceCoords(0, g.orientedYFor(line), g.gridWidth, g.gridHeight).y
+
+proc sinkNeeds(state: var DecoderState) =
+  ## Tells every component the lowest channel row the sink still reads,
+  ## which is what its ring may not overwrite.
+  let g = state.sinkGeometry
+  for component in state.components.mitems:
+    if state.sinkLinesLeft <= 0:
+      component.ringNeedFrom = component.sampleHeight
+    else:
+      component.ringNeedFrom = channelAxis(
+        state.gridRowOfLine(state.sinkLine), g.gridHeight,
+        component.sampleHeight, component.height).lo
+
+proc sinkStart(state: var DecoderState) {.raises: [PixieError].} =
+  let
+    g = state.sinkGeometry
+    first = if g.transposed: g.rects.dstX else: g.rects.dstY
+    count = if g.transposed: g.rects.dstW else: g.rects.dstH
+  state.sinkLinesLeft = count
+  if count > 0 and
+      state.gridRowOfLine(first + count - 1) < state.gridRowOfLine(first):
+    state.sinkLine = first + count - 1
+    state.sinkLineStep = -1
+  else:
+    state.sinkLine = first
+    state.sinkLineStep = 1
+  state.sinkNeeds()
+
+proc sinkReady(state: DecoderState, gridRow: int): bool =
+  ## Whether every component has finished the channel rows this grid row
+  ## samples (two, where subsampled chroma interpolates).
+  for component in state.components:
+    let rows = channelAxis(gridRow, state.sinkGeometry.gridHeight,
+      component.sampleHeight, component.height)
+    if rows.hi >= component.rowsDone:
+      return false
+  true
+
+proc drawLine(state: DecoderState, line: int) =
+  let g = state.sinkGeometry
+  if g.transposed:
+    let orientedX = g.orientedXFor(line)
+    for y in g.rects.dstY ..< g.rects.dstY + g.rects.dstH:
+      state.sink.unsafe[line, y] = state.samplePixel(g, orientedX, g.orientedYFor(y))
+  else:
+    let orientedY = g.orientedYFor(line)
+    for x in g.rects.dstX ..< g.rects.dstX + g.rects.dstW:
+      state.sink.unsafe[x, line] = state.samplePixel(g, g.orientedXFor(x), orientedY)
+
+proc sinkDrain(state: var DecoderState) =
+  ## Draws every line whose samples are complete.
+  var drew = false
+  while state.sinkLinesLeft > 0 and
+      state.sinkReady(state.gridRowOfLine(state.sinkLine)):
+    state.drawLine(state.sinkLine)
+    state.sinkLine += state.sinkLineStep
+    dec state.sinkLinesLeft
+    drew = true
+  if drew:
+    state.sinkNeeds()
+
+proc sinkAfterMcuRow(state: var DecoderState) {.raises: [PixieError].} =
+  ## Every component has a complete band: fold it into the channels, then
+  ## draw what became complete.
+  if not state.sinkActive:
+    return
+  for component in state.components.mitems:
+    component.drainScaledBand()
+  state.sinkDrain()
+
+proc sinkRelease(state: var DecoderState) {.raises: [PixieError].} =
+  ## A scan whose blocks arrive one component at a time (a baseline JPEG
+  ## with separate scans per component) cannot feed the sink, which needs
+  ## every component's rows at once: give the channels their whole planes,
+  ## if the budget has them, and fill the target at the end as before.
+  if not state.sinkActive:
+    return
+  var extra: int64
+  for component in state.components:
+    if component.ringRows > 0:
+      extra += component.channel.width.int64 *
+        (component.sampleHeight - component.ringRows).int64
+  if overDecodeBudget(state.plannedDecodeBytes + extra):
+    failInvalid(
+      "JPEG decode of " & $state.imageWidth & "x" & $state.imageHeight &
+      " with non-interleaved scans needs " &
+      $((state.plannedDecodeBytes + extra) div 1024) &
+      "K of decode buffers, over the " &
+      $(decodeBudgetBytes() div 1024) & "K memory budget"
+    )
+  state.plannedDecodeBytes += extra
+  for component in state.components.mitems:
+    if component.ringRows > 0:
+      component.channel = newMask(component.channel.width, component.sampleHeight)
+      component.ringRows = 0
+  state.sinkActive = false
 
 proc ensureOutputBudget(state: DecoderState, width, height: int) =
   ## The SOF plan check covers the decode buffers; the output image the
@@ -2301,7 +2525,8 @@ proc decodeJpegState(
   streamBaselineBlocks = false,
   scaledTargetWidth = 0,
   scaledTargetHeight = 0,
-  fit = fitStretch
+  fit = fitStretch,
+  sink: Image = nil
 ): DecoderState {.raises: [PixieError].} =
   var state = DecoderState()
   state.buffer = cast[ptr UncheckedArray[uint8]](data)
@@ -2310,6 +2535,7 @@ proc decodeJpegState(
   state.scaledTargetWidth = scaledTargetWidth
   state.scaledTargetHeight = scaledTargetHeight
   state.scaledFit = fit
+  state.sink = sink
   runJpegDecode(state)
   state
 
@@ -2318,7 +2544,8 @@ proc decodeJpegStateStream(
   totalLen: int,
   scaledTargetWidth, scaledTargetHeight: int,
   fit = fitStretch,
-  rewind: JpegRewindProc = nil
+  rewind: JpegRewindProc = nil,
+  sink: Image = nil
 ): DecoderState {.raises: [PixieError].} =
   ## Decodes a JPEG pulled incrementally from `readProc` through a small
   ## sliding window, never holding the whole input in memory.
@@ -2334,8 +2561,15 @@ proc decodeJpegStateStream(
   state.scaledTargetWidth = scaledTargetWidth
   state.scaledTargetHeight = scaledTargetHeight
   state.scaledFit = fit
+  state.sink = sink
   runJpegDecode(state)
   state
+
+proc fillTarget(state: var DecoderState, target: Image) =
+  ## After a decode into `target`: the sink has drawn it, or the channel
+  ## planes are whole and the fill draws it now.
+  if not state.sinkActive:
+    state.fillImage(target)
 
 proc decodeSegments(state: var DecoderState) =
   ## One pass over the file: every marker segment up to the end of image.
@@ -2426,6 +2660,10 @@ proc runJpegDecode(state: var DecoderState) {.raises: [PixieError].} =
     # so the channels are fully written before anything reads them.
     for component in state.components.mitems:
       component.finalizeScaledChannel()
+    if state.sinkActive:
+      state.sinkDrain()
+      if state.sinkLinesLeft != 0:
+        failInvalid("the sink left " & $state.sinkLinesLeft & " lines undrawn")
 
 proc decodeJpeg*(data: string): Image {.raises: [PixieError].} =
   ## Decodes the JPEG into an Image.
@@ -2458,9 +2696,10 @@ proc decodeJpegScaledInto*(
     true,
     target.width,
     target.height,
-    fit
+    fit,
+    target
   )
-  state.fillImage(target)
+  state.fillTarget(target)
 
 proc decodeJpegScaled*(
   data: var string, width, height: int, fit = fitStretch
@@ -2491,10 +2730,11 @@ proc decodeJpegScaledInto*(
     true,
     target.width,
     target.height,
-    fit
+    fit,
+    target
   )
   data = ""
-  state.fillImage(target)
+  state.fillTarget(target)
 
 proc decodeJpegScaled*(
   data: string, width, height: int, fit = fitStretch
@@ -2534,9 +2774,9 @@ proc decodeJpegStreamScaledInto*(
   if target.isNil or target.width <= 0 or target.height <= 0:
     raise newException(PixieError, "Target image width and height must be > 0")
   var state = decodeJpegStateStream(
-    readProc, totalLen, target.width, target.height, fit, rewind
+    readProc, totalLen, target.width, target.height, fit, rewind, target
   )
-  state.fillImage(target)
+  state.fillTarget(target)
 
 proc decodeJpegDimensions*(
   data: pointer, len: int
