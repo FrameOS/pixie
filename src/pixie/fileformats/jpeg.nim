@@ -137,6 +137,28 @@ type
       ## covered onto a 3:4 panel paid double before this window existed).
     plannedDecodeBytes: int64 ## what the SOF plan check accounted for, so the
                               ## build step can budget its output image on top
+    rewindProc: JpegRewindProc ## nil: the stream cannot be read a second time
+    stripMcuRows: int ## MCU rows of coefficients resident at once (see
+                      ## decodeSOF0); numMcuHigh holds the whole image
+    strip: int        ## the strip this pass over the file decodes
+    scanIndex: int    ## the scan this pass is in, counted from 0
+    scanBookmarks: seq[ScanBookmark] ## per scan: where the next strip starts
+
+  JpegRewindProc* = proc(): bool {.gcsafe, raises: [].}
+    ## Puts a streamed source back at its first byte, for a decode that
+    ## reads the input more than once (a progressive JPEG in strips).
+    ## Answers false when it cannot, and the decode fails catchably.
+
+  ScanBookmark = object
+    ## The entropy decoder at a strip boundary inside one scan: enough to
+    ## pick the scan up there on the next pass. The bit reader is a byte
+    ## offset plus whatever it had already pulled into its buffer; the
+    ## rest is the run state a restart marker would reset.
+    pos, bitsBuffered: int
+    bitBuffer: uint32
+    hitEnd: bool
+    eobRun, todoBeforeRestart: int
+    dcPred: array[4, int]
 
   Mask = ref object
     ## Mask object that holds mask opacity data.
@@ -144,6 +166,14 @@ type
     data*: seq[uint8]
 
   UnsafeMask = distinct Mask
+
+var jpegStripMcuRows {.threadvar.}: int
+
+proc setJpegStripMcuRows*(rows: int) {.raises: [].} =
+  ## Decodes progressive JPEGs in strips of at most `rows` MCU rows,
+  ## whatever the memory budget would allow. 0, the default, lets the budget
+  ## decide (decodeSOF0). For tests, and for bounding a pass's work.
+  jpegStripMcuRows = max(0, rows)
 
 when defined(release):
   {.push checks: off.}
@@ -293,6 +323,22 @@ proc ensureBytes(state: var DecoderState, absPos, count: int): bool {.inline.} =
 template at(state: DecoderState, absPos: int): uint8 =
   ## Reads the input byte at an absolute offset; call `ensureBytes` first.
   state.buffer[absPos - state.windowStart]
+
+proc seekTo(state: var DecoderState, absPos: int) =
+  ## Moves the read position, forward or back. A buffer is addressed; a
+  ## stream is read on through to a forward position, and rewound through
+  ## `rewindProc` for a backward one, which only a strip decode asks for.
+  if state.readProc == nil:
+    state.pos = absPos
+    return
+  if absPos < state.windowStart:
+    if state.rewindProc == nil or not state.rewindProc():
+      failInvalid("input stream could not be rewound")
+    state.windowStart = 0
+    state.windowLen = 0
+  state.pos = absPos
+  if absPos < state.len and not state.ensureBytes(absPos, 1):
+    failInvalid("input stream ended early")
 
 proc readUint8(state: var DecoderState): uint8 =
   ## Reads a byte from the input stream.
@@ -512,6 +558,24 @@ proc decodeDHT(state: var DecoderState) =
       return
     failInvalid()
 
+proc coefficientBytesPerMcuRow(state: DecoderState): int64 =
+  ## What one MCU row of resident coefficient blocks costs, every component
+  ## counted; 0 when the decode streams its blocks through the IDCT.
+  if state.streamBaselineBlocks and not state.progressive:
+    return 0
+  for component in state.components:
+    result += (state.numMcuWide * component.yScale).int64 *
+      component.xScale.int64 * 64 * sizeof(int16)
+
+proc leastStripMcuRows(state: DecoderState): int =
+  ## The fewest MCU rows a strip decode could hold: what the mask plan has
+  ## to leave room for before the strip count is known.
+  if not state.progressive:
+    return state.numMcuHigh
+  if jpegStripMcuRows > 0:
+    return min(state.numMcuHigh, jpegStripMcuRows)
+  1
+
 proc decodeSOF0(state: var DecoderState) =
   ## Decode start of Frame
   if state.foundSOF:
@@ -627,11 +691,12 @@ proc decodeSOF0(state: var DecoderState) =
     # done (every 4:4:4 photo on the 13.3" panel, 2026-09-05).
     let budget = decodeBudgetBytes()
     if budget > 0:
-      var blockTotal: int64
-      for component in state.components:
-        if not (state.streamBaselineBlocks and not state.progressive):
-          blockTotal += (state.numMcuWide * component.yScale).int64 *
-            (state.numMcuHigh * component.xScale).int64 * 64 * sizeof(int16)
+      # The coefficient store the masks must leave room for. A progressive
+      # decode keeps one strip of it (stripMcuRows, below), so this counts
+      # the smallest strip and lets the masks keep their resolution; the
+      # strip count then comes from what the masks leave.
+      let blockTotal =
+        state.coefficientBytesPerMcuRow() * state.leastStripMcuRows().int64
       let
         swapped = state.orientation in {5, 6, 7, 8}
         maxYScale = state.maxYScale
@@ -769,11 +834,7 @@ proc decodeSOF0(state: var DecoderState) =
     block:
       let
         blockColumns = state.numMcuWide * component.yScale
-        blockRows = state.numMcuHigh * component.xScale
         streamsBlocks = state.streamBaselineBlocks and not state.progressive
-        blockBytes =
-          if streamsBlocks: 0'i64
-          else: blockColumns.int64 * blockRows.int64 * 64'i64 * sizeof(int16).int64
         maskBytes =
           if state.useScaledChannels():
             # Channel plus the box sampler's band and accumulators.
@@ -795,7 +856,6 @@ proc decodeSOF0(state: var DecoderState) =
               fullBytes
             else:
               fullBytes + fullBytes div 2
-      totalBlockBytes += blockBytes
       totalMaskBytes += maskBytes
       # The channel mask is one allocation; on the reconstruction path the
       # magnified full-stride plane is the biggest one instead.
@@ -806,6 +866,10 @@ proc decodeSOF0(state: var DecoderState) =
           (state.numMcuWide * state.maxYScale * 8).int64 *
             (state.numMcuHigh * state.maxXScale * 8).int64
       largestSingleBytes = max(largestSingleBytes, largestBuffer)
+      if not streamsBlocks:
+        # Coefficients are held a block row per allocation.
+        largestSingleBytes = max(largestSingleBytes,
+          blockColumns.int64 * 64 * sizeof(int16))
 
     component.channelWidth = channelWidth
     component.channelHeight = channelHeight
@@ -816,6 +880,31 @@ proc decodeSOF0(state: var DecoderState) =
 
   if len != 0:
     failInvalid()
+
+  # A progressive JPEG's coefficients stay resident until its last scan has
+  # refined them, so a whole image's worth costs 3 bytes per source pixel
+  # at 4:2:0: 5.8 MB for a 13.3" panel, on a board with under 1 MB to
+  # spend. So the decode runs in strips of MCU rows. Every pass over the
+  # file reads, from each scan, only its strip's blocks, bookmarks where the
+  # next strip begins, and skips to the marker that ends the scan; one strip
+  # of coefficients is all that ever exists (decodeScan, runJpegDecode). As
+  # many rows as the budget holds beside the masks, or every row when it
+  # holds them all, which is what every decode did before. A baseline
+  # decode that keeps its blocks keeps them whole: it is one scan.
+  state.stripMcuRows = state.numMcuHigh
+  let perRow = state.coefficientBytesPerMcuRow()
+  if state.progressive and perRow > 0:
+    if jpegStripMcuRows > 0:
+      state.stripMcuRows = min(state.numMcuHigh, jpegStripMcuRows)
+    elif decodeBudgetBytes() > 0:
+      let room = decodeBudgetBytes().int64 - totalMaskBytes
+      state.stripMcuRows =
+        clamp(room div perRow, 1'i64, state.numMcuHigh.int64).int
+  totalBlockBytes = perRow * state.stripMcuRows.int64
+  if state.stripMcuRows < state.numMcuHigh and state.readProc != nil and
+      state.rewindProc == nil:
+    # Every strip after the first reads the file again from its start.
+    failInvalid("progressive JPEG cannot be decoded from a stream")
 
   # Check the whole decode plan against the memory budget before any
   # image-sized allocation happens, so oversized inputs fail with a
@@ -840,12 +929,12 @@ proc decodeSOF0(state: var DecoderState) =
 
   for component in state.components.mitems:
     if not (state.streamBaselineBlocks and not state.progressive):
-      # Allocate block data structures.
+      # One strip of coefficient blocks, a seq per block row: a 13.3" luma
+      # row is 19 KB, where a whole-image luma plane was one 3.8 MB
+      # allocation a fragmented heap could not make.
       component.blocks = newSeqWith(
-        state.numMcuWide * component.yScale,
-        newSeq[array[64, int16]](
-          state.numMcuHigh * component.xScale
-        )
+        state.stripMcuRows * component.xScale,
+        newSeq[array[64, int16]](state.numMcuWide * component.yScale)
       )
     component.channel = newMask(component.channelWidth, component.channelHeight)
     if state.useScaledChannels():
@@ -861,10 +950,7 @@ proc decodeSOF1(state: var DecoderState) =
 
 proc decodeSOF2(state: var DecoderState) =
   ## Decode Start of Image (Progressive DCT format)
-  if state.readProc != nil:
-    # Progressive scans need random access across the whole entropy stream.
-    failInvalid("progressive JPEG cannot be decoded from a stream")
-  # Same as SOF0
+  # Same as SOF0, whose strip plan says whether a stream can carry it.
   state.progressive = true
   state.decodeSOF0()
 
@@ -968,6 +1054,26 @@ proc reset(state: var DecoderState) =
   else:
     state.todoBeforeRestart = int.high
   state.eobRun = 0
+
+proc captureBookmark(state: DecoderState): ScanBookmark =
+  result = ScanBookmark(pos: state.pos, bitsBuffered: state.bitsBuffered,
+    bitBuffer: state.bitBuffer, hitEnd: state.hitEnd, eobRun: state.eobRun,
+    todoBeforeRestart: state.todoBeforeRestart)
+  # Indexed, not `for i, component in`: a seq's pairs iterator hands out
+  # copies, and a component's copy brings its strip of blocks with it, 1.7
+  # MB for a 13.3" luma strip, at every strip boundary of every scan.
+  for i in 0 ..< state.components.len:
+    result.dcPred[i] = state.components[i].dcPred
+
+proc restoreBookmark(state: var DecoderState, mark: ScanBookmark) =
+  state.seekTo(mark.pos)
+  state.bitsBuffered = mark.bitsBuffered
+  state.bitBuffer = mark.bitBuffer
+  state.hitEnd = mark.hitEnd
+  state.eobRun = mark.eobRun
+  state.todoBeforeRestart = mark.todoBeforeRestart
+  for i in 0 ..< state.components.len:
+    state.components[i].dcPred = mark.dcPred[i]
 
 proc decodeSOS(state: var DecoderState) =
   ## Decode Start of Scan - header before the block data.
@@ -1078,6 +1184,35 @@ proc seekEntropyMarker(state: var DecoderState): bool =
       return true
 
     pos = markerPos + 1
+
+proc skipToScanEnd(state: var DecoderState) =
+  ## Moves to the marker that ends the current scan without decoding the
+  ## entropy-coded data in between: the first 0xFF that is neither a stuffed
+  ## data byte (0xFF00), a restart marker, nor fill (0xFFFF). The read
+  ## position is past every byte the bit reader took, so a marker it had
+  ## reached is still ahead.
+  state.bitBuffer = 0
+  state.bitsBuffered = 0
+  state.hitEnd = false
+  var pos = state.pos
+  if state.readProc == nil:
+    let buffer = state.buffer
+    while pos + 1 < state.len:
+      if buffer[pos] == 0xFF:
+        let marker = buffer[pos + 1]
+        if marker != 0 and marker != 0xFF and marker notin 0xD0'u8 .. 0xD7'u8:
+          state.pos = pos
+          return
+      inc pos
+  else:
+    while pos + 1 < state.len and state.ensureBytes(pos, 2):
+      if state.at(pos) == 0xFF:
+        let marker = state.at(pos + 1)
+        if marker != 0 and marker != 0xFF and marker notin 0xD0'u8 .. 0xD7'u8:
+          state.pos = pos
+          return
+      inc pos
+  state.pos = state.len
 
 proc fillBitBuffer(state: var DecoderState) =
   ## When we are low on bits, we need to call this to populate some more.
@@ -1638,9 +1773,19 @@ proc decodeRegularBlockIntoChannel(
   state.decodeRegularBlock(comp, data)
   state.dequantizeAndIDCTBlock(comp, row, column, data)
 
+proc stripBlockRows(state: DecoderState, comp: int): tuple[first, last: int] =
+  ## The block rows of component `comp` the current strip holds, [first,
+  ## last) in the component's MCU-padded block grid. A whole-image decode is
+  ## one strip of every row.
+  let xScale = state.components[comp].xScale
+  result.first = state.strip * state.stripMcuRows * xScale
+  result.last =
+    min(state.numMcuHigh, (state.strip + 1) * state.stripMcuRows) * xScale
+
 proc decodeBlock(state: var DecoderState, comp, row, column: int) =
-  ## Decodes a block.
-  var data {.byaddr.} = state.components[comp].blocks[row][column]
+  ## Decodes a block into the strip's coefficient store.
+  var data {.byaddr.} =
+    state.components[comp].blocks[column - state.stripBlockRows(comp).first][row]
   if state.progressive:
     if state.spectralStart == 0:
       state.decodeProgressiveBlock(comp, data)
@@ -1705,7 +1850,8 @@ proc checkRestart(state: var DecoderState) =
     state.reset()
 
 proc decodeBlocks(state: var DecoderState) =
-  ## Decodes scan data blocks that follow a SOS block.
+  ## Decodes the scan data blocks that follow a SOS block: the whole scan,
+  ## or the current strip's share of it.
   let streamBaselineBlocks = state.streamBaselineBlocks and not state.progressive
   if state.scanComponents == 1:
     # Single component pass.
@@ -1713,7 +1859,8 @@ proc decodeBlocks(state: var DecoderState) =
       comp = state.componentOrder[0]
       w = (state.components[comp].width + 7) div 8
       h = (state.components[comp].height + 7) div 8
-    for column in 0 ..< h:
+      rows = state.stripBlockRows(comp)
+    for column in rows.first ..< min(h, rows.last):
       for row in 0 ..< w:
         if streamBaselineBlocks:
           state.decodeRegularBlockIntoChannel(comp, row, column)
@@ -1722,7 +1869,10 @@ proc decodeBlocks(state: var DecoderState) =
         state.checkRestart()
   else:
     # Interleaved regular component pass.
-    for mcuY in 0 ..< state.numMcuHigh:
+    let
+      firstMcuY = state.strip * state.stripMcuRows
+      lastMcuY = min(state.numMcuHigh, firstMcuY + state.stripMcuRows)
+    for mcuY in firstMcuY ..< lastMcuY:
       for mcuX in 0 ..< state.numMcuWide:
         for comp in state.componentOrder:
           for compY in 0 ..< state.components[comp].xScale:
@@ -1736,26 +1886,57 @@ proc decodeBlocks(state: var DecoderState) =
                 state.decodeBlock(comp, row, col)
         state.checkRestart()
 
-proc quantizationAndIDCTPass(state: var DecoderState) =
-  ## Does quantization and IDCT.
+proc decodeScan(state: var DecoderState) =
+  ## The entropy-coded data after a SOS header. A whole-image decode reads
+  ## all of it. A strip decode picks the scan up where the previous pass
+  ## left it, reads its own MCU rows, notes where the next strip's begin,
+  ## and moves to the marker that ends the scan without reading the rest.
+  let striped = state.stripMcuRows < state.numMcuHigh
+  if striped and state.strip > 0:
+    if state.scanIndex >= state.scanBookmarks.len:
+      failInvalid("a scan the first pass did not see")
+    state.restoreBookmark(state.scanBookmarks[state.scanIndex])
+  state.decodeBlocks()
+  if striped:
+    if (state.strip + 1) * state.stripMcuRows < state.numMcuHigh:
+      let mark = state.captureBookmark()
+      if state.scanIndex < state.scanBookmarks.len:
+        state.scanBookmarks[state.scanIndex] = mark
+      else:
+        state.scanBookmarks.add(mark)
+    state.skipToScanEnd()
+  inc state.scanIndex
+
+proc idctStrip(state: var DecoderState) =
+  ## Dequantizes and inverse-transforms the blocks the strip holds (every
+  ## block of the image when it holds them all), component by component in
+  ## raster order, which the box sampler's bands rely on. Then clears them
+  ## for the next strip, or frees them after the last.
   if state.streamBaselineBlocks and not state.progressive:
     return
 
+  let lastStrip = (state.strip + 1) * state.stripMcuRows >= state.numMcuHigh
   for comp in 0 ..< state.components.len:
     let
       w = (state.components[comp].width + 7) div 8
       h = (state.components[comp].height + 7) div 8
       qTableId = state.components[comp].quantizationTableId
+      rows = state.stripBlockRows(comp)
     if qTableId.int notin 0 ..< state.quantizationTables.len:
       failInvalid()
-    for column in 0 ..< h:
+    for column in rows.first ..< min(h, rows.last):
       for row in 0 ..< w:
-        var data {.byaddr.} = state.components[comp].blocks[row][column]
-
+        var data {.byaddr.} =
+          state.components[comp].blocks[column - rows.first][row]
         state.dequantizeAndIDCTBlock(comp, row, column, data)
-    state.components[comp].blocks = @[]
-    state.components[comp].coeff = @[]
-    state.components[comp].lineBuf = @[]
+    if lastStrip:
+      state.components[comp].blocks = @[]
+      state.components[comp].coeff = @[]
+      state.components[comp].lineBuf = @[]
+    else:
+      for blockRow in state.components[comp].blocks.mitems:
+        if blockRow.len > 0:
+          zeroMem(blockRow[0].addr, blockRow.len * sizeof(array[64, int16]))
 
 proc magnifyXBy2(mask: Mask): Mask =
   ## Smooth magnify by power of 2 only in the X direction.
@@ -2136,14 +2317,16 @@ proc decodeJpegStateStream(
   readProc: JpegSourceProc,
   totalLen: int,
   scaledTargetWidth, scaledTargetHeight: int,
-  fit = fitStretch
+  fit = fitStretch,
+  rewind: JpegRewindProc = nil
 ): DecoderState {.raises: [PixieError].} =
-  ## Decodes a baseline JPEG pulled incrementally from `readProc` through a
-  ## small sliding window, never holding the whole input in memory.
+  ## Decodes a JPEG pulled incrementally from `readProc` through a small
+  ## sliding window, never holding the whole input in memory.
   if readProc == nil or totalLen <= 2:
     failInvalid("invalid JPEG stream source")
   var state = DecoderState()
   state.readProc = readProc
+  state.rewindProc = rewind
   state.window = newSeq[uint8](jpegStreamWindowSize)
   state.buffer = cast[ptr UncheckedArray[uint8]](state.window[0].addr)
   state.len = totalLen
@@ -2154,7 +2337,12 @@ proc decodeJpegStateStream(
   runJpegDecode(state)
   state
 
-proc runJpegDecode(state: var DecoderState) {.raises: [PixieError].} =
+proc decodeSegments(state: var DecoderState) =
+  ## One pass over the file: every marker segment up to the end of image.
+  ## The first pass reads the headers and sizes the decode; a later pass of
+  ## a strip decode reads the tables again (a scan's Huffman tables are
+  ## defined right before it) and skips what it already knows.
+  let firstPass = state.strip == 0
   while true:
     if state.pos >= state.len and state.foundSOS:
       break
@@ -2164,13 +2352,13 @@ proc runJpegDecode(state: var DecoderState) {.raises: [PixieError].} =
     case chunkId:
       of 0xC0:
         # Start Of Frame (Baseline DCT)
-        state.decodeSOF0()
+        if firstPass: state.decodeSOF0() else: state.skipChunk()
       of 0xC1:
         # Start Of Frame (Extended sequential DCT)
         state.decodeSOF1()
       of 0xC2:
         # Start Of Frame (Progressive DCT)
-        state.decodeSOF2()
+        if firstPass: state.decodeSOF2() else: state.skipChunk()
       of 0xC4:
         # Define Huffman Table
         state.decodeDHT()
@@ -2198,14 +2386,14 @@ proc runJpegDecode(state: var DecoderState) {.raises: [PixieError].} =
         # Start Of Scan
         state.decodeSOS()
         # Entropy-coded data
-        state.decodeBlocks()
+        state.decodeScan()
       of 0XE0:
         # Application-specific
         # state.decodeAPP0(data, at)
         state.skipChunk()
       of 0xE1:
         # Exif/APP1
-        state.decodeExif()
+        if firstPass: state.decodeExif() else: state.skipChunk()
       of 0xE2..0xEF:
         # Application-specific
         state.skipChunk()
@@ -2215,7 +2403,23 @@ proc runJpegDecode(state: var DecoderState) {.raises: [PixieError].} =
       else:
         failInvalid("invalid chunk " & chunkId.toHex())
 
-  state.quantizationAndIDCTPass()
+proc runJpegDecode(state: var DecoderState) {.raises: [PixieError].} =
+  state.decodeSegments()
+  state.idctStrip()
+  if state.stripMcuRows > 0 and state.stripMcuRows < state.numMcuHigh:
+    # The rest of the strips, a pass over the file each (decodeSOF0).
+    let strips =
+      (state.numMcuHigh + state.stripMcuRows - 1) div state.stripMcuRows
+    for strip in 1 ..< strips:
+      state.strip = strip
+      state.scanIndex = 0
+      state.foundSOS = false
+      state.hitEnd = false
+      state.bitBuffer = 0
+      state.bitsBuffered = 0
+      state.seekTo(0)
+      state.decodeSegments()
+      state.idctStrip()
 
   if state.useScaledChannels():
     # Drain the box sampler's last band and any partial vertical footprint,
@@ -2305,25 +2509,32 @@ proc decodeJpegScaledInto*(
   decodeJpegScaledInto(data.cstring, data.len, target, fit)
 
 proc decodeJpegStreamScaled*(
-  readProc: JpegSourceProc, totalLen, width, height: int, fit = fitStretch
+  readProc: JpegSourceProc, totalLen, width, height: int, fit = fitStretch,
+  rewind: JpegRewindProc = nil
 ): Image {.raises: [PixieError].} =
-  ## Decodes a baseline JPEG pulled from `readProc` into a target-sized
-  ## Image, holding only a small window of the compressed input in memory.
-  ## Progressive JPEGs raise a catchable PixieError; retry from a buffer.
-  var state = decodeJpegStateStream(readProc, totalLen, width, height, fit)
+  ## Decodes a JPEG pulled from `readProc` into a target-sized Image,
+  ## holding only a small window of the compressed input in memory. A
+  ## progressive JPEG whose coefficients the budget cannot hold whole is
+  ## read in strips, a pass over the input each, which needs `rewind`;
+  ## without one it raises a catchable PixieError (retry from a buffer).
+  var state = decodeJpegStateStream(
+    readProc, totalLen, width, height, fit, rewind)
   state.buildImage(width, height)
 
 proc decodeJpegStreamScaledInto*(
-  readProc: JpegSourceProc, totalLen: int, target: Image, fit = fitStretch
+  readProc: JpegSourceProc, totalLen: int, target: Image, fit = fitStretch,
+  rewind: JpegRewindProc = nil
 ) {.raises: [PixieError].} =
-  ## Decodes a baseline JPEG pulled from `readProc` directly into an
-  ## existing target-sized Image, holding only a small window of the
-  ## compressed input in memory. Progressive JPEGs raise a catchable
-  ## PixieError; retry from a buffer.
+  ## Decodes a JPEG pulled from `readProc` directly into an existing
+  ## target-sized Image, holding only a small window of the compressed
+  ## input in memory. A progressive JPEG whose coefficients the budget
+  ## cannot hold whole is read in strips, a pass over the input each, which
+  ## needs `rewind`; without one it raises a catchable PixieError (retry
+  ## from a buffer).
   if target.isNil or target.width <= 0 or target.height <= 0:
     raise newException(PixieError, "Target image width and height must be > 0")
   var state = decodeJpegStateStream(
-    readProc, totalLen, target.width, target.height, fit
+    readProc, totalLen, target.width, target.height, fit, rewind
   )
   state.fillImage(target)
 
@@ -2475,8 +2686,9 @@ proc jpegDecodeIntermediateBytes*(
   ## Estimates the decode-intermediate bytes (coefficient blocks + channel
   ## masks) a scaled decode of this JPEG to targetWidth x targetHeight will
   ## allocate. Baseline JPEGs stream their blocks, so only target-sized
-  ## masks count; progressive JPEGs additionally hold source-sized
-  ## coefficient blocks for every component.
+  ## masks count; progressive JPEGs additionally hold one strip of
+  ## coefficient blocks, as many MCU rows as the current budget leaves room
+  ## for beside the masks (decodeSOF0), or every row with no budget set.
   if info.maxXScale <= 0 or info.maxYScale <= 0:
     return 0
   let
@@ -2484,18 +2696,24 @@ proc jpegDecodeIntermediateBytes*(
     mcuHeight = info.maxXScale * 8
     numMcuWide = (info.width + mcuWidth - 1) div mcuWidth
     numMcuHigh = (info.height + mcuHeight - 1) div mcuHeight
+  var perRow, masks: int64
   for scale in info.componentScales:
     if info.progressive:
-      let
-        blockColumns = numMcuWide.int64 * scale.yScale.int64
-        blockRows = numMcuHigh.int64 * scale.xScale.int64
-      result += blockColumns * blockRows * 64 * sizeof(int16).int64
+      perRow += numMcuWide.int64 * scale.yScale.int64 * scale.xScale.int64 *
+        64 * sizeof(int16).int64
     let
       sampleWidth = max(1'i64,
         (targetWidth.int64 * scale.yScale.int64 + info.maxYScale - 1) div info.maxYScale)
       sampleHeight = max(1'i64,
         (targetHeight.int64 * scale.xScale.int64 + info.maxXScale - 1) div info.maxXScale)
-    result += sampleWidth * sampleHeight
+    masks += sampleWidth * sampleHeight
+  var rows = numMcuHigh.int64
+  if perRow > 0:
+    if jpegStripMcuRows > 0:
+      rows = min(rows, jpegStripMcuRows.int64)
+    elif decodeBudgetBytes() > 0:
+      rows = clamp((decodeBudgetBytes().int64 - masks) div perRow, 1'i64, rows)
+  result = masks + perRow * rows
 
 when defined(release):
   {.pop.}

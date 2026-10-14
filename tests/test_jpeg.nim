@@ -186,3 +186,126 @@ block:
     doAssert target.width == targetW and target.height == targetH,
       "budget " & $budget & " refused a decode the floor plan fits"
   setDecodeBudgetBytes(0)
+
+block:
+  # A progressive JPEG decoded in strips must land on exactly the pixels of
+  # the whole-image decode: every strip reads its own blocks from each scan
+  # where the previous pass bookmarked them, so the coefficients come out the
+  # same, and the IDCT and the box sampler see the same blocks in the same
+  # order. Pinned for every scan script in the corpus (libjpeg's, restart
+  # markers, 4:2:0 / 4:2:2 / 4:4:4), every orientation, every fit, at a
+  # downscale, an upscale and 1:1, with strips from one MCU row up.
+  var progressiveFixtures = @[
+    "8x8_progressive", "16x16_progressive", "cat_4_2_0_progressive",
+    "cat_4_4_4_progressive", "cat_restart_markers_5_progressive", "testprog",
+    "progressive"]
+  for n in 1 .. 8:
+    progressiveFixtures.add("f" & $n & "-exif-progressive")
+  for name in progressiveFixtures:
+    let
+      path = "tests/fileformats/jpeg/masters/" & name & ".jpg"
+      data = readFile(path)
+      dims = decodeJpegDimensions(data)
+    doAssert decodeJpegInfo(data).progressive, path
+    setJpegStripMcuRows(0)
+    let whole = decodeJpeg(data)
+    for rows in [1, 2, 3, 7]:
+      setJpegStripMcuRows(rows)
+      doAssert decodeJpeg(data).pixelsEqual(whole), path & " in strips of " & $rows
+    for fit in [fitStretch, fitCover, fitContain]:
+      for (w, h) in [
+        (max(1, dims.width * 5 div 6), max(1, dims.height * 5 div 6)),
+        (dims.width * 3 div 2 + 1, max(1, dims.height div 3)),
+        (dims.width, dims.height)
+      ]:
+        setJpegStripMcuRows(0)
+        # Into a prefilled target: contain leaves its letterbox alone.
+        let wholeScaled = newImage(w, h)
+        wholeScaled.fill(rgbx(9, 99, 199, 255))
+        decodeJpegScaledInto(data, wholeScaled, fit)
+        for rows in [1, 3]:
+          setJpegStripMcuRows(rows)
+          let target = newImage(w, h)
+          target.fill(rgbx(9, 99, 199, 255))
+          decodeJpegScaledInto(data, target, fit)
+          doAssert target.pixelsEqual(wholeScaled),
+            path & " " & $fit & " " & $w & "x" & $h & " in strips of " & $rows
+  setJpegStripMcuRows(0)
+
+proc stripsThroughAStream() =
+  # The same through a stream. A stream that can rewind is read once per
+  # strip; one that cannot still decodes whole when the budget holds the
+  # coefficients, and otherwise says so catchably, so the caller retries
+  # from a buffer.
+  let
+    data = readFile("tests/fileformats/jpeg/masters/cat_4_2_0_progressive.jpg")
+    dims = decodeJpegDimensions(data)
+    w = dims.width * 5 div 6
+    h = dims.height * 5 div 6
+  var pos = 0
+  var rewinds = 0
+  let source = proc(dst: pointer, maxBytes: int): int {.gcsafe, raises: [].} =
+    let n = min(min(maxBytes, 977), data.len - pos)
+    if n > 0:
+      copyMem(dst, data[pos].unsafeAddr, n)
+      pos += n
+    n
+  let rewind = proc(): bool {.gcsafe, raises: [].} =
+    pos = 0
+    inc rewinds
+    true
+  setJpegStripMcuRows(0)
+  let whole = decodeJpegScaled(data, w, h, fitCover)
+  # Whole: no rewind needed, and none asked for.
+  pos = 0
+  doAssert decodeJpegStreamScaled(source, data.len, w, h, fitCover).pixelsEqual(whole)
+  # In strips of 2 MCU rows: a pass per strip, every one from byte 0.
+  setJpegStripMcuRows(2)
+  pos = 0
+  doAssert decodeJpegStreamScaled(source, data.len, w, h, fitCover, rewind).pixelsEqual(whole)
+  let strips = ((dims.height + 15) div 16 + 1) div 2
+  doAssert rewinds == strips - 1, $rewinds & " rewinds for " & $strips & " strips"
+  pos = 0
+  try:
+    discard decodeJpegStreamScaled(source, data.len, w, h, fitCover)
+    doAssert false, "a stream without a rewind cannot carry a strip decode"
+  except PixieError as e:
+    doAssert "cannot be decoded from a stream" in e.msg, e.msg
+    doAssert "memory budget" notin e.msg, e.msg
+  setJpegStripMcuRows(0)
+
+stripsThroughAStream()
+
+block:
+  # With no override the budget sizes the strip: a budget that holds the
+  # masks plus a few MCU rows of coefficients decodes (where it used to
+  # refuse, the whole image's blocks being the plan), and lands on the
+  # whole-image pixels. Too small for even one row stays a budget refusal.
+  let
+    data = readFile("tests/fileformats/jpeg/masters/progressive.jpg")
+    info = decodeJpegInfo(data)
+    w = info.width div 2
+    h = info.height div 2
+  setDecodeBudgetBytes(0)
+  let whole = decodeJpegScaled(data, w, h, fitStretch)
+  var perRow: int64
+  for scale in info.componentScales:
+    perRow += ((info.width + 15) div 16).int64 * scale.yScale.int64 *
+      scale.xScale.int64 * 128
+  let everything = jpegDecodeIntermediateBytes(info, w, h)
+  doAssert everything > perRow * 10, "progressive.jpg should be dozens of MCU rows"
+  # Masks (plus bands and accumulators, which the estimate leaves out) and
+  # three rows of blocks: enough for a strip decode, far short of the whole.
+  let masks = everything - perRow * ((info.height + 15) div 16)
+  setDecodeBudgetBytes((masks + perRow * 3 + 3 * info.width * 8 * 2 + 6 * w * 4).int)
+  let target = newImage(w, h)
+  decodeJpegScaledInto(data, target, fitStretch)
+  doAssert target.pixelsEqual(whole)
+  doAssert jpegDecodeIntermediateBytes(info, w, h) < everything
+  setDecodeBudgetBytes(1)
+  try:
+    decodeJpegScaledInto(data, target, fitStretch)
+    doAssert false, "a 1-byte budget cannot hold a row of coefficients"
+  except PixieError as e:
+    doAssert "memory budget" in e.msg, e.msg
+  setDecodeBudgetBytes(0)
