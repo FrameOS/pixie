@@ -120,18 +120,11 @@ proc copyIntoTarget(target, source: Image) {.raises: [PixieError].} =
     return
   let rowBytes = target.width * target.bytesPerPixel
   for y in 0 ..< target.height:
-    if target.format == pfRgb565:
-      copyMem(
-        target.data16[target.dataIndex(0, y)].addr,
-        source.data16[source.dataIndex(0, y)].unsafeAddr,
-        rowBytes
-      )
-    else:
-      copyMem(
-        target.data[target.dataIndex(0, y)].addr,
-        source.data[source.dataIndex(0, y)].unsafeAddr,
-        rowBytes
-      )
+    copyMem(
+      target.pixelAddr(target.dataIndex(0, y)),
+      source.pixelAddr(source.dataIndex(0, y)),
+      rowBytes
+    )
 
 template isWebpData(data: string): bool =
   data.len > 12 and data.readStr(0, 4) == WebpRiffSignature and
