@@ -1,10 +1,7 @@
 ## Load SVG files.
 
 import bumpy, chroma, ../common, ../fonts, ../images, ../internal, ../paints,
-    ../paths, parsexml, strutils, tables, unicode, vmath, xmlparser, xmltree
-
-when defined(pixieDebugSvg):
-  import strtabs
+    ../paths, parsexml, strtabs, strutils, tables, unicode, vmath, xmlparser, xmltree
 
 const
   xmlSignature* = "<?xml"
@@ -1056,6 +1053,167 @@ proc parseSvg*(
   except:
     raise currentExceptionAsPixieError()
 
+proc holdsText(data: string): bool =
+  ## Whether the markup has a `<text` or `<tspan` tag: one pass from `<` to
+  ## `<` (memchr), where two substring searches walked the whole document
+  ## twice.
+  var i = data.find('<')
+  while i >= 0 and i + 1 < data.len:
+    if data[i + 1] == 't' and
+        (data.continuesWith("text", i + 1) or data.continuesWith("tspan", i + 1)):
+      return true
+    i = data.find('<', i + 1)
+  false
+
+const
+  xmlNameStart = {'A'..'Z', 'a'..'z', '_', ':', '\128'..'\255'}
+  xmlNameChar = {'A'..'Z', 'a'..'z', '0'..'9', '.', '-', '_', ':', '\128'..'\255'}
+  xmlSpace = {' ', '\t', '\c', '\L'}
+
+proc xmlAttrValue(data: string, start, stop: int): string =
+  ## An attribute's value the way std/parsexml reads it: every run of
+  ## whitespace is one space, and a run at the end is dropped.
+  var clean = true
+  for i in start ..< stop:
+    let c = data[i]
+    if c in {'\t', '\c', '\L'} or (c == ' ' and (i + 1 == stop or data[i + 1] == ' ')):
+      clean = false
+      break
+  if clean:
+    return data[start ..< stop]
+  result = newStringOfCap(stop - start)
+  var pendingSpace = false
+  for i in start ..< stop:
+    let c = data[i]
+    if c in xmlSpace:
+      pendingSpace = true
+    else:
+      if pendingSpace:
+        result.add ' '
+        pendingSpace = false
+      result.add c
+
+proc parseSvgXmlFast*(data: string): XmlNode {.raises: [].} =
+  ## The tree std/xmlparser builds (with `reportComments`, without
+  ## `reportWhitespace`) for markup made of elements, attributes, comments
+  ## and text, cut out of `data` a value at a time: Nim's parser appends
+  ## every character to its token one by one, which was half the parse of
+  ## an animated logo on an ESP32. nil for anything else — an entity, a
+  ## CR, a NUL, CDATA, a declaration, unquoted or empty attributes, a tag
+  ## that does not close — which the full parser then reads, and reports.
+  for c in data:
+    if c in {'&', '\c', '\0'}:
+      return nil
+  let n = data.len
+  var
+    pos = 0
+    stack: seq[XmlNode]
+    afterComment = false # std reports the whitespace that follows a comment
+
+  template skipSpace() =
+    while pos < n and data[pos] in xmlSpace:
+      inc pos
+
+  template skipName() =
+    if pos < n and data[pos] in xmlNameStart:
+      inc pos
+      while pos < n and data[pos] in xmlNameChar:
+        inc pos
+
+  while pos < n:
+    let c = data[pos]
+    if c in xmlSpace:
+      let start = pos
+      skipSpace()
+      if afterComment and stack.len > 0:
+        stack[^1].add newText(data[start ..< pos])
+      afterComment = false
+      continue
+    afterComment = false
+    if c != '<':
+      if stack.len == 0:
+        return nil # text outside the root element: an error to std
+      let start = pos
+      pos = data.find('<', pos)
+      if pos < 0:
+        pos = n
+      stack[^1].add newText(data[start ..< pos])
+      continue
+    if pos + 1 >= n:
+      return nil
+    case data[pos + 1]
+    of '/':
+      pos += 2
+      let start = pos
+      skipName()
+      let name = data[start ..< pos]
+      skipSpace()
+      if pos >= n or data[pos] != '>' or stack.len == 0 or stack[^1].tag != name:
+        return nil
+      inc pos
+      let closed = stack.pop()
+      if stack.len == 0:
+        return closed # std reads no further than the root element
+    of '!':
+      if not data.continuesWith("<!--", pos):
+        return nil # CDATA or a declaration
+      let stop = data.find("-->", pos + 4)
+      if stop < 0:
+        return nil
+      if stack.len > 0:
+        stack[^1].add newComment(data[pos + 4 ..< stop])
+        afterComment = true
+      pos = stop + 3
+    of '?':
+      let stop = data.find("?>", pos + 2)
+      if stop < 0:
+        return nil
+      pos = stop + 2 # a processing instruction: std ignores it
+    else:
+      inc pos
+      let start = pos
+      skipName()
+      if pos == start:
+        return nil
+      let element = newElement(data[start ..< pos])
+      skipSpace()
+      if pos < n and data[pos] in xmlNameStart:
+        element.attrs = newStringTable()
+        while pos < n and data[pos] in xmlNameStart:
+          let keyStart = pos
+          skipName()
+          let key = data[keyStart ..< pos]
+          skipSpace()
+          if pos >= n or data[pos] != '=':
+            return nil
+          inc pos
+          skipSpace()
+          if pos >= n or data[pos] notin {'"', '\''}:
+            return nil
+          let quote = data[pos]
+          inc pos
+          let stop = data.find(quote, pos)
+          if stop < 0:
+            return nil
+          element.attrs[key] = xmlAttrValue(data, pos, stop)
+          pos = stop + 1
+          skipSpace()
+      var empty = false
+      if pos < n and data[pos] == '/':
+        empty = true
+        inc pos
+      if pos >= n or data[pos] != '>':
+        return nil
+      inc pos
+      if stack.len > 0:
+        stack[^1].add element
+      if empty:
+        if stack.len == 0:
+          return element
+      else:
+        stack.add element
+  nil # the root element never closed
+
 proc parseSvgXml*(data: string): XmlNode {.raises: [PixieError].} =
   ## Parses SVG markup into XML, the way `parseSvg` needs it. Callers that want
   ## the tree itself — to rewrite the root transform and render in bands, say —
@@ -1064,11 +1222,17 @@ proc parseSvgXml*(data: string): XmlNode {.raises: [PixieError].} =
   ## Nim's parser drops whitespace that follows a closing tag unless asked for
   ## it, which is invisible everywhere except inside `<text>`, where the space
   ## in `…</tspan> tail` is content. Asking for it costs a node per run of
-  ## whitespace in the document, so only documents with text pay.
+  ## whitespace in the document, so only documents with text pay. Markup
+  ## without text, entities or declarations — what an app writes — takes a
+  ## faster reader that builds the same tree (parseSvgXmlFast).
   try:
     var options = {reportComments}
-    if data.contains("<text") or data.contains("<tspan"):
+    if data.holdsText():
       options.incl reportWhitespace
+    else:
+      result = parseSvgXmlFast(data)
+      if result != nil:
+        return
     result = parseXml(data, options)
   except PixieError as e:
     raise e
