@@ -1440,6 +1440,8 @@ proc clearUnsafe(image: Image, startX, startY, toX, toY: int) =
       len = image.dataIndex(toX, toY) - start
     if image.format == pfRgb565:
       fillUnsafe16(image.data16, 0, start, len)
+    elif image.format == pfGray8:
+      fillUnsafe8(image.data8, 0, start, len)
     else:
       fillUnsafe(image.data, rgbx(0, 0, 0, 0), start, len)
     return
@@ -1453,24 +1455,29 @@ proc clearUnsafe(image: Image, startX, startY, toX, toY: int) =
       let start = image.dataIndex(x, y)
       if image.format == pfRgb565:
         fillUnsafe16(image.data16, 0, start, rowEnd - x)
+      elif image.format == pfGray8:
+        fillUnsafe8(image.data8, 0, start, rowEnd - x)
       else:
         fillUnsafe(image.data, rgbx(0, 0, 0, 0), start, rowEnd - x)
     x = 0
     inc y
 
-proc fillCoverage565(
+template fillCoverageNarrowBody(
   image: Image,
   rgbx: ColorRGBX,
   startX, y: int,
   coverages: seq[uint8],
-  blendMode: BlendMode
+  blendMode: BlendMode,
+  data16: untyped,
+  rgbxToRgb565, rgb565ToRgbx: untyped
 ) =
-  ## `fillCoverage` for a 565 destination. The source colour is scaled by the
-  ## antialiasing coverage exactly as for RGBX — coverage lives in the source
-  ## alpha, which is why AA survives a destination without one — and the
-  ## backdrop is expanded to 8 bits, blended, and packed again per pixel.
+  ## `fillCoverage` for a narrow destination (565, grey). The source colour
+  ## is scaled by the antialiasing coverage exactly as for RGBX — coverage
+  ## lives in the source alpha, which is why AA survives a destination
+  ## without one — and the backdrop is expanded to 8 bits, blended, and
+  ## packed again per pixel. `data16` and the two converters name the
+  ## format's buffer and its pack/unpack pair.
   var idx = image.dataIndex(startX, y)
-  let data16 = image.data16
   case blendMode:
   of OverwriteBlend:
     for i in 0 ..< coverages.len:
@@ -1502,6 +1509,18 @@ proc fillCoverage565(
         data16[idx] = rgbxToRgb565(
           blender(rgb565ToRgbx(data16[idx]), rgbx * coverage))
       inc idx
+
+proc fillCoverage565(
+  image: Image, rgbx: ColorRGBX, startX, y: int, coverages: seq[uint8], blendMode: BlendMode
+) =
+  let data = image.data16
+  image.fillCoverageNarrowBody(rgbx, startX, y, coverages, blendMode, data, rgbxToRgb565, rgb565ToRgbx)
+
+proc fillCoverageGray8(
+  image: Image, rgbx: ColorRGBX, startX, y: int, coverages: seq[uint8], blendMode: BlendMode
+) =
+  let data = image.data8
+  image.fillCoverageNarrowBody(rgbx, startX, y, coverages, blendMode, data, rgbxToGray8, gray8ToRgbx)
 
 proc blendLineCoverageOverwrite(
   line: ptr UncheckedArray[ColorRGBX],
@@ -1549,6 +1568,9 @@ proc fillCoverage(
 ) =
   if image.format == pfRgb565:
     image.fillCoverage565(rgbx, startX, y, coverages, blendMode)
+    return
+  if image.format == pfGray8:
+    image.fillCoverageGray8(rgbx, startX, y, coverages, blendMode)
     return
 
   var
@@ -1605,7 +1627,7 @@ proc blendLineMask(
   for i in 0 ..< len:
     line[i] = blendMask(line[i], rgbx)
 
-proc fillHits565(
+template fillHitsNarrowBody(
   image: Image,
   rgbx: ColorRGBX,
   startX, y: int,
@@ -1613,13 +1635,14 @@ proc fillHits565(
   numHits: int,
   windingRule: WindingRule,
   blendMode: BlendMode,
-  maskClears: bool
+  maskClears: bool,
+  data16: untyped,
+  rgbxToRgb565, rgb565ToRgbx, fillUnsafe16: untyped
 ) =
-  ## `fillHits` for a 565 destination: the same span walk, with the solid
-  ## spans stored packed and the blended ones done per pixel at 8 bits.
-  let
-    data16 = image.data16
-    packed = rgbxToRgb565(rgbx)
+  ## `fillHits` for a narrow destination (565, grey): the same span walk,
+  ## with the solid spans stored packed and the blended ones done per pixel
+  ## at 8 bits.
+  let packed = rgbxToRgb565(rgbx)
   case blendMode:
   of OverwriteBlend:
     for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
@@ -1660,6 +1683,22 @@ proc fillHits565(
         data16[idx] = rgbxToRgb565(blender(rgb565ToRgbx(data16[idx]), rgbx))
         inc idx
 
+proc fillHits565(
+  image: Image, rgbx: ColorRGBX, startX, y: int, hits: seq[(Fixed32, int16)], numHits: int,
+  windingRule: WindingRule, blendMode: BlendMode, maskClears: bool
+) =
+  let data = image.data16
+  image.fillHitsNarrowBody(rgbx, startX, y, hits, numHits, windingRule, blendMode, maskClears,
+    data, rgbxToRgb565, rgb565ToRgbx, fillUnsafe16)
+
+proc fillHitsGray8(
+  image: Image, rgbx: ColorRGBX, startX, y: int, hits: seq[(Fixed32, int16)], numHits: int,
+  windingRule: WindingRule, blendMode: BlendMode, maskClears: bool
+) =
+  let data = image.data8
+  image.fillHitsNarrowBody(rgbx, startX, y, hits, numHits, windingRule, blendMode, maskClears,
+    data, rgbxToGray8, gray8ToRgbx, fillUnsafe8)
+
 proc fillHits(
   image: Image,
   rgbx: ColorRGBX,
@@ -1672,6 +1711,10 @@ proc fillHits(
 ) =
   if image.format == pfRgb565:
     image.fillHits565(
+      rgbx, startX, y, hits, numHits, windingRule, blendMode, maskClears)
+    return
+  if image.format == pfGray8:
+    image.fillHitsGray8(
       rgbx, startX, y, hits, numHits, windingRule, blendMode, maskClears)
     return
 
@@ -1788,6 +1831,8 @@ proc fillShapes(
               len = image.dataIndex(0, y + partitionHeight) - start
             if image.format == pfRgb565:
               fillUnsafe16(image.data16, rgbxToRgb565(rgbx), start, len)
+            elif image.format == pfGray8:
+              fillUnsafe8(image.data8, rgbxToGray8(rgbx), start, len)
             else:
               fillUnsafe(image.data, rgbx, start, len)
           else:
@@ -1797,6 +1842,8 @@ proc fillShapes(
               let start = image.dataIndex(0, y + r)
               if image.format == pfRgb565:
                 fillUnsafe16(image.data16, rgbxToRgb565(rgbx), start, image.width)
+              elif image.format == pfGray8:
+                fillUnsafe8(image.data8, rgbxToGray8(rgbx), start, image.width)
               else:
                 fillUnsafe(image.data, rgbx, start, image.width)
         else:

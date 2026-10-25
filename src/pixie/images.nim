@@ -69,6 +69,11 @@ proc fill*(image: Image, color: SomeColor) {.inline, raises: [].} =
     image.forEachSpan:
       fillUnsafe16(image.data16, packed, spanStart, spanLen)
     return
+  if image.format == pfGray8:
+    let luma = rgbxToGray8(color.asRgbx())
+    image.forEachSpan:
+      fillUnsafe8(image.data8, luma, spanStart, spanLen)
+    return
   image.forEachSpan:
     fillUnsafe(image.data, color, spanStart, spanLen)
 
@@ -115,13 +120,8 @@ proc pixelsEqual*(a, b: Image): bool {.raises: [].} =
     return true
   let rowBytes = a.width * a.bytesPerPixel
   for y in 0 ..< a.height:
-    let same =
-      if a.format == pfRgb565:
-        equalMem(a.data16[a.dataIndex(0, y)].addr,
-          b.data16[b.dataIndex(0, y)].addr, rowBytes)
-      else:
-        equalMem(a.data[a.dataIndex(0, y)].addr,
-          b.data[b.dataIndex(0, y)].addr, rowBytes)
+    let same = equalMem(a.pixelAddr(a.dataIndex(0, y)),
+      b.pixelAddr(b.dataIndex(0, y)), rowBytes)
     if not same:
       return false
   true
@@ -145,7 +145,7 @@ proc isTransparent*(image: Image): bool {.hasSimd, raises: [].} =
   ## Checks if this image is fully transparent or not.
   # Conservative for a view, for the same reason as isOneColor. A 565 image
   # has no alpha and reads back opaque, so it is never transparent.
-  if image.isView or image.format == pfRgb565:
+  if image.isView or image.format != pfRgbx:
     return false
   result = true
   for i in 0 ..< image.dataLen:
@@ -156,7 +156,7 @@ proc isOpaque*(image: Image): bool {.raises: [].} =
   ## Checks if the entire image is opaque (alpha values are all 255).
   # No image-level SIMD variant can bypass this walk, so unlike isOneColor and
   # isTransparent a view can be answered exactly instead of conservatively.
-  if image.format == pfRgb565:
+  if image.format != pfRgbx:
     return true
   result = true
   image.forEachSpan:
@@ -175,6 +175,11 @@ proc flipHorizontal*(image: Image) {.raises: [].} =
         swap(image.data16[left], image.data16[right])
         inc left
         dec right
+    elif image.format == pfGray8:
+      for x in 0 ..< halfWidth:
+        swap(image.data8[left], image.data8[right])
+        inc left
+        dec right
     else:
       for x in 0 ..< halfWidth:
         swap(image.data[left], image.data[right])
@@ -191,6 +196,9 @@ proc flipVertical*(image: Image) {.raises: [].} =
     if image.format == pfRgb565:
       for x in 0 ..< image.width:
         swap(image.data16[topStart + x], image.data16[bottomStart + x])
+    elif image.format == pfGray8:
+      for x in 0 ..< image.width:
+        swap(image.data8[topStart + x], image.data8[bottomStart + x])
     else:
       for x in 0 ..< image.width:
         swap(image.data[topStart + x], image.data[bottomStart + x])
@@ -213,10 +221,7 @@ proc rotate90*(image: Image) {.raises: [PixieError].} =
   # is unchanged, so the existing buffer still fits.
   swap(image.width, image.height)
   image.stride = image.width
-  if image.format == pfRgb565:
-    copyMem(image.data16[0].addr, rotated.data16[0].addr, image.dataLen * 2)
-  else:
-    copyMem(image.data[0].addr, rotated.data[0].addr, image.dataLen * 4)
+  copyMem(image.pixelAddr(0), rotated.pixelAddr(0), image.dataLen * image.bytesPerPixel)
 
 proc subImage*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
   ## Gets a sub image from this image.
@@ -232,12 +237,12 @@ proc subImage*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
     )
 
   result = image.newImageLike(w, h)
-  if image.format == pfRgb565:
+  if image.format != pfRgbx:
     for y2 in 0 ..< h:
       copyMem(
-        result.data16[result.dataIndex(0, y2)].addr,
-        image.data16[image.dataIndex(x, y + y2)].addr,
-        w * 2
+        result.pixelAddr(result.dataIndex(0, y2)),
+        image.pixelAddr(image.dataIndex(x, y + y2)),
+        w * image.bytesPerPixel
       )
     return
   for y2 in 0 ..< h:
@@ -294,7 +299,7 @@ proc minifyBy2*(
 
   # The box filter below averages raw RGBX; a 565 source is expanded first so
   # the averaging happens at 8 bits and the result is an ordinary RGBX image.
-  var src = if image.format == pfRgb565: image.toRgbxImage() else: image
+  var src = if image.format != pfRgbx: image.toRgbxImage() else: image
   for _ in 1 .. power:
     # When minifying an image of odd size, round the result image size up
     # so a 99 x 99 src image returns a 50 x 50 image.
@@ -358,7 +363,7 @@ proc magnifyBy2*(
 
   let
     scale = 2 ^ power
-    image = if image.format == pfRgb565: image.toRgbxImage() else: image
+    image = if image.format != pfRgbx: image.toRgbxImage() else: image
   result = newImage(image.width * scale, image.height * scale)
 
   for y in 0 ..< image.height:
@@ -450,18 +455,22 @@ proc blur*(
   if radius < 0:
     raise newException(PixieError, "Cannot apply negative blur")
 
-  if image.format == pfRgb565:
+  if image.format != pfRgbx:
     # Blur at 8 bits in an RGBX copy and quantise the result back in. The
-    # copy is the price of not writing a second blur; a 565 canvas is blurred
-    # rarely enough that paying it beats carrying that code.
+    # copy is the price of not writing a second blur; a 565 or grey canvas
+    # is blurred rarely enough that paying it beats carrying that code.
     let tmp = image.toRgbxImage()
     tmp.blur(radius.float32, outOfBounds)
     for y in 0 ..< image.height:
       let
         src = tmp.dataIndex(0, y)
         dst = image.dataIndex(0, y)
-      for x in 0 ..< image.width:
-        image.data16[dst + x] = rgbxToRgb565(tmp.data[src + x])
+      if image.format == pfGray8:
+        for x in 0 ..< image.width:
+          image.data8[dst + x] = rgbxToGray8(tmp.data[src + x])
+      else:
+        for x in 0 ..< image.width:
+          image.data16[dst + x] = rgbxToRgb565(tmp.data[src + x])
     return
 
   let
@@ -620,10 +629,7 @@ proc blendLineMask(a, b: ptr UncheckedArray[ColorRGBX], len: int) {.hasSimd.} =
 
 template rowAddr(image: Image, x, y: int): pointer =
   ## Address of pixel (x, y) whatever the storage format.
-  (if image.format == pfRgb565:
-    cast[pointer](image.data16[image.dataIndex(x, y)].addr)
-   else:
-    cast[pointer](image.data[image.dataIndex(x, y)].addr))
+  image.pixelAddr(image.dataIndex(x, y))
 
 template zeroRows(image: Image, y, h: int) =
   ## Clears `h` whole rows starting at row `y`. One memset when the rows are
@@ -1049,7 +1055,7 @@ proc opaqueBounds*(image: Image): Rect =
   ## visible part of the image and then use subImage to cut it out.
   ## Returns zero rect if whole image is transparent.
   ## Returns just the size of the image if no edge is transparent.
-  if image.format == pfRgb565:
+  if image.format != pfRgbx:
     # Opaque by construction, so every pixel counts.
     return rect(0, 0, image.width.float32, image.height.float32)
   var

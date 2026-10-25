@@ -70,6 +70,13 @@ template getUncheckedArray16*(
 ): ptr UncheckedArray[uint16] =
   cast[ptr UncheckedArray[uint16]](image.data16[image.dataIndex(x, y)].addr)
 
+proc fillUnsafe8*(
+  data: ptr UncheckedArray[uint8], value: uint8, start, len: int
+) {.raises: [].} =
+  ## `fillUnsafe` for a luma buffer: one memset.
+  if len > 0:
+    nimSetMem(data[start].addr, value.cint, len)
+
 proc fillUnsafe16*(
   data: ptr UncheckedArray[uint16], packed: uint16, start, len: int
 ) {.raises: [].} =
@@ -105,7 +112,7 @@ proc toStraightAlpha*(image: Image) {.raises: [].} =
   ## is one span, so this is the same single pass it always was. The seq
   ## overload below keeps the SIMD path for decoders that hold their pixels
   ## outside an Image.
-  if image.format == pfRgb565:
+  if image.format != pfRgbx:
     return # opaque: straight and premultiplied coincide
   image.forEachSpan:
     for i in spanStart ..< spanStart + spanLen:
@@ -117,7 +124,7 @@ proc toStraightAlpha*(image: Image) {.raises: [].} =
 
 proc toPremultipliedAlpha*(image: Image) {.raises: [].} =
   ## Converts an image to premultiplied alpha from straight alpha, in place.
-  if image.format == pfRgb565:
+  if image.format != pfRgbx:
     return # opaque: straight and premultiplied coincide
   image.forEachSpan:
     for i in spanStart ..< spanStart + spanLen:

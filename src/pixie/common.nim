@@ -43,6 +43,9 @@ type
     ## those values are packed into on the way in and out of memory.
     pfRgbx   ## 32-bit premultiplied RGBA — the format every image had before
     pfRgb565 ## 16-bit packed RGB (5/6/5), no alpha; reads back fully opaque
+    pfGray8  ## 8-bit luma, no alpha; reads back as an opaque grey. A canvas
+             ## for a greyscale panel: a quarter of RGBX's memory, half of
+             ## 565's, and nothing a grey panel can show is lost
 
   Image* {.acyclic.} = ref object
     ## Image object that holds bitmap data in premultiplied alpha RGBA format.
@@ -60,6 +63,15 @@ type
     ## guess, because those operations are defined by an alpha channel a 565
     ## image does not have. Drawing a 565 image onto another image works
     ## (it reads back opaque); scaling one is done through an RGBX copy.
+    ##
+    ## `pfGray8` is the same kind of presentation surface with one byte of
+    ## luma per pixel (BT.601 weights, `rgbxToGray8`). Everything said about
+    ## 565 holds for it. Blending onto it blends the grey backdrop with the
+    ## colour source and keeps the luma of the result, so for every blend
+    ## mode whose channels are independent (normal, multiply, screen,
+    ## overlay, ...) it is exactly the grey of what an RGBX canvas would
+    ## hold; only the modes that read the backdrop's hue (hue, saturation,
+    ## color, luminosity) see a backdrop that has none.
     ##
     ## Premultiplied colour written into a 565 image keeps its premultiplied
     ## RGB and forgets the alpha, which is exactly what a display driver that
@@ -101,9 +113,11 @@ type
     storage: seq[ColorRGBX] ## owned pixels; empty for a view or a 565 image
     storage16: seq[uint16]  ## owned 565 pixels; empty for a view, an RGBX
                             ## image, or a 565 image over a borrowed buffer
+    storage8: seq[uint8]    ## owned luma pixels, like storage16 for pfGray8
     root: Image             ## the owner whose buffer this views; nil if owner
     pixels: ptr UncheckedArray[ColorRGBX] ## the RGBX buffer, owned or borrowed
     pixels16: ptr UncheckedArray[uint16]  ## the 565 buffer, owned or borrowed
+    pixels8: ptr UncheckedArray[uint8]    ## the luma buffer, owned or borrowed
 
   ImageSourceProc* = proc(
     dst: pointer, maxBytes: int
@@ -163,6 +177,10 @@ template data16*(image: Image): ptr UncheckedArray[uint16] =
   ## The 565 pixels of a `pfRgb565` image, addressed like `data`.
   image.pixels16
 
+template data8*(image: Image): ptr UncheckedArray[uint8] =
+  ## The luma pixels of a `pfGray8` image, addressed like `data`.
+  image.pixels8
+
 template dataIndex*(image: Image, x, y: int): int =
   image.origin + image.stride * y + x
 
@@ -171,6 +189,20 @@ template isRgbx*(image: Image): bool =
 
 template isRgb565*(image: Image): bool =
   image.format == pfRgb565
+
+template isGray8*(image: Image): bool =
+  image.format == pfGray8
+
+proc rgbxToGray8*(c: ColorRGBX): uint8 {.inline, raises: [].} =
+  ## The luma of a premultiplied RGBX colour: BT.601 weights in 256ths
+  ## (77 + 150 + 29 = 256), rounded. Alpha is dropped as for 565: a
+  ## translucent pixel lands as the darker grey of its premultiplied RGB.
+  ## Idempotent with `gray8ToRgbx`: a grey expands and packs back to itself.
+  ((c.r.uint32 * 77 + c.g.uint32 * 150 + c.b.uint32 * 29 + 128) shr 8).uint8
+
+proc gray8ToRgbx*(l: uint8): ColorRGBX {.inline, raises: [].} =
+  ## An opaque grey.
+  ColorRGBX(r: l, g: l, b: l, a: 255)
 
 proc rgbxToRgb565*(c: ColorRGBX): uint16 {.inline, raises: [].} =
   ## Packs a premultiplied RGBX colour into 5/6/5, rounding each channel to
@@ -203,6 +235,7 @@ proc rgb565ToRgbx*(p: uint16): ColorRGBX {.inline, raises: [].} =
 template getPixel*(image: Image, index: int): ColorRGBX =
   ## The pixel at a `dataIndex`, whatever the storage format.
   (if image.format == pfRgbx: image.pixels[index]
+   elif image.format == pfGray8: gray8ToRgbx(image.pixels8[index])
    else: rgb565ToRgbx(image.pixels16[index]))
 
 proc rgbxToRgb565Dithered*(c: ColorRGBX, index: int): uint16 {.inline, raises: [].} =
@@ -255,13 +288,26 @@ template setPixel*(image: Image, index: int, color: ColorRGBX) =
   ## Stores a premultiplied pixel at a `dataIndex`, whatever the storage format.
   if image.format == pfRgbx:
     image.pixels[index] = color
+  elif image.format == pfGray8:
+    image.pixels8[index] = rgbxToGray8(color)
   elif image.ditherStores:
     image.pixels16[index] = rgbxToRgb565Dithered(color, index)
   else:
     image.pixels16[index] = rgbxToRgb565(color)
 
 template bytesPerPixel*(image: Image): int =
-  (if image.format == pfRgbx: 4 else: 2)
+  (case image.format
+   of pfRgbx: 4
+   of pfRgb565: 2
+   of pfGray8: 1)
+
+template pixelAddr*(image: Image, index: int): pointer =
+  ## The address of the pixel at a `dataIndex`, whatever the storage format:
+  ## what a row copy or a row compare starts from.
+  (case image.format
+   of pfRgbx: cast[pointer](image.pixels[index].addr)
+   of pfRgb565: cast[pointer](image.pixels16[index].addr)
+   of pfGray8: cast[pointer](image.pixels8[index].addr))
 
 template bufferPointer*(image: Image): pointer =
   ## The start of the pixel buffer this image addresses, whatever its format.
@@ -269,8 +315,10 @@ template bufferPointer*(image: Image): pointer =
   ## owner) exactly when this is equal — the identity question "does this
   ## value alias my canvas?" asked in a way that is not fooled by one side
   ## being RGBX and the other 565.
-  (if image.format == pfRgb565: cast[pointer](image.pixels16)
-   else: cast[pointer](image.pixels))
+  (case image.format
+   of pfRgb565: cast[pointer](image.pixels16)
+   of pfGray8: cast[pointer](image.pixels8)
+   of pfRgbx: cast[pointer](image.pixels))
 
 template byteSize*(image: Image): int =
   ## Bytes the image's own pixels occupy: width * height * bytesPerPixel.
@@ -474,6 +522,36 @@ proc newImage565*(width, height: int): Image {.raises: [PixieError].} =
   result.storage16 = newSeq[uint16](width * height)
   result.pixels16 = cast[ptr UncheckedArray[uint16]](result.storage16[0].addr)
 
+proc newImageGray8*(width, height: int): Image {.raises: [PixieError].} =
+  ## Creates a new 8-bit luma image, a quarter of the memory of `newImage`.
+  ## Starts black. See the notes on `Image` for what it can and cannot do.
+  if width <= 0 or height <= 0:
+    raise newException(PixieError, "Image width and height must be > 0")
+  result = Image()
+  result.width = width
+  result.height = height
+  result.stride = width
+  result.origin = 0
+  result.format = pfGray8
+  result.storage8 = newSeq[uint8](width * height)
+  result.pixels8 = cast[ptr UncheckedArray[uint8]](result.storage8[0].addr)
+
+proc newImageGray8Over*(
+  width, height: int, buffer: pointer
+): Image {.raises: [PixieError].} =
+  ## `newImage565Over` for a luma buffer of `width * height` bytes.
+  if width <= 0 or height <= 0:
+    raise newException(PixieError, "Image width and height must be > 0")
+  if buffer.isNil:
+    raise newException(PixieError, "newImageGray8Over needs a buffer")
+  result = Image()
+  result.width = width
+  result.height = height
+  result.stride = width
+  result.origin = 0
+  result.format = pfGray8
+  result.pixels8 = cast[ptr UncheckedArray[uint8]](buffer)
+
 proc newImage565Over*(
   width, height: int, buffer: pointer
 ): Image {.raises: [PixieError].} =
@@ -514,10 +592,10 @@ proc newImageOver*(
 
 proc newImageLike*(image: Image, width, height: int): Image {.raises: [PixieError].} =
   ## A fresh image in the same storage format as `image`.
-  if image.format == pfRgb565:
-    newImage565(width, height)
-  else:
-    newImage(width, height)
+  case image.format
+  of pfRgb565: newImage565(width, height)
+  of pfGray8: newImageGray8(width, height)
+  of pfRgbx: newImage(width, height)
 
 proc newImageFrom*(
   width, height: int, data: sink seq[ColorRGBX]
@@ -558,6 +636,14 @@ proc toContiguousSeq*(image: Image): seq[ColorRGBX] {.raises: [].} =
         for x in 0 ..< image.width:
           result[dst + x] = rgb565ToRgbx(image.pixels16[src + x])
       return
+    if image.format == pfGray8:
+      for y in 0 ..< image.height:
+        let
+          src = image.dataIndex(0, y)
+          dst = y * image.width
+        for x in 0 ..< image.width:
+          result[dst + x] = gray8ToRgbx(image.pixels8[src + x])
+      return
     for y in 0 ..< image.height:
       copyMem(
         result[y * image.width].addr,
@@ -582,6 +668,13 @@ proc toRgbxImage*(image: Image): Image {.raises: [].} =
         dst = y * image.width
       for x in 0 ..< image.width:
         result.pixels[dst + x] = rgb565ToRgbx(image.pixels16[src + x])
+  elif image.format == pfGray8:
+    for y in 0 ..< image.height:
+      let
+        src = image.dataIndex(0, y)
+        dst = y * image.width
+      for x in 0 ..< image.width:
+        result.pixels[dst + x] = gray8ToRgbx(image.pixels8[src + x])
   else:
     for y in 0 ..< image.height:
       copyMem(
@@ -608,7 +701,27 @@ proc toRgb565Image*(image: Image): Image {.raises: [].} =
       copyMem(result.pixels16[dst].addr, image.pixels16[src].addr, image.width * 2)
     else:
       for x in 0 ..< image.width:
-        result.pixels16[dst + x] = rgbxToRgb565(image.pixels[src + x])
+        result.pixels16[dst + x] = rgbxToRgb565(image.getPixel(src + x))
+
+proc toGray8Image*(image: Image): Image {.raises: [].} =
+  ## A luma copy of any image — the quantising direction, like toRgb565Image.
+  result = Image()
+  result.width = image.width
+  result.height = image.height
+  result.stride = image.width
+  result.origin = 0
+  result.format = pfGray8
+  result.storage8 = newSeq[uint8](image.width * image.height)
+  result.pixels8 = cast[ptr UncheckedArray[uint8]](result.storage8[0].addr)
+  for y in 0 ..< image.height:
+    let
+      src = image.dataIndex(0, y)
+      dst = y * image.width
+    if image.format == pfGray8:
+      copyMem(result.pixels8[dst].addr, image.pixels8[src].addr, image.width)
+    else:
+      for x in 0 ..< image.width:
+        result.pixels8[dst + x] = rgbxToGray8(image.getPixel(src + x))
 
 proc newImageFromUnchecked*(
   width, height: int, data: sink seq[ColorRGBX]
@@ -647,6 +760,7 @@ proc view*(image: Image, x, y, w, h: int): Image {.raises: [PixieError].} =
   result.root = if image.root.isNil: image else: image.root
   result.pixels = image.pixels
   result.pixels16 = image.pixels16
+  result.pixels8 = image.pixels8
 
 template isView*(image: Image): bool =
   ## True when the image borrows another's pixels rather than owning them.
@@ -657,6 +771,8 @@ proc copy*(image: Image): Image {.raises: [].} =
   ## view copies out, so the result always owns its pixels.
   if image.format == pfRgb565:
     return image.toRgb565Image()
+  if image.format == pfGray8:
+    return image.toGray8Image()
   result = Image()
   result.width = image.width
   result.height = image.height
