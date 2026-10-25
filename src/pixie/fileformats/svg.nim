@@ -226,6 +226,8 @@ const
 var
   pathCache {.threadvar.}: seq[(string, Path)]
   pathCacheChars {.threadvar.}: int
+  pathBounds {.threadvar.}: seq[(Path, Rect)]
+    ## Untransformed bounds of the cached paths (`localBounds`).
 
 proc parsePathCached(d: string): Path {.raises: [PixieError].} =
   ## `<path d>` parsed once and shared by every SVG that holds the same data.
@@ -250,7 +252,12 @@ proc parsePathCached(d: string): Path {.raises: [PixieError].} =
   pathCacheChars += d.len
   while pathCache.len > PathCacheEntries or pathCacheChars > PathCacheMaxChars:
     pathCacheChars -= pathCache[0][0].len
+    let gone = pathCache[0][1]
     pathCache.delete(0)
+    for i in 0 ..< pathBounds.len:
+      if pathBounds[i][0] == gone:
+        pathBounds.delete(i)
+        break
 
 proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties =
   result = inherited
@@ -1207,16 +1214,52 @@ proc renderInto*(
 proc sameElement(a, b: (Path, SvgProperties)): bool =
   sameCommands(a[0], b[0]) and a[1] == b[1]
 
+proc localBounds(path: Path): Rect {.raises: [PixieError].} =
+  ## The untransformed bounds of a path, measured once for a shared one (the
+  ## path cache): measuring flattens every curve, which cost an animated
+  ## logo 14 ms a frame on an ESP32 when done under each new transform.
+  for (cached, bounds) in pathBounds:
+    if cached == path:
+      return bounds
+  result = path.computeBounds()
+  for (_, cached) in pathCache:
+    if cached == path:
+      pathBounds.add((path, result))
+      break
+
+proc transformedBounds(bounds: Rect, m: Mat3): Rect =
+  ## The box around a box's four corners under `m`: it holds whatever the box
+  ## held, for any affine transform.
+  let corners = [
+    m * vec2(bounds.x, bounds.y), m * vec2(bounds.x + bounds.w, bounds.y),
+    m * vec2(bounds.x, bounds.y + bounds.h), m * vec2(bounds.x + bounds.w, bounds.y + bounds.h)
+  ]
+  var
+    minX = corners[0].x
+    minY = corners[0].y
+    maxX = minX
+    maxY = minY
+  for corner in corners:
+    minX = min(minX, corner.x)
+    minY = min(minY, corner.y)
+    maxX = max(maxX, corner.x)
+    maxY = max(maxY, corner.y)
+  rect(minX, minY, maxX - minX, maxY - minY)
+
 proc paintBounds(path: Path, props: SvgProperties): Rect {.raises: [PixieError].} =
   ## The pixels an element can touch: the path's bounds, grown by its stroke
-  ## and a pixel of antialiasing on each side.
-  result = path.computeBounds(props.transform)
-  var margin = 1.0'f32
+  ## and a pixel of antialiasing on each side. Measured untransformed (once,
+  ## for a shared path) and mapped through the transform, which can only
+  ## grow the box; flattening at the untransformed scale can put a curve a
+  ## fraction of a unit inside its true extent, so that fraction, scaled,
+  ## goes into the margin too.
+  let
+    m = props.transform
+    scale = sqrt(max(m[0, 0] * m[0, 0] + m[0, 1] * m[0, 1],
+      m[1, 0] * m[1, 0] + m[1, 1] * m[1, 1]))
+  result = transformedBounds(localBounds(path), m)
+  var margin = 1.0'f32 + 0.5'f32 * scale
   if props.stroke.a > 0 and props.strokeWidth > 0:
-    let
-      m = props.transform
-      scale = sqrt(max(m[0, 0] * m[0, 0] + m[0, 1] * m[0, 1],
-        m[1, 0] * m[1, 0] + m[1, 1] * m[1, 1]))
     margin += props.strokeWidth * scale * max(1'f32, props.strokeMiterLimit) / 2
   result.x -= margin
   result.y -= margin
