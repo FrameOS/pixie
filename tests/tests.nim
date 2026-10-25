@@ -16,6 +16,7 @@ import
   test_rgb565,
   test_webp,
   test_svg,
+  test_svg_covers,
   xrays
 
 writeReport()
