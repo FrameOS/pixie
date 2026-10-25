@@ -630,6 +630,17 @@ proc coefficientBytesPerMcuRow(state: DecoderState): int64 =
     result += (state.numMcuWide * component.yScale).int64 *
       component.xScale.int64 * 64 * sizeof(int16)
 
+proc outputReserveBytes(state: DecoderState): int64 =
+  ## The image buildImage allocates once the decode is done, which the
+  ## budget has to hold next to the plan (ensureOutputBudget): the caller's
+  ## target size for a scaled decode, the whole image otherwise. A decode
+  ## into the caller's target (a sink) allocates none.
+  if not state.sink.isNil:
+    return 0
+  if state.scaledTargetWidth > 0 and state.scaledTargetHeight > 0:
+    return state.scaledTargetWidth.int64 * state.scaledTargetHeight.int64 * 4
+  state.imageWidth.int64 * state.imageHeight.int64 * 4
+
 proc leastStripMcuRows(state: DecoderState): int =
   ## The fewest MCU rows a strip decode could hold: what the mask plan has
   ## to leave room for before the strip count is known.
@@ -791,9 +802,16 @@ proc decodeSOF0(state: var DecoderState) =
           result += sampleW.int64 * rows.int64 +
             compWidth.int64 * (8 * xScale).int64 +
             2'i64 * sampleW.int64 * sizeof(uint32).int64
-      let maskBudget = budget.int64 - blockTotal
-      if maskBudget > 0 and
-          scaledMaskBytes(effectiveTargetWidth, effectiveTargetHeight) > maskBudget:
+      # The output is the plan's neighbour, not part of the room the
+      # channels may fill: sized without it, a progressive photo's planes
+      # and strips took the whole budget and the output check after them
+      # refused every one (788K planned of a 791K budget, then a 526K
+      # output on top: the SenseCAP Indicator, 2026-10-25).
+      # A budget the output (or the strip) fills already clamps to the floor
+      # grid, so its refusal names the smallest plan, as a tiny budget's does.
+      let maskBudget = max(1'i64,
+        budget.int64 - blockTotal - state.outputReserveBytes())
+      if scaledMaskBytes(effectiveTargetWidth, effectiveTargetHeight) > maskBudget:
         # First guess from the area ratio (the planes dominate), then shave
         # in 1/64 steps until the exact count fits — the bands and
         # accumulators shrink slower than the planes, so the guess alone
@@ -978,7 +996,7 @@ proc decodeSOF0(state: var DecoderState) =
     if jpegStripMcuRows > 0:
       state.stripMcuRows = min(state.numMcuHigh, jpegStripMcuRows)
     elif decodeBudgetBytes() > 0:
-      let room = decodeBudgetBytes().int64 - totalMaskBytes
+      let room = decodeBudgetBytes().int64 - totalMaskBytes - state.outputReserveBytes()
       state.stripMcuRows =
         clamp(room div perRow, 1'i64, state.numMcuHigh.int64).int
   totalBlockBytes = perRow * state.stripMcuRows.int64
@@ -1005,6 +1023,17 @@ proc decodeSOF0(state: var DecoderState) =
       (if state.progressive: " (progressive)" else: "") &
       " needs " & $(state.plannedDecodeBytes div 1024) &
       "K of decode buffers, over the " &
+      $(decodeBudgetBytes() div 1024) & "K memory budget"
+    )
+  # And the output beside it, before the entropy decode rather than after:
+  # the same refusal ensureOutputBudget would make, seconds of decoding
+  # sooner.
+  let outputBytes = state.outputReserveBytes()
+  if outputBytes > 0 and overDecodeBudget(state.plannedDecodeBytes + outputBytes):
+    failInvalid(
+      "JPEG output of " & $(outputBytes div 4) & " pixels needs " &
+      $(outputBytes div 1024) & "K next to " &
+      $(state.plannedDecodeBytes div 1024) & "K of decode buffers, over the " &
       $(decodeBudgetBytes() div 1024) & "K memory budget"
     )
 
