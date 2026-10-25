@@ -41,6 +41,10 @@ type
     fontItalic: bool
     textAnchor: SvgTextAnchor
     baseline: SvgBaseline
+    # A square-cornered `<rect>` element's own box, before `transform`
+    # (`coversOpaque`). Never inherited: parseSvgProperties clears it.
+    isRect: bool
+    rectX, rectY, rectW, rectH: float32
 
   SvgGradient = object
     kind: PaintKind         # LinearGradientPaint or RadialGradientPaint
@@ -217,6 +221,7 @@ proc parseSvgTransform(transform: string): Mat3 =
 
 proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties =
   result = inherited
+  result.isRect = false
 
   var
     fillRule = node.attr("fill-rule")
@@ -879,6 +884,7 @@ proc parseSvgElement(
       ry = max(parseFloat(node.attrOrDefault("ry", "0")), 0)
 
     let path = newPath()
+    var rectProps = props
     if rx > 0 or ry > 0:
       if rx == 0:
         rx = ry
@@ -898,8 +904,13 @@ proc parseSvgElement(
       path.ellipticalArcTo(rx, ry, 0, false, true, x + rx, y)
     else:
       path.rect(x, y, width, height)
+      rectProps.isRect = true
+      rectProps.rectX = x
+      rectProps.rectY = y
+      rectProps.rectW = width
+      rectProps.rectH = height
 
-    result.add (path, props)
+    result.add (path, rectProps)
 
   of "circle", "ellipse":
     let
@@ -1097,6 +1108,40 @@ proc renderSvg(
     raise e
   except:
     raise currentExceptionAsPixieError()
+
+proc coversOpaque*(svg: Svg, width, height: int): bool {.raises: [].} =
+  ## Whether the first thing `svg` paints is an opaque, solid, square-cornered
+  ## rectangle over all of a `width` x `height` target — a background rect —
+  ## so that rendering it overwrites every pixel of the target whatever was
+  ## there before. A caller that would clear the target first (FrameOS paints
+  ## a scene's background colour before its first node draws) can skip that
+  ## pass. Conservative: false whenever it cannot be sure (a gradient, any
+  ## opacity, rounded corners, a rotation, an edge short of the target's).
+  if svg.isNil or svg.elements.len == 0 or width <= 0 or height <= 0:
+    return false
+  let props = svg.elements[0][1]
+  if not props.isRect or not props.display:
+    return false
+  if props.opacity < 1 or props.fillOpacity < 1:
+    return false
+  if props.fill.len == 0 or props.fill == "none" or props.fill.startsWith("url("):
+    return false
+  var color: Color
+  try:
+    color = parseHtmlColor(props.fill)
+  except:
+    return false
+  if color.a < 1:
+    return false
+  let m = props.transform
+  # Scale and translation only: a rotated or skewed box is not axis-aligned.
+  if m[0, 1] != 0 or m[1, 0] != 0:
+    return false
+  let
+    a = m * vec2(props.rectX, props.rectY)
+    b = m * vec2(props.rectX + props.rectW, props.rectY + props.rectH)
+  min(a.x, b.x) <= 0 and min(a.y, b.y) <= 0 and
+    max(a.x, b.x) >= width.float32 and max(a.y, b.y) >= height.float32
 
 proc renderInto*(svg: Svg, target: Image) {.raises: [PixieError].} =
   ## Render SVG into an existing image, compositing onto whatever is already
