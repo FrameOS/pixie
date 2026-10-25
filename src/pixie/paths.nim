@@ -25,6 +25,9 @@ type
     ## Used to hold paths and create paths.
     commands: seq[float32]
     start, at: Vec2 # Maintained by moveTo, lineTo, etc. Used by arcTo.
+    shared: bool # never changes again (`share`)
+    flatScale: float32 # the pixel scale `flat` was flattened at; 0 = none
+    flat: seq[Polygon] # a shared path's closed shapes at `flatScale`
 
   SomePath* = Path | string
 
@@ -1486,19 +1489,27 @@ template fillCoverageNarrowBody(
   ## lives in the source alpha, which is why AA survives a destination
   ## without one — and the backdrop is expanded to 8 bits, blended, and
   ## packed again per pixel. `data16` and the two converters name the
-  ## format's buffer and its pack/unpack pair.
+  ## format's buffer and its pack/unpack pair. A fully covered pixel of an
+  ## opaque fill — the inside of every shape on a scanline that needs
+  ## antialiasing — is the colour itself, stored packed once.
   var idx = image.dataIndex(startX, y)
+  let packed = rgbxToRgb565(rgbx)
   case blendMode:
   of OverwriteBlend:
     for i in 0 ..< coverages.len:
       let coverage = coverages[i]
-      if coverage != 0:
+      if coverage == 255:
+        data16[idx] = packed
+      elif coverage != 0:
         data16[idx] = rgbxToRgb565(rgbx * coverage)
       inc idx
   of NormalBlend:
+    let opaque = rgbx.a == 255
     for i in 0 ..< coverages.len:
       let coverage = coverages[i]
-      if coverage != 0:
+      if coverage == 255 and opaque:
+        data16[idx] = packed
+      elif coverage != 0:
         data16[idx] = rgbxToRgb565(
           blendNormal(rgb565ToRgbx(data16[idx]), rgbx * coverage))
       inc idx
@@ -1771,6 +1782,7 @@ proc fillHits(
         image.data[dataIndex] = blender(backdrop, rgbx)
         inc dataIndex
 
+var rowsFast*, rowsTrap*, rowsAA*, rowsNoAA*, entriesAA*, pixelsAA*, edgePixels*: int
 proc fillShapes(
   image: Image,
   shapes: seq[Polygon],
@@ -1863,6 +1875,7 @@ proc fillShapes(
             image.fillHits(rgbx, 0, y + r, hits, 2, NonZero, blendMode)
 
         y += partitionHeight
+        rowsFast += partitionHeight
         continue
 
     let
@@ -2066,6 +2079,7 @@ proc fillShapes(
           if blendMode == MaskBlend:
             image.clearUnsafe(min(filledTo, image.width), y, image.width, y)
 
+          inc rowsTrap
           inc y
           continue
 
@@ -2084,6 +2098,9 @@ proc fillShapes(
     )
 
     if partitions[partitionIndex].requiresAntiAliasing:
+      inc rowsAA
+      entriesAA += numEntryIndices
+      pixelsAA += coverages.len
       image.fillCoverage(
         rgbx,
         startX,
@@ -2279,6 +2296,25 @@ proc strokeShapes(
 
     result.add(shapeStroke)
 
+proc share*(path: Path) {.raises: [].} =
+  ## Promises that `path` never changes again, so a fill may keep the shapes
+  ## it flattens to: one path drawn every frame of an animation under a new
+  ## translation (an SVG's path cache hands out such paths) is then
+  ## flattened once per scale instead of once per frame, a sixth of an
+  ## animated logo's raster on an ESP32. Changing a shared path afterwards
+  ## leaves its fills drawing the old shape.
+  path.shared = true
+
+proc closedShapes(path: Path, pixelScale: float32): seq[Polygon] =
+  ## commandsToShapes(true, pixelScale), from what a shared path kept when
+  ## the scale is the one it was flattened at.
+  if not path.shared:
+    return path.commandsToShapes(true, pixelScale)
+  if path.flatScale != pixelScale:
+    path.flat = path.commandsToShapes(true, pixelScale)
+    path.flatScale = pixelScale
+  path.flat
+
 proc parseSomePath(
   path: SomePath, closeSubpaths: bool, pixelScale: float32
 ): seq[Polygon] {.inline.} =
@@ -2286,7 +2322,10 @@ proc parseSomePath(
   when type(path) is string:
     parsePath(path).commandsToShapes(closeSubpaths, pixelScale)
   elif type(path) is Path:
-    path.commandsToShapes(closeSubpaths, pixelScale)
+    if closeSubpaths:
+      path.closedShapes(pixelScale)
+    else:
+      path.commandsToShapes(closeSubpaths, pixelScale)
 
 const paintStripMinRows = 4
 

@@ -248,6 +248,7 @@ proc parsePathCached(d: string): Path {.raises: [PixieError].} =
         pathCache.add(entry)
       return
   result = parsePath(d)
+  result.share() # fills keep what it flattens to (paths.share)
   pathCache.add((d, result))
   pathCacheChars += d.len
   while pathCache.len > PathCacheEntries or pathCacheChars > PathCacheMaxChars:
