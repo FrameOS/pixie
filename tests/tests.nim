@@ -17,6 +17,8 @@ import
   test_webp,
   test_svg,
   test_svg_covers,
+  test_svg_damage,
+  test_svg_xml,
   xrays
 
 writeReport()

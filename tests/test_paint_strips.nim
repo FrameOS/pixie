@@ -94,6 +94,18 @@ block: # no budget = one strip
   setDecodeContiguousBudgetBytes(W * 4 * 50)
   doAssert paintStripRows(W, H) == 50
   setDecodeContiguousBudgetBytes(0)
+  # A provider is asked once, when the budget is first read.
+  var asked {.global.} = 0
+  setDecodeContiguousBudgetProvider(proc(): int =
+    {.cast(gcsafe).}:
+      inc asked
+    W * 4 * 40)
+  doAssert asked == 0
+  doAssert paintStripRows(W, H) == 40
+  doAssert paintStripRows(W, H) == 40
+  doAssert asked == 1
+  setDecodeContiguousBudgetBytes(0)
+  doAssert paintStripRows(W, H) == H
   # The pair takes half the budget: budget = 4 * rowBytes * rows.
   setDecodeBudgetBytes(4 * W * 4 * 37)
   doAssert paintStripRows(W, H) == 37

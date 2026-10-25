@@ -311,6 +311,53 @@ block:
   setDecodeBudgetBytes(0)
 
 block:
+  # The same strip decode into a NEW image: the output is allocated beside
+  # the plan, so the strips must leave it room. They were sized to the whole
+  # budget, and the output check after them refused every progressive photo
+  # that needed strips (an ESP32 slideshow, 2026-10-25). The budget below
+  # holds the strip plan and the output, and decodes; without the output's
+  # room it refuses before the entropy decode, not after it.
+  let
+    data = readFile("tests/fileformats/jpeg/masters/progressive.jpg")
+    info = decodeJpegInfo(data)
+    w = info.width div 2
+    h = info.height div 2
+  setDecodeBudgetBytes(0)
+  let whole = decodeJpegScaled(data, w, h, fitStretch)
+  var perRow: int64
+  for scale in info.componentScales:
+    perRow += ((info.width + 15) div 16).int64 * scale.yScale.int64 *
+      scale.xScale.int64 * 128
+  let everything = jpegDecodeIntermediateBytes(info, w, h)
+  let masks = everything - perRow * ((info.height + 15) div 16)
+  let output = w.int64 * h.int64 * 4
+  setDecodeBudgetBytes((masks + perRow * 3 + 3 * info.width * 8 * 2 + 6 * w * 4 + output).int)
+  doAssert decodeJpegScaled(data, w, h, fitStretch).pixelsEqual(whole)
+  # Unscaled too: the whole image is the output. A 1-byte budget's refusal
+  # names the one-row plan; that plus two more rows and the output decodes.
+  setDecodeBudgetBytes(0)
+  let full = decodeJpeg(data)
+  setDecodeBudgetBytes(1)
+  var oneRowK = 0
+  try:
+    discard decodeJpeg(data)
+    doAssert false, "a 1-byte budget cannot hold a row of coefficients"
+  except PixieError as e:
+    let needsAt = e.msg.find("needs ") + 6
+    oneRowK = parseInt(e.msg[needsAt ..< e.msg.find("K of decode")])
+  setDecodeBudgetBytes((oneRowK.int64 * 1024 + 1024 + perRow * 2 +
+    info.width.int64 * info.height.int64 * 4).int)
+  doAssert decodeJpeg(data).pixelsEqual(full)
+  # An output the budget cannot hold beside even the smallest plan.
+  setDecodeBudgetBytes(output.int)
+  try:
+    discard decodeJpegScaled(data, w, h, fitStretch)
+    doAssert false, "the output alone fills this budget"
+  except PixieError as e:
+    doAssert "memory budget" in e.msg, e.msg
+  setDecodeBudgetBytes(0)
+
+block:
   # The sink: a decode into a target no longer finishes target-sized channel
   # planes and fills the target from them; it keeps a ring of channel rows
   # and draws each target line as soon as every component has its samples.

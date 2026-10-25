@@ -1,10 +1,7 @@
 ## Load SVG files.
 
-import chroma, ../common, ../fonts, ../images, ../internal, ../paints,
-    ../paths, parsexml, strutils, tables, unicode, vmath, xmlparser, xmltree
-
-when defined(pixieDebugSvg):
-  import strtabs
+import bumpy, chroma, ../common, ../fonts, ../images, ../internal, ../paints,
+    ../paths, parsexml, strtabs, strutils, tables, unicode, vmath, xmlparser, xmltree
 
 const
   xmlSignature* = "<?xml"
@@ -218,6 +215,47 @@ proc parseSvgTransform(transform: string): Mat3 =
       result = result * scale(vec2(sx, sy))
     else:
       failInvalidTransform(transform)
+
+const
+  PathCacheEntries = 32
+  PathCacheMaxChars = 64 * 1024 ## all cached path data together
+
+var
+  pathCache {.threadvar.}: seq[(string, Path)]
+  pathCacheChars {.threadvar.}: int
+  pathBounds {.threadvar.}: seq[(Path, Rect)]
+    ## Untransformed bounds of the cached paths (`localBounds`).
+
+proc parsePathCached(d: string): Path {.raises: [PixieError].} =
+  ## `<path d>` parsed once and shared by every SVG that holds the same data.
+  ## An animation renders the same shapes under a new transform every frame,
+  ## and parsing their data was a third of the parse on an ESP32; sharing one
+  ## path also makes "this element did not change" a pointer comparison
+  ## (`damage`). Paths parsed here are only ever read — rendered and measured
+  ## — never changed, so sharing them is safe. Per thread, bounded by count
+  ## and by total characters; data too long for the bound is parsed each time.
+  if d.len * 4 > PathCacheMaxChars:
+    return parsePath(d)
+  for i in countdown(pathCache.high, 0):
+    if pathCache[i][0] == d:
+      result = pathCache[i][1]
+      if i != pathCache.high:
+        let entry = pathCache[i]
+        pathCache.delete(i)
+        pathCache.add(entry)
+      return
+  result = parsePath(d)
+  result.share() # fills keep what it flattens to (paths.share)
+  pathCache.add((d, result))
+  pathCacheChars += d.len
+  while pathCache.len > PathCacheEntries or pathCacheChars > PathCacheMaxChars:
+    pathCacheChars -= pathCache[0][0].len
+    let gone = pathCache[0][1]
+    pathCache.delete(0)
+    for i in 0 ..< pathBounds.len:
+      if pathBounds[i][0] == gone:
+        pathBounds.delete(i)
+        break
 
 proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties =
   result = inherited
@@ -816,7 +854,7 @@ proc parseSvgElement(
     let
       d = node.attr("d")
       props = node.parseSvgProperties(propertiesStack[^1])
-      path = parsePath(d)
+      path = parsePathCached(d)
 
     result.add (path, props)
 
@@ -1015,6 +1053,167 @@ proc parseSvg*(
   except:
     raise currentExceptionAsPixieError()
 
+proc holdsText(data: string): bool =
+  ## Whether the markup has a `<text` or `<tspan` tag: one pass from `<` to
+  ## `<` (memchr), where two substring searches walked the whole document
+  ## twice.
+  var i = data.find('<')
+  while i >= 0 and i + 1 < data.len:
+    if data[i + 1] == 't' and
+        (data.continuesWith("text", i + 1) or data.continuesWith("tspan", i + 1)):
+      return true
+    i = data.find('<', i + 1)
+  false
+
+const
+  xmlNameStart = {'A'..'Z', 'a'..'z', '_', ':', '\128'..'\255'}
+  xmlNameChar = {'A'..'Z', 'a'..'z', '0'..'9', '.', '-', '_', ':', '\128'..'\255'}
+  xmlSpace = {' ', '\t', '\c', '\L'}
+
+proc xmlAttrValue(data: string, start, stop: int): string =
+  ## An attribute's value the way std/parsexml reads it: every run of
+  ## whitespace is one space, and a run at the end is dropped.
+  var clean = true
+  for i in start ..< stop:
+    let c = data[i]
+    if c in {'\t', '\c', '\L'} or (c == ' ' and (i + 1 == stop or data[i + 1] == ' ')):
+      clean = false
+      break
+  if clean:
+    return data[start ..< stop]
+  result = newStringOfCap(stop - start)
+  var pendingSpace = false
+  for i in start ..< stop:
+    let c = data[i]
+    if c in xmlSpace:
+      pendingSpace = true
+    else:
+      if pendingSpace:
+        result.add ' '
+        pendingSpace = false
+      result.add c
+
+proc parseSvgXmlFast*(data: string): XmlNode {.raises: [].} =
+  ## The tree std/xmlparser builds (with `reportComments`, without
+  ## `reportWhitespace`) for markup made of elements, attributes, comments
+  ## and text, cut out of `data` a value at a time: Nim's parser appends
+  ## every character to its token one by one, which was half the parse of
+  ## an animated logo on an ESP32. nil for anything else — an entity, a
+  ## CR, a NUL, CDATA, a declaration, unquoted or empty attributes, a tag
+  ## that does not close — which the full parser then reads, and reports.
+  for c in data:
+    if c in {'&', '\c', '\0'}:
+      return nil
+  let n = data.len
+  var
+    pos = 0
+    stack: seq[XmlNode]
+    afterComment = false # std reports the whitespace that follows a comment
+
+  template skipSpace() =
+    while pos < n and data[pos] in xmlSpace:
+      inc pos
+
+  template skipName() =
+    if pos < n and data[pos] in xmlNameStart:
+      inc pos
+      while pos < n and data[pos] in xmlNameChar:
+        inc pos
+
+  while pos < n:
+    let c = data[pos]
+    if c in xmlSpace:
+      let start = pos
+      skipSpace()
+      if afterComment and stack.len > 0:
+        stack[^1].add newText(data[start ..< pos])
+      afterComment = false
+      continue
+    afterComment = false
+    if c != '<':
+      if stack.len == 0:
+        return nil # text outside the root element: an error to std
+      let start = pos
+      pos = data.find('<', pos)
+      if pos < 0:
+        pos = n
+      stack[^1].add newText(data[start ..< pos])
+      continue
+    if pos + 1 >= n:
+      return nil
+    case data[pos + 1]
+    of '/':
+      pos += 2
+      let start = pos
+      skipName()
+      let name = data[start ..< pos]
+      skipSpace()
+      if pos >= n or data[pos] != '>' or stack.len == 0 or stack[^1].tag != name:
+        return nil
+      inc pos
+      let closed = stack.pop()
+      if stack.len == 0:
+        return closed # std reads no further than the root element
+    of '!':
+      if not data.continuesWith("<!--", pos):
+        return nil # CDATA or a declaration
+      let stop = data.find("-->", pos + 4)
+      if stop < 0:
+        return nil
+      if stack.len > 0:
+        stack[^1].add newComment(data[pos + 4 ..< stop])
+        afterComment = true
+      pos = stop + 3
+    of '?':
+      let stop = data.find("?>", pos + 2)
+      if stop < 0:
+        return nil
+      pos = stop + 2 # a processing instruction: std ignores it
+    else:
+      inc pos
+      let start = pos
+      skipName()
+      if pos == start:
+        return nil
+      let element = newElement(data[start ..< pos])
+      skipSpace()
+      if pos < n and data[pos] in xmlNameStart:
+        element.attrs = newStringTable()
+        while pos < n and data[pos] in xmlNameStart:
+          let keyStart = pos
+          skipName()
+          let key = data[keyStart ..< pos]
+          skipSpace()
+          if pos >= n or data[pos] != '=':
+            return nil
+          inc pos
+          skipSpace()
+          if pos >= n or data[pos] notin {'"', '\''}:
+            return nil
+          let quote = data[pos]
+          inc pos
+          let stop = data.find(quote, pos)
+          if stop < 0:
+            return nil
+          element.attrs[key] = xmlAttrValue(data, pos, stop)
+          pos = stop + 1
+          skipSpace()
+      var empty = false
+      if pos < n and data[pos] == '/':
+        empty = true
+        inc pos
+      if pos >= n or data[pos] != '>':
+        return nil
+      inc pos
+      if stack.len > 0:
+        stack[^1].add element
+      if empty:
+        if stack.len == 0:
+          return element
+      else:
+        stack.add element
+  nil # the root element never closed
+
 proc parseSvgXml*(data: string): XmlNode {.raises: [PixieError].} =
   ## Parses SVG markup into XML, the way `parseSvg` needs it. Callers that want
   ## the tree itself — to rewrite the root transform and render in bands, say —
@@ -1023,11 +1222,17 @@ proc parseSvgXml*(data: string): XmlNode {.raises: [PixieError].} =
   ## Nim's parser drops whitespace that follows a closing tag unless asked for
   ## it, which is invisible everywhere except inside `<text>`, where the space
   ## in `…</tspan> tail` is content. Asking for it costs a node per run of
-  ## whitespace in the document, so only documents with text pay.
+  ## whitespace in the document, so only documents with text pay. Markup
+  ## without text, entities or declarations — what an app writes — takes a
+  ## faster reader that builds the same tree (parseSvgXmlFast).
   try:
     var options = {reportComments}
-    if data.contains("<text") or data.contains("<tspan"):
+    if data.holdsText():
       options.incl reportWhitespace
+    else:
+      result = parseSvgXmlFast(data)
+      if result != nil:
+        return
     result = parseXml(data, options)
   except PixieError as e:
     raise e
@@ -1045,11 +1250,15 @@ proc parseSvg*(data: string, width = 0, height = 0): Svg {.raises: [PixieError].
     raise currentExceptionAsPixieError()
 
 proc renderSvg(
-  svg: Svg, target: Image, firstBlendMode: BlendMode
+  svg: Svg, target: Image, firstBlendMode: BlendMode, offset = mat3()
 ) {.raises: [PixieError].} =
+  ## `offset` maps the image the SVG was parsed for onto `target`: a
+  ## translation when `target` is a window of it (renderInto with an origin).
   try:
     var blendMode = firstBlendMode
-    for (path, props) in svg.elements:
+    for (path, elementProps) in svg.elements:
+      var props = elementProps
+      props.transform = offset * props.transform
       if props.display and props.opacity > 0:
         if props.fill != "none":
           var paint: Paint
@@ -1155,6 +1364,120 @@ proc renderInto*(svg: Svg, target: Image) {.raises: [PixieError].} =
   ## content they are not, and a semi-transparent first path would replace what
   ## is underneath instead of blending with it.
   svg.renderSvg(target, NormalBlend)
+
+proc renderInto*(
+  svg: Svg, target: Image, originX, originY: int
+) {.raises: [PixieError].} =
+  ## renderInto for a window: `target` is the part of the image the SVG was
+  ## parsed for that starts at (originX, originY) — a `view` of it, say — and
+  ## what falls inside it is drawn exactly as a whole render would draw it
+  ## there. With `damage`, an animation repaints the box that changed instead
+  ## of the whole canvas.
+  svg.renderSvg(target, NormalBlend,
+    translate(vec2(-originX.float32, -originY.float32)))
+
+proc sameElement(a, b: (Path, SvgProperties)): bool =
+  sameCommands(a[0], b[0]) and a[1] == b[1]
+
+proc localBounds(path: Path): Rect {.raises: [PixieError].} =
+  ## The untransformed bounds of a path, measured once for a shared one (the
+  ## path cache): measuring flattens every curve, which cost an animated
+  ## logo 14 ms a frame on an ESP32 when done under each new transform.
+  for (cached, bounds) in pathBounds:
+    if cached == path:
+      return bounds
+  result = path.computeBounds()
+  for (_, cached) in pathCache:
+    if cached == path:
+      pathBounds.add((path, result))
+      break
+
+proc transformedBounds(bounds: Rect, m: Mat3): Rect =
+  ## The box around a box's four corners under `m`: it holds whatever the box
+  ## held, for any affine transform.
+  let corners = [
+    m * vec2(bounds.x, bounds.y), m * vec2(bounds.x + bounds.w, bounds.y),
+    m * vec2(bounds.x, bounds.y + bounds.h), m * vec2(bounds.x + bounds.w, bounds.y + bounds.h)
+  ]
+  var
+    minX = corners[0].x
+    minY = corners[0].y
+    maxX = minX
+    maxY = minY
+  for corner in corners:
+    minX = min(minX, corner.x)
+    minY = min(minY, corner.y)
+    maxX = max(maxX, corner.x)
+    maxY = max(maxY, corner.y)
+  rect(minX, minY, maxX - minX, maxY - minY)
+
+proc paintBounds(path: Path, props: SvgProperties): Rect {.raises: [PixieError].} =
+  ## The pixels an element can touch: the path's bounds, grown by its stroke
+  ## and a pixel of antialiasing on each side. Measured untransformed (once,
+  ## for a shared path) and mapped through the transform, which can only
+  ## grow the box; flattening at the untransformed scale can put a curve a
+  ## fraction of a unit inside its true extent, so that fraction, scaled,
+  ## goes into the margin too.
+  let
+    m = props.transform
+    scale = sqrt(max(m[0, 0] * m[0, 0] + m[0, 1] * m[0, 1],
+      m[1, 0] * m[1, 0] + m[1, 1] * m[1, 1]))
+  result = transformedBounds(localBounds(path), m)
+  var margin = 1.0'f32 + 0.5'f32 * scale
+  if props.stroke.a > 0 and props.strokeWidth > 0:
+    margin += props.strokeWidth * scale * max(1'f32, props.strokeMiterLimit) / 2
+  result.x -= margin
+  result.y -= margin
+  result.w += margin * 2
+  result.h += margin * 2
+
+proc damage*(
+  previous, next: Svg, width, height: int
+): tuple[full: bool, x, y, w, h: int] {.raises: [].} =
+  ## Where rendering `next` changes a `width` x `height` target that holds
+  ## exactly what `previous` rendered there (both parsed for that size): the
+  ## box around every element that differs, where it was and where it will
+  ## be. Everything outside the box is drawn by elements both have in common,
+  ## so repainting the box alone (renderInto with an origin, into a view)
+  ## leaves the target exactly as a whole render of `next` would.
+  ##
+  ## `full` when the two cannot be compared element by element: a different
+  ## number of elements, a gradient that differs, or bounds that cannot be
+  ## measured. An empty box (w = 0) when nothing differs.
+  if previous.isNil or next.isNil or width <= 0 or height <= 0 or
+      previous.elements.len != next.elements.len or
+      previous.gradients != next.gradients:
+    return (true, 0, 0, width, height)
+  var
+    minX = float32.high
+    minY = float32.high
+    maxX = float32.low
+    maxY = float32.low
+  try:
+    for i in 0 ..< next.elements.len:
+      if sameElement(previous.elements[i], next.elements[i]):
+        continue
+      for element in [previous.elements[i], next.elements[i]]:
+        let (path, props) = element
+        if not props.display or props.opacity <= 0:
+          continue
+        let bounds = paintBounds(path, props)
+        minX = min(minX, bounds.x)
+        minY = min(minY, bounds.y)
+        maxX = max(maxX, bounds.x + bounds.w)
+        maxY = max(maxY, bounds.y + bounds.h)
+  except:
+    return (true, 0, 0, width, height)
+  if maxX <= minX or maxY <= minY:
+    return (false, 0, 0, 0, 0)
+  let
+    x0 = clamp(floor(minX).int, 0, width)
+    y0 = clamp(floor(minY).int, 0, height)
+    x1 = clamp(ceil(maxX).int, 0, width)
+    y1 = clamp(ceil(maxY).int, 0, height)
+  if x1 <= x0 or y1 <= y0:
+    return (false, 0, 0, 0, 0)
+  (false, x0, y0, x1 - x0, y1 - y0)
 
 proc newImage*(svg: Svg): Image {.raises: [PixieError].} =
   ## Render SVG and return the image.

@@ -47,16 +47,33 @@ proc overDecodeBudget*(bytes: int64): bool {.inline, raises: [].} =
 ## (catchably, "memory budget" in the message) when even the clamped plan
 ## cannot fit. 0 = unlimited.
 
-var decodeContiguousBudget {.threadvar.}: int
+var
+  decodeContiguousBudget {.threadvar.}: int
+  decodeContiguousProvider {.threadvar.}: proc(): int {.nimcall, raises: [].}
 
-proc decodeContiguousBudgetBytes*(): int {.inline, raises: [].} =
+proc decodeContiguousBudgetBytes*(): int {.raises: [].} =
   ## Largest single allocation a decode may make; 0 = unlimited.
+  if not decodeContiguousProvider.isNil:
+    decodeContiguousBudget = max(0, decodeContiguousProvider())
+    decodeContiguousProvider = nil
   decodeContiguousBudget
 
 proc setDecodeContiguousBudgetBytes*(bytes: int) {.raises: [].} =
   ## Sets the largest-single-allocation budget; 0 = unlimited. Feed it the
   ## largest free block of the heap the decode buffers come from.
   decodeContiguousBudget = max(0, bytes)
+  decodeContiguousProvider = nil
+
+proc setDecodeContiguousBudgetProvider*(
+  provider: proc(): int {.nimcall, raises: [].}
+) {.raises: [].} =
+  ## Sets the largest-single-allocation budget to what `provider` answers
+  ## the first time a decode asks for it, and keeps that answer until the
+  ## next set. For a heap whose largest free block is costly to measure (an
+  ## ESP32 walks every block for it, half a millisecond with a few hundred),
+  ## refreshed before every render of an animation that mostly decodes
+  ## nothing.
+  decodeContiguousProvider = provider
 
 proc overContiguousBudget*(bytes: int64): bool {.inline, raises: [].} =
   ## True when one allocation of `bytes` exceeds the contiguous budget.
