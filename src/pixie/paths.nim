@@ -1116,6 +1116,16 @@ proc computeBounds(segments: seq[(Segment, int16)]): Rect =
     result.w = xMax - xMin
     result.h = yMax - yMin
 
+proc sameCommands*(a, b: Path): bool {.raises: [].} =
+  ## Whether two paths draw the same shape: the same path, or the same
+  ## commands. (Where the pen is left for the next command does not matter
+  ## to what either draws.)
+  if a == b:
+    return true
+  if a.isNil or b.isNil:
+    return false
+  a.commands == b.commands
+
 proc computeBounds*(
   path: Path, transform = mat3()
 ): Rect {.raises: [PixieError].} =

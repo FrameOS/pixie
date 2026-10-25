@@ -1,6 +1,6 @@
 ## Load SVG files.
 
-import chroma, ../common, ../fonts, ../images, ../internal, ../paints,
+import bumpy, chroma, ../common, ../fonts, ../images, ../internal, ../paints,
     ../paths, parsexml, strutils, tables, unicode, vmath, xmlparser, xmltree
 
 when defined(pixieDebugSvg):
@@ -218,6 +218,39 @@ proc parseSvgTransform(transform: string): Mat3 =
       result = result * scale(vec2(sx, sy))
     else:
       failInvalidTransform(transform)
+
+const
+  PathCacheEntries = 32
+  PathCacheMaxChars = 64 * 1024 ## all cached path data together
+
+var
+  pathCache {.threadvar.}: seq[(string, Path)]
+  pathCacheChars {.threadvar.}: int
+
+proc parsePathCached(d: string): Path {.raises: [PixieError].} =
+  ## `<path d>` parsed once and shared by every SVG that holds the same data.
+  ## An animation renders the same shapes under a new transform every frame,
+  ## and parsing their data was a third of the parse on an ESP32; sharing one
+  ## path also makes "this element did not change" a pointer comparison
+  ## (`damage`). Paths parsed here are only ever read — rendered and measured
+  ## — never changed, so sharing them is safe. Per thread, bounded by count
+  ## and by total characters; data too long for the bound is parsed each time.
+  if d.len * 4 > PathCacheMaxChars:
+    return parsePath(d)
+  for i in countdown(pathCache.high, 0):
+    if pathCache[i][0] == d:
+      result = pathCache[i][1]
+      if i != pathCache.high:
+        let entry = pathCache[i]
+        pathCache.delete(i)
+        pathCache.add(entry)
+      return
+  result = parsePath(d)
+  pathCache.add((d, result))
+  pathCacheChars += d.len
+  while pathCache.len > PathCacheEntries or pathCacheChars > PathCacheMaxChars:
+    pathCacheChars -= pathCache[0][0].len
+    pathCache.delete(0)
 
 proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties =
   result = inherited
@@ -816,7 +849,7 @@ proc parseSvgElement(
     let
       d = node.attr("d")
       props = node.parseSvgProperties(propertiesStack[^1])
-      path = parsePath(d)
+      path = parsePathCached(d)
 
     result.add (path, props)
 
@@ -1045,11 +1078,15 @@ proc parseSvg*(data: string, width = 0, height = 0): Svg {.raises: [PixieError].
     raise currentExceptionAsPixieError()
 
 proc renderSvg(
-  svg: Svg, target: Image, firstBlendMode: BlendMode
+  svg: Svg, target: Image, firstBlendMode: BlendMode, offset = mat3()
 ) {.raises: [PixieError].} =
+  ## `offset` maps the image the SVG was parsed for onto `target`: a
+  ## translation when `target` is a window of it (renderInto with an origin).
   try:
     var blendMode = firstBlendMode
-    for (path, props) in svg.elements:
+    for (path, elementProps) in svg.elements:
+      var props = elementProps
+      props.transform = offset * props.transform
       if props.display and props.opacity > 0:
         if props.fill != "none":
           var paint: Paint
@@ -1155,6 +1192,84 @@ proc renderInto*(svg: Svg, target: Image) {.raises: [PixieError].} =
   ## content they are not, and a semi-transparent first path would replace what
   ## is underneath instead of blending with it.
   svg.renderSvg(target, NormalBlend)
+
+proc renderInto*(
+  svg: Svg, target: Image, originX, originY: int
+) {.raises: [PixieError].} =
+  ## renderInto for a window: `target` is the part of the image the SVG was
+  ## parsed for that starts at (originX, originY) — a `view` of it, say — and
+  ## what falls inside it is drawn exactly as a whole render would draw it
+  ## there. With `damage`, an animation repaints the box that changed instead
+  ## of the whole canvas.
+  svg.renderSvg(target, NormalBlend,
+    translate(vec2(-originX.float32, -originY.float32)))
+
+proc sameElement(a, b: (Path, SvgProperties)): bool =
+  sameCommands(a[0], b[0]) and a[1] == b[1]
+
+proc paintBounds(path: Path, props: SvgProperties): Rect {.raises: [PixieError].} =
+  ## The pixels an element can touch: the path's bounds, grown by its stroke
+  ## and a pixel of antialiasing on each side.
+  result = path.computeBounds(props.transform)
+  var margin = 1.0'f32
+  if props.stroke.a > 0 and props.strokeWidth > 0:
+    let
+      m = props.transform
+      scale = sqrt(max(m[0, 0] * m[0, 0] + m[0, 1] * m[0, 1],
+        m[1, 0] * m[1, 0] + m[1, 1] * m[1, 1]))
+    margin += props.strokeWidth * scale * max(1'f32, props.strokeMiterLimit) / 2
+  result.x -= margin
+  result.y -= margin
+  result.w += margin * 2
+  result.h += margin * 2
+
+proc damage*(
+  previous, next: Svg, width, height: int
+): tuple[full: bool, x, y, w, h: int] {.raises: [].} =
+  ## Where rendering `next` changes a `width` x `height` target that holds
+  ## exactly what `previous` rendered there (both parsed for that size): the
+  ## box around every element that differs, where it was and where it will
+  ## be. Everything outside the box is drawn by elements both have in common,
+  ## so repainting the box alone (renderInto with an origin, into a view)
+  ## leaves the target exactly as a whole render of `next` would.
+  ##
+  ## `full` when the two cannot be compared element by element: a different
+  ## number of elements, a gradient that differs, or bounds that cannot be
+  ## measured. An empty box (w = 0) when nothing differs.
+  if previous.isNil or next.isNil or width <= 0 or height <= 0 or
+      previous.elements.len != next.elements.len or
+      previous.gradients != next.gradients:
+    return (true, 0, 0, width, height)
+  var
+    minX = float32.high
+    minY = float32.high
+    maxX = float32.low
+    maxY = float32.low
+  try:
+    for i in 0 ..< next.elements.len:
+      if sameElement(previous.elements[i], next.elements[i]):
+        continue
+      for element in [previous.elements[i], next.elements[i]]:
+        let (path, props) = element
+        if not props.display or props.opacity <= 0:
+          continue
+        let bounds = paintBounds(path, props)
+        minX = min(minX, bounds.x)
+        minY = min(minY, bounds.y)
+        maxX = max(maxX, bounds.x + bounds.w)
+        maxY = max(maxY, bounds.y + bounds.h)
+  except:
+    return (true, 0, 0, width, height)
+  if maxX <= minX or maxY <= minY:
+    return (false, 0, 0, 0, 0)
+  let
+    x0 = clamp(floor(minX).int, 0, width)
+    y0 = clamp(floor(minY).int, 0, height)
+    x1 = clamp(ceil(maxX).int, 0, width)
+    y1 = clamp(ceil(maxY).int, 0, height)
+  if x1 <= x0 or y1 <= y0:
+    return (false, 0, 0, 0, 0)
+  (false, x0, y0, x1 - x0, y1 - y0)
 
 proc newImage*(svg: Svg): Image {.raises: [PixieError].} =
   ## Render SVG and return the image.
