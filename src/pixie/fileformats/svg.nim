@@ -1577,6 +1577,26 @@ proc renderSvg(
   except:
     raise currentExceptionAsPixieError()
 
+type SvgPicture* = tuple
+  image: Image  ## what an `<image>` element draws
+  box: Rect     ## the box it is stretched into, before `transform`
+  clip: Rect    ## the element's own box it is clipped to (`slice`); w < 0: none
+  transform: Mat3
+
+iterator pictures*(svg: Svg): SvgPicture {.raises: [].} =
+  ## The pictures the SVG draws, and where: for a caller that changes a
+  ## picture's pixels in place (a canvas an app draws into) and must repaint
+  ## them, which damageRects cannot see (the element is the same, and so is
+  ## its picture, by identity).
+  if not svg.isNil:
+    for element in svg.elements:
+      let props = element.props
+      if not props.image.isNil and props.display and props.opacity > 0:
+        yield (props.image, props.imageBox,
+          (if props.imageClip: rect(props.rectX, props.rectY, props.rectW, props.rectH)
+           else: rect(0, 0, -1, -1)),
+          props.transform)
+
 proc coversOpaque*(svg: Svg, width, height: int): bool {.raises: [].} =
   ## Whether the first thing `svg` paints is an opaque, solid, square-cornered
   ## rectangle over all of a `width` x `height` target — a background rect —

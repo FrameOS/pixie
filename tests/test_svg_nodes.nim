@@ -131,3 +131,20 @@ block:
   let other = parseSvg(b, 80, 80, reuse = true)
   doAssert not damageRects(second, other, 80, 80).full
   echo "svg node reuse ok"
+
+block:
+  # pictures: the <image> elements an SVG draws, where, for a caller that
+  # changes a picture's pixels in place; hidden ones are not listed.
+  let picture = newImage(10, 5)
+  let doc = SvgNode(tag: "svg", attrs: @[("width", "40"), ("height", "40")], children: @[
+    SvgNode(tag: "rect", attrs: @[("width", "40"), ("height", "40"), ("fill", "#fff")]),
+    SvgNode(tag: "image", attrs: @[("x", "4"), ("y", "6"), ("width", "20"), ("height", "10")], image: picture),
+    SvgNode(tag: "image", attrs: @[("x", "0"), ("y", "0"), ("width", "8"), ("height", "8"),
+      ("opacity", "0")], image: picture)])
+  var found: seq[SvgPicture]
+  for p in parseSvg(doc, 80, 80).pictures:
+    found.add p
+  doAssert found.len == 1
+  doAssert found[0].image == picture and found[0].box == rect(4, 6, 20, 10) and found[0].clip.w < 0
+  doAssert found[0].transform * vec2(4, 6) == vec2(8, 12) # parsed at twice the size
+  echo "svg pictures ok"
