@@ -148,7 +148,7 @@ template lutIndex(t: float32, last: int): int =
   (if not (t > 0): 0 elif t >= 1: last else: int(t * last.float32 + 0.5'f32))
 
 template fillPerPixel(
-  image: Image, paint: Paint, extent: float32, exact: bool,
+  image: Image, paint: Paint, extent: float32, exact: bool, pixels: int,
   rowSetup, tAt: untyped
 ) =
   ## Writes every pixel of `image` with the gradient colour at the `t` that
@@ -156,7 +156,8 @@ template fillPerPixel(
   ## row for whatever `tAt` wants precomputed. Colours come from the table
   ## when `gradientLutSize` says the fill is large enough to pay for one;
   ## `tAt` sees which through the injected `throughTable`.
-  let lutSize = gradientLutSize(extent, image.width * image.height, exact)
+  let lutSize = gradientLutSize(extent,
+    if pixels >= 0: pixels else: image.width * image.height, exact)
   if lutSize == 0:
     let throughTable {.inject.} = false
     for y {.inject.} in 0 ..< image.height:
@@ -176,7 +177,7 @@ template fillPerPixel(
         image.setPixel(rowIndex + x, lut[lutIndex(tAt, last)])
 
 proc fillGradientLinear(
-  image: Image, paint: Paint, origin: Vec2, exact: bool
+  image: Image, paint: Paint, origin: Vec2, exact: bool, pixels: int
 ) =
   ## Fills a linear gradient. Pixel (x, y) of `image` takes the colour the
   ## gradient has at `origin + (x, y)`, so a strip of a larger surface can be
@@ -257,13 +258,13 @@ proc fillGradientLinear(
         image.unsafe[x, y] = rgbx
 
   else:
-    image.fillPerPixel(paint, dist(at, to), exact):
+    image.fillPerPixel(paint, dist(at, to), exact, pixels):
       let rowY = y.float32 + origin.y
     do:
       toLineSpace(at, to, vec2(x.float32 + origin.x, rowY))
 
 proc fillGradientRadial(
-  image: Image, paint: Paint, origin: Vec2, exact: bool
+  image: Image, paint: Paint, origin: Vec2, exact: bool, pixels: int
 ) =
   ## Fills a radial gradient: t is the distance from the centre in a space
   ## where the edge and skew handles are one unit away, so the stops sit on
@@ -299,7 +300,7 @@ proc fillGradientRadial(
     m11 = mat[1, 1]
     m20 = mat[2, 0]
     m21 = mat[2, 1]
-  image.fillPerPixel(paint, max(distanceX, distanceY), exact):
+  image.fillPerPixel(paint, max(distanceX, distanceY), exact, pixels):
     let
       rowY = y.float32 + origin.y
       rowX10 = m10 * rowY
@@ -313,7 +314,7 @@ proc fillGradientRadial(
     if throughTable: fastSqrt(d2) else: sqrt(d2)
 
 proc fillGradientAngular(
-  image: Image, paint: Paint, origin: Vec2, exact: bool
+  image: Image, paint: Paint, origin: Vec2, exact: bool, pixels: int
 ) =
   ## Fills an angular gradient.
 
@@ -336,7 +337,7 @@ proc fillGradientAngular(
   # t runs 0..1 around the circle; the outermost pixels of the fill go round
   # it in about pi * (width + height) steps.
   image.fillPerPixel(
-    paint, f32PI * (image.width + image.height).float32, exact
+    paint, f32PI * (image.width + image.height).float32, exact, pixels
   ):
     let rowY = y.float32 + origin.y
   do:
@@ -346,7 +347,7 @@ proc fillGradientAngular(
     (angle + gradientAngle + f32PI / 2).fixAngle() / 2 / f32PI + 0.5.float32
 
 proc fillGradient*(
-  image: Image, paint: Paint, origin = vec2(0, 0), exact = false
+  image: Image, paint: Paint, origin = vec2(0, 0), exact = false, pixels = -1
 ) {.raises: [PixieError].} =
   ## Fills with the Paint gradient. `origin` is where the image's top-left
   ## pixel sits in the gradient's coordinate space: filling a strip at
@@ -356,12 +357,15 @@ proc fillGradient*(
   ## Radial, angular and diagonal linear gradients read their colours from a
   ## table (see `gradientLutSize`) once the fill is large enough to pay for
   ## one; `exact = true` evaluates the colour ramp at every pixel instead.
+  ## `pixels`: the size of the whole fill `image` is a strip of, which is
+  ## what decides for the table, so that every strip of one fill decides
+  ## alike (the image's own size when -1).
   case paint.kind:
   of LinearGradientPaint:
-    image.fillGradientLinear(paint, origin, exact)
+    image.fillGradientLinear(paint, origin, exact, pixels)
   of RadialGradientPaint:
-    image.fillGradientRadial(paint, origin, exact)
+    image.fillGradientRadial(paint, origin, exact, pixels)
   of AngularGradientPaint:
-    image.fillGradientAngular(paint, origin, exact)
+    image.fillGradientAngular(paint, origin, exact, pixels)
   else:
     raise newException(PixieError, "Paint must be a gradient")
