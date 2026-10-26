@@ -1,5 +1,8 @@
 import chroma, common, images, simd, vmath
 
+when defined(release):
+  {.push checks: off.}
+
 type
   PaintKind* = enum
     SolidPaint
@@ -204,36 +207,16 @@ proc fillGradientLinear(
     at = paint.gradientHandlePositions[0]
     to = paint.gradientHandlePositions[1]
 
-  if at.y == to.y: # Horizontal gradient
-    var x: int
-    while x < image.width:
-      when allowSimd and (defined(amd64) or defined(arm64)):
-        if x + 4 <= image.width and image.format == pfRgbx:
-          var colors: array[4, ColorRGBX]
-          for i in 0 ..< 4:
-            let
-              xy = vec2((x + i).float32 + origin.x, origin.y)
-              t = toLineSpace(at, to, xy)
-              rgbx = paint.gradientColor(t)
-            colors[i] = rgbx
-          when defined(amd64):
-            let colorVec = mm_loadu_si128(colors[0].addr)
-            for y in 0 ..< image.height:
-              mm_storeu_si128(image.data[image.dataIndex(x, y)].addr, colorVec)
-          else: # arm64
-            let colorVec = vld1q_u32(colors[0].addr)
-            for y in 0 ..< image.height:
-              vst1q_u32(image.data[image.dataIndex(x, y)].addr, colorVec)
-          x += 4
-          continue
-
+  if at.y == to.y: # Horizontal gradient: one row of colours, copied down
+    if image.height > 0:
+      for x in 0 ..< image.width:
+        let t = toLineSpace(at, to, vec2(x.float32 + origin.x, origin.y))
+        image.unsafe[x, 0] = paint.gradientColor(t)
       let
-        xy = vec2(x.float32 + origin.x, origin.y)
-        t = toLineSpace(at, to, xy)
-        rgbx = paint.gradientColor(t)
-      for y in 0 ..< image.height:
-        image.unsafe[x, y] = rgbx
-      inc x
+        rowBytes = image.width * image.bytesPerPixel
+        first = image.pixelAddr(image.dataIndex(0, 0))
+      for y in 1 ..< image.height:
+        copyMem(image.pixelAddr(image.dataIndex(0, y)), first, rowBytes)
 
   elif at.x == to.x: # Vertical gradient
     for y in 0 ..< image.height:
@@ -369,3 +352,6 @@ proc fillGradient*(
     image.fillGradientAngular(paint, origin, exact, pixels)
   else:
     raise newException(PixieError, "Paint must be a gradient")
+
+when defined(release):
+  {.pop.}
