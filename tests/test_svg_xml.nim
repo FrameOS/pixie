@@ -1,25 +1,41 @@
-import os, parsexml, pixie/common, pixie/fileformats/svg, xmlparser, xmltree
+import algorithm, os, parsexml, pixie/common, pixie/fileformats/svg, strutils, xmlparser
 
-# parseSvgXmlFast must build exactly the tree std/xmlparser builds for what
-# it accepts, and refuse (nil) what it does not reproduce, so that the full
-# parser reads that — and reports its errors.
+# parseSvgNodesFast must read exactly the elements std/xmlparser reads for
+# what it accepts (text and comments it drops: nothing in a document without
+# `<text>` reads them), and refuse (nil) what it does not reproduce, so that
+# the full parser reads that — and reports its errors.
+
+proc elements(node: SvgNode): string =
+  ## The elements and attributes of a tree, which is all parseSvg reads of a
+  ## document without text. Attributes sorted: std's table holds them in hash
+  ## order, and an element reads them by name.
+  if node.tag.len == 0 or node.tag == "&":
+    return
+  result = "<" & node.tag
+  for (key, value) in node.attrs.sorted():
+    result.add " " & key & "=" & value.escape
+  result.add ">"
+  for child in node.children:
+    result.add child.elements
+  result.add "</" & node.tag & ">"
 
 proc stdTree(data: string): string =
-  $parseXml(data, {reportComments})
+  parseXml(data, {reportComments}).toSvgNode().elements
 
 proc check(data: string, fast: bool) =
-  let tree = parseSvgXmlFast(data)
+  let tree = parseSvgNodesFast(data)
   if fast:
     doAssert tree != nil, "refused: " & data
   if tree != nil:
-    doAssert $tree == stdTree(data), "differs: " & data & "\n" & $tree & "\n" & stdTree(data)
+    doAssert tree.elements == stdTree(data), "differs: " & data & "\n" &
+      tree.elements & "\n" & stdTree(data)
 
 var corpus, accepted: int
 for dir in ["tests/fileformats/svg", "tests/fonts"]:
   for path in walkFiles(dir / "*.svg"):
     let data = readFile(path)
     inc corpus
-    if parseSvgXmlFast(data) != nil:
+    if parseSvgNodesFast(data) != nil:
       inc accepted
     check(data, fast = false)
 doAssert accepted > 0
@@ -33,12 +49,13 @@ check("""<?xml version="1.0"?>""" & "\n" & svgOpen & "\n  <g>\n    <rect width='
 # Attribute values: runs of whitespace are one space, a trailing run goes,
 # a leading one stays one space.
 check(svgOpen & "<path d=\"M0 0\n  L5\t5   Z  \"/><path d=\"  M1 1\"/><path d=\" M2 2 \"/></svg>", true)
-# Comments, and the whitespace after one, are nodes; text is a node.
+# Comments and text are read past.
 check(svgOpen & "<!-- a -- b --> \n <g><title>Logo  x </title><!--c--><rect/></g></svg>", true)
 check("<!-- before -->\n" & svgOpen & "<g/></svg>", true)
 # Names with namespaces and dots, single-quoted values holding the other quote.
 check("""<svg xmlns:xlink="x"><use xlink:href='#a"b' a.b-c="1"/></svg>""", true)
-# A tag without attributes keeps no attribute table, an empty one none either.
+# A repeated attribute: the last one wins, as in std's table.
+check(svgOpen & """<rect x="1" x="2"/></svg>""", true)
 check("<svg><g ></g><g/><g\n/></svg>", true)
 # Everything after the root element is ignored, as std ignores it.
 check(svgOpen & "</svg><junk", true)
@@ -57,15 +74,24 @@ for data in [
   svgOpen & "<rect x=\"1\"",                # cut off
   svgOpen & "< g/></svg>",                  # no name
 ]:
-  doAssert parseSvgXmlFast(data) == nil, data
+  doAssert parseSvgNodesFast(data) == nil, data
 
-# parseSvgXml gives the same tree either way, and the same errors.
-doAssert $parseSvgXml(svgOpen & "<rect/></svg>") == stdTree(svgOpen & "<rect/></svg>")
+# parseSvgNodes gives the same elements either way, and the same errors.
+doAssert parseSvgNodes(svgOpen & "<rect/></svg>").elements ==
+  stdTree(svgOpen & "<rect/></svg>")
 var raised = false
 try:
-  discard parseSvgXml(svgOpen & "<g></h></svg>")
+  discard parseSvgNodes(svgOpen & "<g></h></svg>")
 except PixieError:
   raised = true
 doAssert raised
+
+# A text document goes through std, with its whitespace and its entities.
+block:
+  let root = parseSvgNodes(svgOpen & "<text><tspan>a</tspan> &amp; &nbsp;b</text></svg>")
+  var texts: seq[string]
+  for child in root.children[0].children:
+    texts.add child.tag & ":" & child.text
+  doAssert texts == @["tspan:", ": ", ":&", ": ", "&: ", ":b"], $texts
 
 echo "test_svg_xml: ", accepted, " of ", corpus, " corpus files read fast, ok"

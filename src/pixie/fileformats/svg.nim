@@ -14,6 +14,22 @@ type
     gradients: Table[string, SvgGradient]
     viewBoxWidth, viewBoxHeight: float32 # what percentage lengths refer to
 
+  SvgNode* {.acyclic.} = ref object
+    ## What `parseSvg` reads: an element (`tag`, `attrs`, `children`), a run
+    ## of text inside one (an empty `tag`), or the text of an entity, which
+    ## keeps its spaces (`tag` "&"). Markup becomes a tree of these
+    ## (`parseSvgNodes`); a caller that holds a drawing in some other form
+    ## builds the tree itself and skips the markup — the larger half of an
+    ## animated document's parse. Such a caller can also hand over what markup
+    ## has no words for: the picture an `<image>` draws (`image`) and the
+    ## outline of a `<path>` (`path`, in place of its `d`).
+    tag*: string
+    text*: string
+    attrs*: seq[(string, string)]
+    children*: seq[SvgNode]
+    image*: Image
+    path*: Path
+
   SvgTextAnchor = enum
     StartAnchor, MiddleAnchor, EndAnchor
 
@@ -42,6 +58,12 @@ type
     # (`coversOpaque`). Never inherited: parseSvgProperties clears it.
     isRect: bool
     rectX, rectY, rectW, rectH: float32
+    # An `<image>`: the picture, the box it is drawn stretched into, and
+    # whether it is clipped to the element's own box (rectX.., `slice`).
+    # Never inherited either.
+    image: Image
+    imageBox: Rect
+    imageClip: bool
 
   SvgGradient = object
     kind: PaintKind         # LinearGradientPaint or RadialGradientPaint
@@ -75,7 +97,25 @@ proc svgTypefaceResolver*(): SvgTypefaceResolver {.raises: [].} =
   {.cast(gcsafe).}:
     result = svgTypefaceResolverImpl
 
-proc attrOrDefault(node: XmlNode, name, default: string): string =
+proc attr*(node: SvgNode, name: string): string =
+  ## The value of attribute `name`, or "" when the element has none. A
+  ## handful of attributes per element: a scan beats a hash table, and costs
+  ## no table.
+  for i in 0 ..< node.attrs.len:
+    if node.attrs[i][0] == name:
+      return node.attrs[i][1]
+
+proc setAttr*(node: SvgNode, name, value: string) =
+  for i in 0 ..< node.attrs.len:
+    if node.attrs[i][0] == name:
+      node.attrs[i][1] = value
+      return
+  node.attrs.add((name, value))
+
+proc isText(node: SvgNode): bool {.inline.} =
+  node.tag.len == 0 or node.tag == "&"
+
+proc attrOrDefault(node: SvgNode, name, default: string): string =
   result = node.attr(name)
   if result.len == 0:
     result = default
@@ -257,9 +297,11 @@ proc parsePathCached(d: string): Path {.raises: [PixieError].} =
         pathBounds.delete(i)
         break
 
-proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties =
+proc parseSvgProperties(node: SvgNode, inherited: SvgProperties): SvgProperties =
   result = inherited
   result.isRect = false
+  result.image = nil
+  result.imageClip = false
 
   var
     fillRule = node.attr("fill-rule")
@@ -300,11 +342,11 @@ proc parseSvgProperties(node: XmlNode, inherited: SvgProperties): SvgProperties 
         ]:
           echo k, ": ", v
 
-    if node.attrs() != nil:
-      for k, v in node.attrs():
-        maybeLogPair(k, v)
+    for (k, v) in node.attrs:
+      maybeLogPair(k, v)
 
-  let pairs = style.split(';')
+  # Most elements have no style: splitting "" still allocates a seq.
+  let pairs = if style.len > 0: style.split(';') else: @[]
   for pair in pairs:
     let parts = pair.split(':')
     if parts.len == 2:
@@ -580,7 +622,7 @@ proc resolveSvgTypeface(props: SvgProperties): Typeface =
   resolver("", props.fontWeight, props.fontItalic)
 
 proc walkSvgText(
-  node: XmlNode,
+  node: SvgNode,
   inherited: SvgProperties,
   runs: var seq[SvgTextRun],
   lastWasSpace: var bool,
@@ -607,32 +649,27 @@ proc walkSvgText(
   if dy.len > 0:
     pending.dy += parseSvgCoordinate(dy)
 
-  for child in node:
-    case child.kind
-    of xnText, xnCData, xnVerbatimText:
+  for child in node.children:
+    case child.tag
+    of "":
       let text = collapseSvgWhitespace(child.text, lastWasSpace)
       if text.len > 0:
         runs.add SvgTextRun(text: text, props: props, pos: pending)
         pending = SvgTextPosition()
-    of xnEntity:
-      let text = svgEntityText(child.text)
-      if text.len > 0:
+    of "&":
+      if child.text.len > 0:
         lastWasSpace = false
-        runs.add SvgTextRun(text: text, props: props, pos: pending)
+        runs.add SvgTextRun(text: child.text, props: props, pos: pending)
         pending = SvgTextPosition()
-    of xnElement:
-      case child.tag
-      of "tspan", "text", "a":
-        child.walkSvgText(props, runs, lastWasSpace, pending)
-      else:
-        # <textPath>, <title>, <desc>, <tref>: no v1 support, and dropping the
-        # element is better than losing the document it sits in.
-        discard
+    of "tspan", "text", "a":
+      child.walkSvgText(props, runs, lastWasSpace, pending)
     else:
+      # <textPath>, <title>, <desc>, <tref>: no v1 support, and dropping the
+      # element is better than losing the document it sits in.
       discard
 
 proc parseSvgText(
-  node: XmlNode, props: SvgProperties
+  node: SvgNode, props: SvgProperties
 ): seq[(Path, SvgProperties)] =
   ## Turns a `<text>` element into glyph outlines. They are ordinary paths from
   ## there on: fill, stroke, gradients, opacity and transforms all apply exactly
@@ -729,11 +766,11 @@ proc parseSvgLength(value: string, reference: float32): float32 =
   else:
     parseFloat(v)
 
-proc parseSvgGradientStops(node: XmlNode): seq[ColorStop] =
-  for child in node:
-    if child.kind != xnElement:
+proc parseSvgGradientStops(node: SvgNode): seq[ColorStop] =
+  for child in node.children:
+    if child.isText:
       # Whitespace between the stops, reported for documents with text in
-      # them (see parseSvgXml). Not a tag, and `tag` on it would be a defect.
+      # them (see parseSvgNodes).
       continue
     if child.tag == "stop":
       var
@@ -776,7 +813,7 @@ proc parseSvgGradientStops(node: XmlNode): seq[ColorStop] =
     else:
       raise newException(PixieError, "Unexpected SVG tag: " & child.tag)
 
-proc parseSvgGradient(node: XmlNode, svg: Svg) =
+proc parseSvgGradient(node: SvgNode, svg: Svg) =
   ## `<linearGradient>` and `<radialGradient>`, registered by id for fills to
   ## reference as `url(#id)`. Coordinates are user space (`gradientUnits=
   ## "userSpaceOnUse"`, the only supported units), numbers or percentages of
@@ -818,11 +855,52 @@ proc parseSvgGradient(node: XmlNode, svg: Svg) =
   gradient.stops = node.parseSvgGradientStops()
   svg.gradients[id] = gradient
 
+proc parseSvgImage(node: SvgNode, props: SvgProperties): (Path, SvgProperties) =
+  ## An `<image>` whose picture the caller decoded (`SvgNode.image`): drawn
+  ## into its x/y/width/height box (the picture's own size when absent), fitted
+  ## the way `preserveAspectRatio` says — `none` stretches, `meet` (the
+  ## default) fits inside and `slice` covers, clipped to the box, both aligned
+  ## by xMin/xMid/xMax and YMin/YMid/YMax.
+  let image = node.image
+  if image.isNil or image.width <= 0 or image.height <= 0:
+    raise newException(PixieError, "Unsupported SVG tag: image")
+  let
+    x = parseSvgCoordinate(node.attr("x"))
+    y = parseSvgCoordinate(node.attr("y"))
+    w = parseSvgCoordinate(node.attr("width"), image.width.float32)
+    h = parseSvgCoordinate(node.attr("height"), image.height.float32)
+    aspect = node.attr("preserveAspectRatio")
+  if w <= 0 or h <= 0:
+    return
+  var box = rect(x, y, w, h)
+  result[1] = props
+  if aspect != "none":
+    let
+      slice = aspect.endsWith("slice")
+      sx = w / image.width.float32
+      sy = h / image.height.float32
+      s = if slice: max(sx, sy) else: min(sx, sy)
+      fw = image.width.float32 * s
+      fh = image.height.float32 * s
+      ax = if "xMin" in aspect: 0f32 elif "xMax" in aspect: 1f32 else: 0.5f32
+      ay = if "YMin" in aspect: 0f32 elif "YMax" in aspect: 1f32 else: 0.5f32
+    box = rect(x + (w - fw) * ax, y + (h - fh) * ay, fw, fh)
+    result[1].imageClip = slice
+  result[1].image = image
+  result[1].imageBox = box
+  result[1].rectX = x
+  result[1].rectY = y
+  result[1].rectW = w
+  result[1].rectH = h
+  # The element's box, for its bounds (damage); never filled.
+  result[0] = newPath()
+  result[0].rect(x, y, w, h)
+
 proc parseSvgElement(
-  node: XmlNode, svg: Svg, propertiesStack: var seq[SvgProperties]
-): seq[(Path, SvgProperties)] =
-  if node.kind != xnElement:
-    # Skip <!-- comments -->
+  node: SvgNode, svg: Svg, propertiesStack: var seq[SvgProperties],
+  elements: var seq[(Path, SvgProperties)]
+) =
+  if node.isText:
     return
 
   case node.tag:
@@ -832,31 +910,32 @@ proc parseSvgElement(
   of "defs":
     # Where documents keep their gradients. Anything else defined here
     # (patterns, clip paths, symbols) is not drawn, as before.
-    for child in node:
-      if child.kind == xnElement and
-          child.tag in ["linearGradient", "radialGradient"]:
+    for child in node.children:
+      if child.tag in ["linearGradient", "radialGradient"]:
         child.parseSvgGradient(svg)
-      else:
-        when defined(pixieDebugSvg):
-          echo child
 
   of "g":
     let props = node.parseSvgProperties(propertiesStack[^1])
     propertiesStack.add(props)
-    for child in node:
-      result.add child.parseSvgElement(svg, propertiesStack)
+    for child in node.children:
+      child.parseSvgElement(svg, propertiesStack, elements)
     discard propertiesStack.pop()
 
   of "text":
-    result.add node.parseSvgText(propertiesStack[^1])
+    elements.add node.parseSvgText(propertiesStack[^1])
+
+  of "image":
+    let element = node.parseSvgImage(node.parseSvgProperties(propertiesStack[^1]))
+    if not element[0].isNil:
+      elements.add element
 
   of "path":
     let
       d = node.attr("d")
       props = node.parseSvgProperties(propertiesStack[^1])
-      path = parsePathCached(d)
+      path = if node.path.isNil: parsePathCached(d) else: node.path
 
-    result.add (path, props)
+    elements.add (path, props)
 
   of "line":
     let
@@ -870,7 +949,7 @@ proc parseSvgElement(
     path.moveTo(x1, y1)
     path.lineTo(x2, y2)
 
-    result.add (path, props)
+    elements.add (path, props)
 
   of "polyline", "polygon":
     let
@@ -904,7 +983,7 @@ proc parseSvgElement(
     if node.tag == "polygon":
       path.closePath()
 
-    result.add (path, props)
+    elements.add (path, props)
 
   of "rect":
     let
@@ -948,7 +1027,7 @@ proc parseSvgElement(
       rectProps.rectW = width
       rectProps.rectH = height
 
-    result.add (path, rectProps)
+    elements.add (path, rectProps)
 
   of "circle", "ellipse":
     let
@@ -967,7 +1046,7 @@ proc parseSvgElement(
     let path = newPath()
     path.ellipse(cx, cy, rx, ry)
 
-    result.add (path, props)
+    elements.add (path, props)
 
   of "linearGradient", "radialGradient":
     node.parseSvgGradient(svg)
@@ -976,7 +1055,7 @@ proc parseSvgElement(
     raise newException(PixieError, "Unsupported SVG tag: " & node.tag)
 
 proc parseSvgViewBox(
-  root: XmlNode, width, height: int
+  root: SvgNode, width, height: int
 ): tuple[minX, minY, width, height: float32] =
   ## The user coordinate box the document is drawn in. `viewBox` when there is
   ## one (four numbers, whitespace and/or commas between them, decimals
@@ -1012,9 +1091,9 @@ proc parseSvgViewBox(
   raise newException(PixieError, "SVG has no viewBox and no width/height")
 
 proc parseSvg*(
-  root: XmlNode, width = 0, height = 0
+  root: SvgNode, width = 0, height = 0
 ): Svg {.raises: [PixieError].} =
-  ## Parse SVG XML. Defaults to the SVG's view box size.
+  ## Parse an SVG node tree. Defaults to the SVG's view box size.
   try:
     if root.tag != "svg":
       failInvalid()
@@ -1046,12 +1125,46 @@ proc parseSvg*(
       rootProps.transform = rootProps.transform * scale(vec2(scaleX, scaleY))
 
     var propertiesStack = @[rootProps]
-    for node in root.items:
-      result.elements.add node.parseSvgElement(result, propertiesStack)
+    for node in root.children:
+      node.parseSvgElement(result, propertiesStack, result.elements)
   except PixieError as e:
     raise e
   except:
     raise currentExceptionAsPixieError()
+
+proc addSvgNode(siblings: var seq[SvgNode], node: XmlNode) =
+  ## `node` as what parseSvg reads, appended to `siblings`: comments and
+  ## processing instructions go, an entity becomes the text it stands for.
+  case node.kind
+  of xnElement:
+    let element = SvgNode(tag: node.tag)
+    if node.attrs != nil:
+      for key, value in node.attrs:
+        element.attrs.add((key, value))
+    for child in node:
+      element.children.addSvgNode(child)
+    siblings.add element
+  of xnText, xnCData, xnVerbatimText:
+    siblings.add SvgNode(text: node.text)
+  of xnEntity:
+    siblings.add SvgNode(tag: "&", text: svgEntityText(node.text))
+  else:
+    discard
+
+proc toSvgNode*(root: XmlNode): SvgNode {.raises: [].} =
+  ## An XML tree as the node tree parseSvg reads.
+  var nodes: seq[SvgNode]
+  try:
+    nodes.addSvgNode(root)
+  except KeyError:
+    discard # attrs iteration: not raised for a table it is walking
+  if nodes.len > 0: nodes[0] else: SvgNode(tag: "svg")
+
+proc parseSvg*(
+  root: XmlNode, width = 0, height = 0
+): Svg {.raises: [PixieError].} =
+  ## Parse SVG XML. Defaults to the SVG's view box size.
+  root.toSvgNode().parseSvg(width, height)
 
 proc holdsText(data: string): bool =
   ## Whether the markup has a `<text` or `<tspan` tag: one pass from `<` to
@@ -1093,22 +1206,23 @@ proc xmlAttrValue(data: string, start, stop: int): string =
         pendingSpace = false
       result.add c
 
-proc parseSvgXmlFast*(data: string): XmlNode {.raises: [].} =
-  ## The tree std/xmlparser builds (with `reportComments`, without
+proc parseSvgNodesFast*(data: string): SvgNode {.raises: [].} =
+  ## The elements std/xmlparser reads (with `reportComments`, without
   ## `reportWhitespace`) for markup made of elements, attributes, comments
   ## and text, cut out of `data` a value at a time: Nim's parser appends
   ## every character to its token one by one, which was half the parse of
-  ## an animated logo on an ESP32. nil for anything else — an entity, a
-  ## CR, a NUL, CDATA, a declaration, unquoted or empty attributes, a tag
-  ## that does not close — which the full parser then reads, and reports.
+  ## an animated logo on an ESP32. For a document without `<text>`, where
+  ## nothing reads text or comments, so neither is kept. nil for anything
+  ## else — an entity, a CR, a NUL, CDATA, a declaration, unquoted or empty
+  ## attributes, a tag that does not close — which the full parser then
+  ## reads, and reports.
   for c in data:
     if c in {'&', '\c', '\0'}:
       return nil
   let n = data.len
   var
     pos = 0
-    stack: seq[XmlNode]
-    afterComment = false # std reports the whitespace that follows a comment
+    stack: seq[SvgNode]
 
   template skipSpace() =
     while pos < n and data[pos] in xmlSpace:
@@ -1123,21 +1237,14 @@ proc parseSvgXmlFast*(data: string): XmlNode {.raises: [].} =
   while pos < n:
     let c = data[pos]
     if c in xmlSpace:
-      let start = pos
       skipSpace()
-      if afterComment and stack.len > 0:
-        stack[^1].add newText(data[start ..< pos])
-      afterComment = false
       continue
-    afterComment = false
     if c != '<':
       if stack.len == 0:
         return nil # text outside the root element: an error to std
-      let start = pos
       pos = data.find('<', pos)
       if pos < 0:
         pos = n
-      stack[^1].add newText(data[start ..< pos])
       continue
     if pos + 1 >= n:
       return nil
@@ -1160,9 +1267,6 @@ proc parseSvgXmlFast*(data: string): XmlNode {.raises: [].} =
       let stop = data.find("-->", pos + 4)
       if stop < 0:
         return nil
-      if stack.len > 0:
-        stack[^1].add newComment(data[pos + 4 ..< stop])
-        afterComment = true
       pos = stop + 3
     of '?':
       let stop = data.find("?>", pos + 2)
@@ -1175,29 +1279,28 @@ proc parseSvgXmlFast*(data: string): XmlNode {.raises: [].} =
       skipName()
       if pos == start:
         return nil
-      let element = newElement(data[start ..< pos])
+      let element = SvgNode(tag: data[start ..< pos])
       skipSpace()
-      if pos < n and data[pos] in xmlNameStart:
-        element.attrs = newStringTable()
-        while pos < n and data[pos] in xmlNameStart:
-          let keyStart = pos
-          skipName()
-          let key = data[keyStart ..< pos]
-          skipSpace()
-          if pos >= n or data[pos] != '=':
-            return nil
-          inc pos
-          skipSpace()
-          if pos >= n or data[pos] notin {'"', '\''}:
-            return nil
-          let quote = data[pos]
-          inc pos
-          let stop = data.find(quote, pos)
-          if stop < 0:
-            return nil
-          element.attrs[key] = xmlAttrValue(data, pos, stop)
-          pos = stop + 1
-          skipSpace()
+      while pos < n and data[pos] in xmlNameStart:
+        let keyStart = pos
+        skipName()
+        let key = data[keyStart ..< pos]
+        skipSpace()
+        if pos >= n or data[pos] != '=':
+          return nil
+        inc pos
+        skipSpace()
+        if pos >= n or data[pos] notin {'"', '\''}:
+          return nil
+        let quote = data[pos]
+        inc pos
+        let stop = data.find(quote, pos)
+        if stop < 0:
+          return nil
+        # std keeps the last of a repeated attribute
+        element.setAttr(key, xmlAttrValue(data, pos, stop))
+        pos = stop + 1
+        skipSpace()
       var empty = false
       if pos < n and data[pos] == '/':
         empty = true
@@ -1206,7 +1309,7 @@ proc parseSvgXmlFast*(data: string): XmlNode {.raises: [].} =
         return nil
       inc pos
       if stack.len > 0:
-        stack[^1].add element
+        stack[^1].children.add element
       if empty:
         if stack.len == 0:
           return element
@@ -1215,39 +1318,63 @@ proc parseSvgXmlFast*(data: string): XmlNode {.raises: [].} =
   nil # the root element never closed
 
 proc parseSvgXml*(data: string): XmlNode {.raises: [PixieError].} =
-  ## Parses SVG markup into XML, the way `parseSvg` needs it. Callers that want
-  ## the tree itself — to rewrite the root transform and render in bands, say —
-  ## should come through here rather than calling `parseXml` directly.
-  ##
-  ## Nim's parser drops whitespace that follows a closing tag unless asked for
-  ## it, which is invisible everywhere except inside `<text>`, where the space
-  ## in `…</tspan> tail` is content. Asking for it costs a node per run of
-  ## whitespace in the document, so only documents with text pay. Markup
-  ## without text, entities or declarations — what an app writes — takes a
-  ## faster reader that builds the same tree (parseSvgXmlFast).
+  ## Parses SVG markup into XML the way `parseSvg` reads it: with the
+  ## whitespace that follows a closing tag when the document has text (Nim's
+  ## parser drops it otherwise, and inside `<text>` the space in
+  ## `…</tspan> tail` is content). parseSvgNodes is the faster way to the
+  ## same drawing.
   try:
     var options = {reportComments}
     if data.holdsText():
       options.incl reportWhitespace
-    else:
-      result = parseSvgXmlFast(data)
-      if result != nil:
-        return
     result = parseXml(data, options)
   except PixieError as e:
     raise e
   except:
     raise currentExceptionAsPixieError()
 
+proc parseSvgNodes*(data: string): SvgNode {.raises: [PixieError].} =
+  ## Parses SVG markup into the node tree parseSvg reads. Markup without
+  ## text, entities or declarations — what an app writes — is read straight
+  ## into nodes (parseSvgNodesFast); anything else goes through std/xmlparser
+  ## (parseSvgXml), whose errors are the ones reported.
+  if not data.holdsText():
+    result = parseSvgNodesFast(data)
+    if result != nil:
+      return
+  result = parseSvgXml(data).toSvgNode()
+
 proc parseSvg*(data: string, width = 0, height = 0): Svg {.raises: [PixieError].} =
   ## Parse SVG data. Defaults to the SVG's view box size.
-  try:
-    let root = parseSvgXml(data)
-    result = root.parseSvg(width, height)
-  except PixieError as e:
-    raise e
-  except:
-    raise currentExceptionAsPixieError()
+  parseSvgNodes(data).parseSvg(width, height)
+
+proc drawSvgImage(target: Image, props: SvgProperties) {.raises: [PixieError].} =
+  ## An `<image>` element: its picture stretched into `imageBox`, and with
+  ## `imageClip` only where it falls inside the element's box, which an axis
+  ## aligned transform keeps a rectangle of the target.
+  var image = props.image
+  let
+    box = props.imageBox
+    m = props.transform
+    opacity = props.opacity * props.fillOpacity
+  if opacity < 1:
+    image = image.copy()
+    image.applyOpacity(opacity)
+  let transform = m * translate(vec2(box.x, box.y)) *
+    scale(vec2(box.w / image.width.float32, box.h / image.height.float32))
+  if not props.imageClip or m[0, 1] != 0 or m[1, 0] != 0:
+    target.draw(image, transform)
+    return
+  let
+    a = m * vec2(props.rectX, props.rectY)
+    b = m * vec2(props.rectX + props.rectW, props.rectY + props.rectH)
+    x0 = clamp(round(min(a.x, b.x)).int, 0, target.width)
+    y0 = clamp(round(min(a.y, b.y)).int, 0, target.height)
+    x1 = clamp(round(max(a.x, b.x)).int, 0, target.width)
+    y1 = clamp(round(max(a.y, b.y)).int, 0, target.height)
+  if x1 > x0 and y1 > y0:
+    target.view(x0, y0, x1 - x0, y1 - y0).draw(
+      image, translate(vec2(-x0.float32, -y0.float32)) * transform)
 
 proc renderSvg(
   svg: Svg, target: Image, firstBlendMode: BlendMode, offset = mat3()
@@ -1259,6 +1386,11 @@ proc renderSvg(
     for (path, elementProps) in svg.elements:
       var props = elementProps
       props.transform = offset * props.transform
+      if not props.image.isNil:
+        if props.display and props.opacity > 0:
+          target.drawSvgImage(props)
+          blendMode = NormalBlend
+        continue
       if props.display and props.opacity > 0:
         if props.fill != "none":
           var paint: Paint
