@@ -2342,6 +2342,13 @@ proc parseSomePath(
 
 const paintStripMinRows = 4
 
+proc shapeBounds(path: SomePath, transform: Mat3): Rect {.raises: [PixieError].} =
+  ## The box around a path's outline under `transform`, in the target's
+  ## pixels (its flattening at that scale, so a shared path's cached one).
+  var shapes = parseSomePath(path, true, transform.pixelScale())
+  shapes.transform(transform)
+  computeBounds(shapes.shapesToSegments(skipHorizontal = false))
+
 proc paintStripRows*(width, height: int): int {.raises: [].} =
   ## Rows per strip when a path is filled with a paint server (gradient or
   ## image paint). Such a fill goes through a coverage mask and a paint image
@@ -2363,7 +2370,7 @@ proc paintStripRows*(width, height: int): int {.raises: [].} =
   max(min(height.int64, paintStripMinRows.int64), rows).int
 
 template paintThroughMask(
-  image: Image, paint: Paint, transform: Mat3, rasterise: untyped
+  image: Image, paint: Paint, transform: Mat3, bounds: Rect, rasterise: untyped
 ) =
   ## The paint-server half of fillPath and strokePath: rasterise the shape
   ## as a coverage mask, paint the gradient or image, multiply, composite.
@@ -2379,19 +2386,38 @@ template paintThroughMask(
   ## The paint is evaluated at the strip's true coordinates, so gradient
   ## colours are identical. One strip covering everything is the original
   ## algorithm, untouched.
+  ##
+  ## `bounds`: the shape's box in the image. A gradient under a blend that
+  ## leaves what it does not cover as it was (all but the masks and
+  ## overwrite) only needs that box: the mask, the paint and the composite
+  ## are its size, not the image's, so a gradient button costs its own
+  ## pixels (a 416x36 slider on a 480x480 canvas, 15,000 of them instead of
+  ## 230,400 three times over). An image paint keeps the image's width: its
+  ## bilinear samples would round differently through the moved matrix.
+  var
+    boxX0, boxY0 = 0
+    boxX1 = image.width
+    boxY1 = image.height
+  if paint.kind in {LinearGradientPaint, RadialGradientPaint, AngularGradientPaint} and
+      paint.blendMode notin {MaskBlend, OverwriteBlend, SubtractMaskBlend, ExcludeMaskBlend}:
+    boxX0 = clamp(floor(bounds.x).int - 1, 0, image.width)
+    boxY0 = clamp(floor(bounds.y).int - 1, 0, image.height)
+    boxX1 = clamp(ceil(bounds.x + bounds.w).int + 1, boxX0, image.width)
+    boxY1 = clamp(ceil(bounds.y + bounds.h).int + 1, boxY0, image.height)
   let
-    stripRows = paintStripRows(image.width, image.height)
+    boxW = boxX1 - boxX0
+    stripRows = paintStripRows(max(boxW, 1), max(boxY1 - boxY0, 1))
     savedOpacity = paint.opacity
-  var stripY = 0
-  while stripY < image.height:
+  var stripY = boxY0
+  while boxW > 0 and stripY < boxY1:
     let
-      stripHeight = min(stripRows, image.height - stripY)
-      wholeImage = stripHeight == image.height
-      stripOffset = vec2(0, -stripY.float32)
+      stripHeight = min(stripRows, boxY1 - stripY)
+      wholeImage = boxW == image.width and stripHeight == image.height
+      stripOffset = vec2(-boxX0.float32, -stripY.float32)
       stripTransform {.inject.} =
         if wholeImage: transform else: translate(stripOffset) * transform
-      mask {.inject.} = newImage(image.width, stripHeight)
-      fill = newImage(image.width, stripHeight)
+      mask {.inject.} = newImage(boxW, stripHeight)
+      fill = newImage(boxW, stripHeight)
 
     rasterise
 
@@ -2409,7 +2435,9 @@ template paintThroughMask(
         fill.drawTiled(paint.image,
           if wholeImage: paint.imageMat else: translate(stripOffset) * paint.imageMat)
       of LinearGradientPaint, RadialGradientPaint, AngularGradientPaint:
-        fill.fillGradient(paint, -stripOffset)
+        # The table is chosen as for one pass over the whole image, as before
+        # strips and boxes: every strip of the fill alike, the same colours.
+        fill.fillGradient(paint, -stripOffset, pixels = image.width * image.height)
 
     paint.opacity = savedOpacity
 
@@ -2420,7 +2448,7 @@ template paintThroughMask(
     if wholeImage:
       image.draw(fill, blendMode = paint.blendMode)
     else:
-      image.view(0, stripY, image.width, stripHeight).draw(
+      image.view(boxX0, stripY, boxW, stripHeight).draw(
         fill, blendMode = paint.blendMode)
 
     stripY += stripHeight
@@ -2447,7 +2475,7 @@ proc fillPath*(
       image.fillShapes(shapes, color, windingRule, paint.blendMode)
     return
 
-  image.paintThroughMask(paint, transform):
+  image.paintThroughMask(paint, transform, shapeBounds(path, transform)):
     mask.fillPath(path, color(1, 1, 1, 1), stripTransform, windingRule)
 
 proc strokePath*(
@@ -2484,7 +2512,13 @@ proc strokePath*(
       image.fillShapes(strokeShapes, color, NonZero, paint.blendMode)
     return
 
-  image.paintThroughMask(paint, transform):
+  var bounds = shapeBounds(path, transform)
+  let reach = strokeWidth * transform.pixelScale() * max(1'f32, miterLimit) / 2
+  bounds.x -= reach
+  bounds.y -= reach
+  bounds.w += reach * 2
+  bounds.h += reach * 2
+  image.paintThroughMask(paint, transform, bounds):
     mask.strokePath(
       path,
       color(1, 1, 1, 1),

@@ -74,7 +74,8 @@ animate(pfRgb565)
 
 block:
   # Nothing changed: an empty box. An element added is damage where it is
-  # (the rest still match, in order); a changed gradient: full.
+  # (the rest still match, in order); a changed gradient, the elements
+  # filled with it.
   let a = parseSvg(frame(3), W, H)
   doAssert damage(a, parseSvg(frame(3), W, H), W, H) == (false, 0, 0, 0, 0)
   let added = damage(a, parseSvg(frame(3, "<rect width=\"4\" height=\"4\"/>"), W, H), W, H)
@@ -84,8 +85,51 @@ block:
       "<stop offset=\"0\" stop-color=\"#000\"/><stop offset=\"1\" stop-color=\"#fff\"/></linearGradient></defs>" &
       "<rect width=\"9\" height=\"9\" fill=\"url(#g)\"/>"
     g2 = g1.replace("#fff", "#f00")
-  doAssert damage(parseSvg(frame(3, g1), W, H), parseSvg(frame(3, g2), W, H), W, H).full
+  let ramp = damage(parseSvg(frame(3, g1), W, H), parseSvg(frame(3, g2), W, H), W, H)
+  doAssert not ramp.full and ramp.x == 0 and ramp.y == 0 and ramp.w <= 11 and ramp.h <= 11, $ramp
   doAssert damage(nil, a, W, H).full
+
+block:
+  # A slider: a track, a fill whose gradient stretches to its width, and a
+  # knob at its end. Moving it repaints the fill and the knob, never the
+  # rest of the frame, and each frame comes out as a whole render.
+  proc slider(level: int): string =
+    let w = 20 + level
+    &"""<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">""" &
+      &"""<rect x="0" y="0" width="{W}" height="{H}" fill="#090b14"/>""" &
+      """<rect x="10" y="20" width="140" height="16" rx="8" fill="#334155"/>""" &
+      &"""<defs><linearGradient id="g0" gradientUnits="userSpaceOnUse" x1="10" y1="0" x2="{10 + w}" y2="0">""" &
+      """<stop offset="0" stop-color="#0369a1"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs>""" &
+      &"""<rect x="10" y="20" width="{w}" height="16" rx="8" fill="url(#g0)"/>""" &
+      &"""<circle cx="{10 + w - 8}" cy="28" r="6" fill="#fff"/>""" &
+      """<rect x="10" y="60" width="60" height="30" rx="6" fill="#fcd34d"/></svg>"""
+  var
+    buffers = [fresh(slider(0), pfRgbx), fresh(slider(10), pfRgbx)]
+    held = [parseSvg(slider(0), W, H), parseSvg(slider(10), W, H)]
+  for i in 2 ..< 14:
+    let
+      level = (i * 37) mod 120
+      target = buffers[i mod 2]
+      next = parseSvg(slider(level), W, H)
+      found = damageRects(held[i mod 2], next, W, H)
+    doAssert not found.full
+    for r in found.rects:
+      # The track's row, never the card below it.
+      doAssert r.y >= 17 and r.y + r.h <= 39, &"slider {level}: {r}"
+      next.renderInto(target.view(r.x, r.y, r.w, r.h), r.x, r.y)
+    held[i mod 2] = next
+    let expected = fresh(slider(level), pfRgbx)
+    var nudged = 0
+    for y in 0 ..< H:
+      for x in 0 ..< W:
+        let (got, want) = (target[x, y], expected[x, y])
+        if got == want:
+          continue
+        # An antialiased edge a rounding off, as above; nothing more.
+        doAssert abs(got.r.int - want.r.int) <= 2 and abs(got.g.int - want.g.int) <= 2 and
+          abs(got.b.int - want.b.int) <= 2, &"slider {level}: ({x}, {y}) is {got}, a whole render gives {want}"
+        inc nudged
+    doAssert nudged * 200 < W * H, &"slider {level}: {nudged} pixels off by a rounding"
 
 block:
   # Identical path data is parsed once.

@@ -1667,15 +1667,29 @@ proc damageRects*(
   ## joined, and past `maxRects` the two whose join adds the least area.
   ##
   ## The match looks `Resync` elements ahead for an element added or
-  ## removed; a longer run than that is damage too, if more of it. `full`
-  ## when a gradient differs or bounds cannot be measured. No boxes when
-  ## nothing differs.
-  if previous.isNil or next.isNil or width <= 0 or height <= 0 or
-      previous.gradients != next.gradients:
+  ## removed; a longer run than that is damage too, if more of it. An
+  ## element filled with a gradient whose definition differs between the
+  ## two (a progress bar's ramp stretched to its new width) differs however
+  ## equal the rest of it is. `full` when bounds cannot be measured. No
+  ## boxes when nothing differs.
+  if previous.isNil or next.isNil or width <= 0 or height <= 0:
     return (true, @[(0, 0, width, height)])
   const Resync = 8
   template a: untyped = previous.elements
   template b: untyped = next.elements
+  var changedGradients: seq[string]
+  for id, gradient in previous.gradients:
+    if id notin next.gradients or next.gradients.getOrDefault(id) != gradient:
+      changedGradients.add id
+  for id in next.gradients.keys:
+    if id notin previous.gradients:
+      changedGradients.add id
+  proc paintChanged(element: SvgElement): bool =
+    changedGradients.len > 0 and element.props.fill.startsWith("url(#") and
+      element.props.fill.find(")") > 5 and
+      element.props.fill[5 ..< element.props.fill.find(")")] in changedGradients
+  template same(i, j: int): bool =
+    sameElement(previous, i, next, j) and not paintChanged(previous.elements[i])
   var boxes: seq[Rect]
   proc add(boxes: var seq[Rect], svg: Svg, i: int) {.raises: [PixieError].} =
     let element = svg.elements[i]
@@ -1684,7 +1698,7 @@ proc damageRects*(
   try:
     var i, j = 0
     while i < a.len or j < b.len:
-      if i < a.len and j < b.len and sameElement(previous, i, next, j):
+      if i < a.len and j < b.len and same(i, j):
         inc i
         inc j
         continue
@@ -1692,9 +1706,9 @@ proc damageRects*(
       # before a[i] reappears, or `removed` of `previous` before b[j] does.
       var added, removed = 0
       for k in 1 .. Resync:
-        if i < a.len and j + k < b.len and sameElement(previous, i, next, j + k):
+        if i < a.len and j + k < b.len and same(i, j + k):
           added = k
-        elif j < b.len and i + k < a.len and sameElement(previous, i + k, next, j):
+        elif j < b.len and i + k < a.len and same(i + k, j):
           removed = k
         if added + removed > 0:
           break
