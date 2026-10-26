@@ -227,4 +227,47 @@ block:
         doAssert abs(got.r.int - want.r.int) <= 1 and abs(got.g.int - want.g.int) <= 1 and
           abs(got.b.int - want.b.int) <= 1, &"frame {i}: ({x}, {y}) is {got}, a whole render gives {want}"
 
+block:
+  # A stroke reaches past its path by how it joins and ends: a round join or
+  # cap half the width, a square cap to its corners, a miter join as far as
+  # its limit. Drawn over the same background, each one's damage box is
+  # tight around its kind of reach and still holds every pixel it painted.
+  const bg = &"""<rect x="0" y="0" width="{W}" height="{H}" fill="#f1f5f9"/>"""
+  proc doc(stroke = ""): string =
+    &"""<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">{bg}{stroke}</svg>"""
+  let empty = parseSvg(doc(), W, H)
+  for (join, cap, reach) in [("round", "round", 0.5), ("bevel", "butt", 0.5),
+      ("round", "square", 0.71), ("miter", "round", 2.0)]:
+    # A sharp turn (a miter that reaches its limit) and two ends.
+    let stroke = &"""<polyline points="30,90 80,30 90,90" fill="none" stroke="#ef4444" """ &
+      &"""stroke-width="12" stroke-linejoin="{join}" stroke-linecap="{cap}" stroke-miterlimit="4"/>"""
+    let
+      next = parseSvg(doc(stroke), W, H)
+      box = damage(empty, next, W, H)
+      grow = (12 * reach + 2).ceil.int # the reach, antialiasing and rounding out
+    doAssert not box.full and box.w > 0
+    doAssert box.x >= 30 - grow - 1 and box.x + box.w <= 90 + grow + 1 and
+      box.y >= 30 - grow - 1 and box.y + box.h <= 90 + grow + 1,
+      &"{join}/{cap}: {box} reaches past {grow}"
+    let target = fresh(doc(), pfRgbx)
+    next.renderInto(target.view(box.x, box.y, box.w, box.h), box.x, box.y)
+    let expected = fresh(doc(stroke), pfRgbx)
+    for y in 0 ..< H:
+      for x in 0 ..< W:
+        doAssert target[x, y] == expected[x, y],
+          &"{join}/{cap}: ({x}, {y}) is {target[x, y]} outside {box}, a whole render gives {expected[x, y]}"
+  # A line from a finger, round-capped (its join the default miter, which a
+  # single segment never draws): its box, not four widths more on each side.
+  let
+    lineDoc = doc("""<line x1="40" y1="60" x2="52" y2="62" stroke="#000" stroke-width="12" stroke-linecap="round"/>""")
+    line = parseSvg(lineDoc, W, H)
+    lineBox = damage(empty, line, W, H)
+  doAssert lineBox.w * lineBox.h <= 30 * 22, &"{lineBox}"
+  let lineTarget = fresh(doc(), pfRgbx)
+  line.renderInto(lineTarget.view(lineBox.x, lineBox.y, lineBox.w, lineBox.h), lineBox.x, lineBox.y)
+  let lineExpected = fresh(lineDoc, pfRgbx)
+  for y in 0 ..< H:
+    for x in 0 ..< W:
+      doAssert lineTarget[x, y] == lineExpected[x, y], &"line: ({x}, {y}) outside {lineBox}"
+
 echo "svg damage ok"

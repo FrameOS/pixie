@@ -1464,7 +1464,17 @@ proc paintBounds(path: Path, props: SvgProperties): Rect {.raises: [PixieError].
   result = transformedBounds(localBounds(path), m)
   var margin = 1.0'f32 + 0.5'f32 * scale
   if props.stroke.a > 0 and props.strokeWidth > 0:
-    margin += props.strokeWidth * scale * max(1'f32, props.strokeMiterLimit) / 2
+    # How far the stroke reaches past the path, in half widths: a miter join
+    # as far as the miter limit lets it, a square cap to its corners, and
+    # round or bevel joins, round or butt caps and a line with no join at
+    # all half the width. A finger painting round-capped lines repaints a box
+    # around each, not one four widths wider on every side.
+    var reach = 1'f32
+    if props.strokeLineJoin == MiterJoin and path.hasJoins:
+      reach = max(reach, props.strokeMiterLimit)
+    if props.strokeLineCap == SquareCap:
+      reach = max(reach, sqrt(2'f32))
+    margin += props.strokeWidth * scale * reach / 2
   result.x -= margin
   result.y -= margin
   result.w += margin * 2
