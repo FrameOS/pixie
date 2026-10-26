@@ -10,9 +10,7 @@ const
 type
   Svg* = ref object
     width*, height*: int
-    elements: seq[(Path, SvgProperties)]
-    origins: seq[int64] # each element's node parse and place in it (`origin`), 0: none
-    bounds: seq[Rect] # each element's paintBounds, once measured (w < 0: not yet)
+    elements: seq[SvgElement]
     gradients: Table[string, SvgGradient]
     viewBoxWidth, viewBoxHeight: float32 # what percentage lengths refer to
 
@@ -34,11 +32,21 @@ type
     # What parseSvg made of this node as a child of the document, and under
     # which inherited properties: a caller that hands the same node over
     # again (a UI's unchanged card) gets the same elements back unparsed.
-    # `parsedEpoch` names that parse (`origin`). A node is not changed once
-    # parsed, as a shared path is not.
-    parsed: seq[(Path, SvgProperties)]
-    parsedUnder: SvgProperties
-    parsedEpoch: int64
+    # A node is not changed once parsed, as a shared path is not. The
+    # properties are the document's, one object for every node parsed
+    # with them, not a copy in each.
+    parsed: seq[SvgElement]
+    parsedUnder: ref SvgProperties # nil: not parsed
+
+  SvgElement = ref object
+    ## One thing an SVG draws. Never changed once made, so the parses that
+    ## bring a node's elements back (`SvgNode.parsed`) and every frame a
+    ## caller keeps for its damage share it: a pointer per element, not a
+    ## copy of its properties each. The same element in two parses is one
+    ## object, which is how damageRects knows it without comparing.
+    path: Path
+    props: SvgProperties
+    bounds: Rect # paintBounds, once measured (w < 0: not yet)
 
   SvgTextAnchor = enum
     StartAnchor, MiddleAnchor, EndAnchor
@@ -94,12 +102,11 @@ type
 template failInvalid() =
   raise newException(PixieError, "Invalid SVG data")
 
-var parseEpoch {.threadvar.}: int64
+proc newSvgElement(path: Path, props: SvgProperties): SvgElement =
+  SvgElement(path: path, props: props, bounds: rect(0, 0, -1, -1))
 
-proc origin(epoch: int64, index: int): int64 {.inline.} =
-  ## An element's identity: the parse of its node and its place in it. Two
-  ## elements with the same nonzero origin are the same element.
-  epoch * 4096 + index.int64
+proc newSvgElement(element: (Path, SvgProperties)): SvgElement =
+  newSvgElement(element[0], element[1])
 
 var svgTypefaceResolverImpl: SvgTypefaceResolver
 
@@ -908,7 +915,7 @@ proc parseSvgImage(node: SvgNode, props: SvgProperties): (Path, SvgProperties) =
 
 proc parseSvgElement(
   node: SvgNode, svg: Svg, propertiesStack: var seq[SvgProperties],
-  elements: var seq[(Path, SvgProperties)]
+  elements: var seq[SvgElement]
 ) =
   if node.isText:
     return
@@ -932,12 +939,13 @@ proc parseSvgElement(
     discard propertiesStack.pop()
 
   of "text":
-    elements.add node.parseSvgText(propertiesStack[^1])
+    for element in node.parseSvgText(propertiesStack[^1]):
+      elements.add newSvgElement(element)
 
   of "image":
     let element = node.parseSvgImage(node.parseSvgProperties(propertiesStack[^1]))
     if not element[0].isNil:
-      elements.add element
+      elements.add newSvgElement(element)
 
   of "path":
     let
@@ -945,7 +953,7 @@ proc parseSvgElement(
       props = node.parseSvgProperties(propertiesStack[^1])
       path = if node.path.isNil: parsePathCached(d) else: node.path
 
-    elements.add (path, props)
+    elements.add newSvgElement(path, props)
 
   of "line":
     let
@@ -959,7 +967,7 @@ proc parseSvgElement(
     path.moveTo(x1, y1)
     path.lineTo(x2, y2)
 
-    elements.add (path, props)
+    elements.add newSvgElement(path, props)
 
   of "polyline", "polygon":
     let
@@ -993,7 +1001,7 @@ proc parseSvgElement(
     if node.tag == "polygon":
       path.closePath()
 
-    elements.add (path, props)
+    elements.add newSvgElement(path, props)
 
   of "rect":
     let
@@ -1037,7 +1045,7 @@ proc parseSvgElement(
       rectProps.rectW = width
       rectProps.rectH = height
 
-    elements.add (path, rectProps)
+    elements.add newSvgElement(path, rectProps)
 
   of "circle", "ellipse":
     let
@@ -1056,7 +1064,7 @@ proc parseSvgElement(
     let path = newPath()
     path.ellipse(cx, cy, rx, ry)
 
-    elements.add (path, props)
+    elements.add newSvgElement(path, props)
 
   of "linearGradient", "radialGradient":
     node.parseSvgGradient(svg)
@@ -1140,35 +1148,32 @@ proc parseSvg*(
         scaleY = height.float32 / box.height
       rootProps.transform = rootProps.transform * scale(vec2(scaleX, scaleY))
 
-    var propertiesStack = @[rootProps]
+    var
+      propertiesStack = @[rootProps]
+      under: ref SvgProperties # rootProps, for the nodes parsed here
     for node in root.children:
       if not reuse:
         node.parseSvgElement(result, propertiesStack, result.elements)
         continue
-      if node.parsedEpoch != 0 and node.parsedUnder == rootProps:
-        for k in 0 ..< node.parsed.len:
-          result.elements.add node.parsed[k]
-          result.origins.add origin(node.parsedEpoch, k)
+      if not node.parsedUnder.isNil and
+          (node.parsedUnder == under or node.parsedUnder[] == rootProps):
+        under = node.parsedUnder
+        result.elements.add node.parsed
         continue
       let
         first = result.elements.len
         gradients = result.gradients.len
       node.parseSvgElement(result, propertiesStack, result.elements)
-      # Kept unless it defined gradients (the document's, not the node's)
-      # or made more elements than an origin can count.
-      if result.gradients.len == gradients and result.elements.len - first <= 0xfff:
-        inc parseEpoch
+      # Kept unless it defined gradients (the document's, not the node's).
+      if result.gradients.len == gradients:
+        if under.isNil:
+          under = new(SvgProperties)
+          under[] = rootProps
         node.parsed = result.elements[first .. ^1]
-        node.parsedUnder = rootProps
-        node.parsedEpoch = parseEpoch
-        for k in 0 ..< node.parsed.len:
-          result.origins.add origin(parseEpoch, k)
+        node.parsedUnder = under
       else:
-        node.parsedEpoch = 0
-        while result.origins.len < result.elements.len:
-          result.origins.add 0
-    if result.origins.len != result.elements.len:
-      result.origins.setLen(0) # not reused: no origins at all
+        node.parsed = @[]
+        node.parsedUnder = nil
   except PixieError as e:
     raise e
   except:
@@ -1418,15 +1423,13 @@ proc drawSvgImage(target: Image, props: SvgProperties) {.raises: [PixieError].} 
     target.view(x0, y0, x1 - x0, y1 - y0).draw(
       image, translate(vec2(-x0.float32, -y0.float32)) * transform)
 
-proc sameElement(a, b: (Path, SvgProperties)): bool =
-  sameCommands(a[0], b[0]) and a[1] == b[1]
-
 proc sameElement(a: Svg, i: int, b: Svg, j: int): bool =
   ## Element i of `a` and j of `b` draw the same: one element, handed over
   ## twice (the same node's parse), or two equal ones.
-  if i < a.origins.len and j < b.origins.len and a.origins[i] != 0 and a.origins[i] == b.origins[j]:
-    return true
-  sameElement(a.elements[i], b.elements[j])
+  let
+    x = a.elements[i]
+    y = b.elements[j]
+  x == y or (sameCommands(x.path, y.path) and x.props == y.props)
 
 proc transformedBounds(bounds: Rect, m: Mat3): Rect =
   ## The box around a box's four corners under `m`: it holds whatever the box
@@ -1467,17 +1470,13 @@ proc paintBounds(path: Path, props: SvgProperties): Rect {.raises: [PixieError].
   result.w += margin * 2
   result.h += margin * 2
 
-proc paintBounds(svg: Svg, i: int): Rect {.raises: [PixieError].} =
-  ## Element `i`'s paintBounds, measured once per parsed SVG: a frame's
-  ## repaint boxes each look at every element, and damageRects at the
-  ## changed ones of the frame before as well.
-  if svg.bounds.len != svg.elements.len:
-    svg.bounds.setLen(svg.elements.len)
-    for b in svg.bounds.mitems:
-      b.w = -1
-  if svg.bounds[i].w < 0:
-    svg.bounds[i] = paintBounds(svg.elements[i][0], svg.elements[i][1])
-  svg.bounds[i]
+proc paintBounds(element: SvgElement): Rect {.raises: [PixieError].} =
+  ## The element's paintBounds, measured once per element, whatever parses
+  ## share it: a frame's repaint boxes each look at every element, and
+  ## damageRects at the changed ones of the frame before as well.
+  if element.bounds.w < 0:
+    element.bounds = paintBounds(element.path, element.props)
+  element.bounds
 
 proc join(a, b: Rect): Rect =
   let
@@ -1501,11 +1500,13 @@ proc renderSvg(
   ## costs the elements over it, not every element's flattening and stroke.
   try:
     var blendMode = firstBlendMode
-    for i, (path, elementProps) in svg.elements:
+    for element in svg.elements:
+      let path = element.path
+      template elementProps: untyped = element.props
       if window.w > 0 and elementProps.display and elementProps.opacity > 0:
         var bounds = window
         try:
-          bounds = svg.paintBounds(i)
+          bounds = element.paintBounds()
         except PixieError:
           discard # unmeasured: drawn
         if not bounds.meets(window):
@@ -1586,7 +1587,7 @@ proc coversOpaque*(svg: Svg, width, height: int): bool {.raises: [].} =
   ## opacity, rounded corners, a rotation, an edge short of the target's).
   if svg.isNil or svg.elements.len == 0 or width <= 0 or height <= 0:
     return false
-  let props = svg.elements[0][1]
+  let props = svg.elements[0].props
   if not props.isRect or not props.display:
     return false
   if props.opacity < 1 or props.fillOpacity < 1:
@@ -1677,8 +1678,9 @@ proc damageRects*(
   template b: untyped = next.elements
   var boxes: seq[Rect]
   proc add(boxes: var seq[Rect], svg: Svg, i: int) {.raises: [PixieError].} =
-    if svg.elements[i][1].display and svg.elements[i][1].opacity > 0:
-      boxes.addBox(svg.paintBounds(i))
+    let element = svg.elements[i]
+    if element.props.display and element.props.opacity > 0:
+      boxes.addBox(element.paintBounds())
   try:
     var i, j = 0
     while i < a.len or j < b.len:
