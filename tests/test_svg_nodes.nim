@@ -102,3 +102,32 @@ block: # An RGB565 target takes an <image> too
   doAssert target[0, 0].r > 200 and target[3, 1].b > 200
 
 echo "test_svg_nodes ok"
+
+block:
+  # reuse: the same child node handed over again comes back as the same
+  # elements, known to damageRects without a compare; a changed one is
+  # parsed again, and a parse under other properties does not take them.
+  let
+    keep = SvgNode(tag: "rect", attrs: @[("x", "2"), ("y", "2"), ("width", "8"), ("height", "8"), ("fill", "#f00")])
+    moving = proc(x: int): SvgNode = SvgNode(tag: "rect", attrs: @[("x", $x), ("y", "20"), ("width", "6"), ("height", "6"), ("fill", "#00f")])
+    a = SvgNode(tag: "svg", attrs: @[("width", "40"), ("height", "40")], children: @[keep, moving(2)])
+    b = SvgNode(tag: "svg", attrs: @[("width", "40"), ("height", "40")], children: @[keep, moving(20)])
+    first = parseSvg(a, 40, 40, reuse = true)
+    second = parseSvg(b, 40, 40, reuse = true)
+    found = damageRects(first, second, 40, 40)
+  doAssert not found.full and found.rects.len > 0
+  for r in found.rects:
+    doAssert r.y >= 17, $found.rects # where the moved rect was and is, not the kept one
+  # Drawn the same as a parse without reuse.
+  let
+    reused = newImage(40, 40)
+    plain = newImage(40, 40)
+  second.renderInto(reused)
+  parseSvg(b, 40, 40).renderInto(plain)
+  for y in 0 ..< 40:
+    for x in 0 ..< 40:
+      doAssert reused[x, y] == plain[x, y]
+  # Under another size (other inherited properties) the kept node is parsed again.
+  let other = parseSvg(b, 80, 80, reuse = true)
+  doAssert not damageRects(second, other, 80, 80).full
+  echo "svg node reuse ok"

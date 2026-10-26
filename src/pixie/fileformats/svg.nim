@@ -11,6 +11,7 @@ type
   Svg* = ref object
     width*, height*: int
     elements: seq[(Path, SvgProperties)]
+    origins: seq[int64] # each element's node parse and place in it (`origin`), 0: none
     bounds: seq[Rect] # each element's paintBounds, once measured (w < 0: not yet)
     gradients: Table[string, SvgGradient]
     viewBoxWidth, viewBoxHeight: float32 # what percentage lengths refer to
@@ -30,6 +31,14 @@ type
     children*: seq[SvgNode]
     image*: Image
     path*: Path
+    # What parseSvg made of this node as a child of the document, and under
+    # which inherited properties: a caller that hands the same node over
+    # again (a UI's unchanged card) gets the same elements back unparsed.
+    # `parsedEpoch` names that parse (`origin`). A node is not changed once
+    # parsed, as a shared path is not.
+    parsed: seq[(Path, SvgProperties)]
+    parsedUnder: SvgProperties
+    parsedEpoch: int64
 
   SvgTextAnchor = enum
     StartAnchor, MiddleAnchor, EndAnchor
@@ -84,6 +93,13 @@ type
 
 template failInvalid() =
   raise newException(PixieError, "Invalid SVG data")
+
+var parseEpoch {.threadvar.}: int64
+
+proc origin(epoch: int64, index: int): int64 {.inline.} =
+  ## An element's identity: the parse of its node and its place in it. Two
+  ## elements with the same nonzero origin are the same element.
+  epoch * 4096 + index.int64
 
 var svgTypefaceResolverImpl: SvgTypefaceResolver
 
@@ -1085,9 +1101,15 @@ proc parseSvgViewBox(
   raise newException(PixieError, "SVG has no viewBox and no width/height")
 
 proc parseSvg*(
-  root: SvgNode, width = 0, height = 0
+  root: SvgNode, width = 0, height = 0, reuse = false
 ): Svg {.raises: [PixieError].} =
   ## Parse an SVG node tree. Defaults to the SVG's view box size.
+  ##
+  ## `reuse`: the caller hands over nodes it handed over before (a UI's
+  ## layout keeps what did not change): a child of the root parsed under the
+  ## same inherited properties brings its elements back without a parse,
+  ## and damageRects knows them for the same elements without comparing
+  ## them. Each child keeps what it made for that.
   try:
     if root.tag != "svg":
       failInvalid()
@@ -1120,7 +1142,33 @@ proc parseSvg*(
 
     var propertiesStack = @[rootProps]
     for node in root.children:
+      if not reuse:
+        node.parseSvgElement(result, propertiesStack, result.elements)
+        continue
+      if node.parsedEpoch != 0 and node.parsedUnder == rootProps:
+        for k in 0 ..< node.parsed.len:
+          result.elements.add node.parsed[k]
+          result.origins.add origin(node.parsedEpoch, k)
+        continue
+      let
+        first = result.elements.len
+        gradients = result.gradients.len
       node.parseSvgElement(result, propertiesStack, result.elements)
+      # Kept unless it defined gradients (the document's, not the node's)
+      # or made more elements than an origin can count.
+      if result.gradients.len == gradients and result.elements.len - first <= 0xfff:
+        inc parseEpoch
+        node.parsed = result.elements[first .. ^1]
+        node.parsedUnder = rootProps
+        node.parsedEpoch = parseEpoch
+        for k in 0 ..< node.parsed.len:
+          result.origins.add origin(parseEpoch, k)
+      else:
+        node.parsedEpoch = 0
+        while result.origins.len < result.elements.len:
+          result.origins.add 0
+    if result.origins.len != result.elements.len:
+      result.origins.setLen(0) # not reused: no origins at all
   except PixieError as e:
     raise e
   except:
@@ -1372,6 +1420,13 @@ proc drawSvgImage(target: Image, props: SvgProperties) {.raises: [PixieError].} 
 
 proc sameElement(a, b: (Path, SvgProperties)): bool =
   sameCommands(a[0], b[0]) and a[1] == b[1]
+
+proc sameElement(a: Svg, i: int, b: Svg, j: int): bool =
+  ## Element i of `a` and j of `b` draw the same: one element, handed over
+  ## twice (the same node's parse), or two equal ones.
+  if i < a.origins.len and j < b.origins.len and a.origins[i] != 0 and a.origins[i] == b.origins[j]:
+    return true
+  sameElement(a.elements[i], b.elements[j])
 
 proc transformedBounds(bounds: Rect, m: Mat3): Rect =
   ## The box around a box's four corners under `m`: it holds whatever the box
@@ -1627,7 +1682,7 @@ proc damageRects*(
   try:
     var i, j = 0
     while i < a.len or j < b.len:
-      if i < a.len and j < b.len and sameElement(a[i], b[j]):
+      if i < a.len and j < b.len and sameElement(previous, i, next, j):
         inc i
         inc j
         continue
@@ -1635,9 +1690,9 @@ proc damageRects*(
       # before a[i] reappears, or `removed` of `previous` before b[j] does.
       var added, removed = 0
       for k in 1 .. Resync:
-        if i < a.len and j + k < b.len and sameElement(a[i], b[j + k]):
+        if i < a.len and j + k < b.len and sameElement(previous, i, next, j + k):
           added = k
-        elif j < b.len and i + k < a.len and sameElement(a[i + k], b[j]):
+        elif j < b.len and i + k < a.len and sameElement(previous, i + k, next, j):
           removed = k
         if added + removed > 0:
           break
