@@ -11,6 +11,7 @@ type
   Svg* = ref object
     width*, height*: int
     elements: seq[(Path, SvgProperties)]
+    bounds: seq[Rect] # each element's paintBounds, once measured (w < 0: not yet)
     gradients: Table[string, SvgGradient]
     viewBoxWidth, viewBoxHeight: float32 # what percentage lengths refer to
 
@@ -263,8 +264,6 @@ const
 var
   pathCache {.threadvar.}: seq[(string, Path)]
   pathCacheChars {.threadvar.}: int
-  pathBounds {.threadvar.}: seq[(Path, Rect)]
-    ## Untransformed bounds of the cached paths (`localBounds`).
 
 proc parsePathCached(d: string): Path {.raises: [PixieError].} =
   ## `<path d>` parsed once and shared by every SVG that holds the same data.
@@ -290,12 +289,7 @@ proc parsePathCached(d: string): Path {.raises: [PixieError].} =
   pathCacheChars += d.len
   while pathCache.len > PathCacheEntries or pathCacheChars > PathCacheMaxChars:
     pathCacheChars -= pathCache[0][0].len
-    let gone = pathCache[0][1]
     pathCache.delete(0)
-    for i in 0 ..< pathBounds.len:
-      if pathBounds[i][0] == gone:
-        pathBounds.delete(i)
-        break
 
 proc parseSvgProperties(node: SvgNode, inherited: SvgProperties): SvgProperties =
   result = inherited
@@ -1376,14 +1370,91 @@ proc drawSvgImage(target: Image, props: SvgProperties) {.raises: [PixieError].} 
     target.view(x0, y0, x1 - x0, y1 - y0).draw(
       image, translate(vec2(-x0.float32, -y0.float32)) * transform)
 
+proc sameElement(a, b: (Path, SvgProperties)): bool =
+  sameCommands(a[0], b[0]) and a[1] == b[1]
+
+proc transformedBounds(bounds: Rect, m: Mat3): Rect =
+  ## The box around a box's four corners under `m`: it holds whatever the box
+  ## held, for any affine transform.
+  let corners = [
+    m * vec2(bounds.x, bounds.y), m * vec2(bounds.x + bounds.w, bounds.y),
+    m * vec2(bounds.x, bounds.y + bounds.h), m * vec2(bounds.x + bounds.w, bounds.y + bounds.h)
+  ]
+  var
+    minX = corners[0].x
+    minY = corners[0].y
+    maxX = minX
+    maxY = minY
+  for corner in corners:
+    minX = min(minX, corner.x)
+    minY = min(minY, corner.y)
+    maxX = max(maxX, corner.x)
+    maxY = max(maxY, corner.y)
+  rect(minX, minY, maxX - minX, maxY - minY)
+
+proc paintBounds(path: Path, props: SvgProperties): Rect {.raises: [PixieError].} =
+  ## The pixels an element can touch: the path's bounds, grown by its stroke
+  ## and a pixel of antialiasing on each side. Measured untransformed (once,
+  ## for a shared path) and mapped through the transform, which can only
+  ## grow the box; flattening at the untransformed scale can put a curve a
+  ## fraction of a unit inside its true extent, so that fraction, scaled,
+  ## goes into the margin too.
+  let
+    m = props.transform
+    scale = sqrt(max(m[0, 0] * m[0, 0] + m[0, 1] * m[0, 1],
+      m[1, 0] * m[1, 0] + m[1, 1] * m[1, 1]))
+  result = transformedBounds(localBounds(path), m)
+  var margin = 1.0'f32 + 0.5'f32 * scale
+  if props.stroke.a > 0 and props.strokeWidth > 0:
+    margin += props.strokeWidth * scale * max(1'f32, props.strokeMiterLimit) / 2
+  result.x -= margin
+  result.y -= margin
+  result.w += margin * 2
+  result.h += margin * 2
+
+proc paintBounds(svg: Svg, i: int): Rect {.raises: [PixieError].} =
+  ## Element `i`'s paintBounds, measured once per parsed SVG: a frame's
+  ## repaint boxes each look at every element, and damageRects at the
+  ## changed ones of the frame before as well.
+  if svg.bounds.len != svg.elements.len:
+    svg.bounds.setLen(svg.elements.len)
+    for b in svg.bounds.mitems:
+      b.w = -1
+  if svg.bounds[i].w < 0:
+    svg.bounds[i] = paintBounds(svg.elements[i][0], svg.elements[i][1])
+  svg.bounds[i]
+
+proc join(a, b: Rect): Rect =
+  let
+    x = min(a.x, b.x)
+    y = min(a.y, b.y)
+  rect(x, y, max(a.x + a.w, b.x + b.w) - x, max(a.y + a.h, b.y + b.h) - y)
+
+proc meets(a, b: Rect): bool =
+  ## The two share a pixel's edge at least: repainting them as one costs
+  ## nothing a second pass over the overlap would not.
+  a.x <= b.x + b.w and b.x <= a.x + a.w and a.y <= b.y + b.h and b.y <= a.y + a.h
+
 proc renderSvg(
-  svg: Svg, target: Image, firstBlendMode: BlendMode, offset = mat3()
+  svg: Svg, target: Image, firstBlendMode: BlendMode, offset = mat3(),
+  window = rect(0, 0, 0, 0)
 ) {.raises: [PixieError].} =
   ## `offset` maps the image the SVG was parsed for onto `target`: a
   ## translation when `target` is a window of it (renderInto with an origin).
+  ## `window`, when it has an area: that window, in the parsed image. An
+  ## element that cannot touch it is skipped, so repainting a small box
+  ## costs the elements over it, not every element's flattening and stroke.
   try:
     var blendMode = firstBlendMode
-    for (path, elementProps) in svg.elements:
+    for i, (path, elementProps) in svg.elements:
+      if window.w > 0 and elementProps.display and elementProps.opacity > 0:
+        var bounds = window
+        try:
+          bounds = svg.paintBounds(i)
+        except PixieError:
+          discard # unmeasured: drawn
+        if not bounds.meets(window):
+          continue
       var props = elementProps
       props.transform = offset * props.transform
       if not props.image.isNil:
@@ -1503,113 +1574,128 @@ proc renderInto*(
   ## renderInto for a window: `target` is the part of the image the SVG was
   ## parsed for that starts at (originX, originY) — a `view` of it, say — and
   ## what falls inside it is drawn exactly as a whole render would draw it
-  ## there. With `damage`, an animation repaints the box that changed instead
-  ## of the whole canvas.
+  ## there. With `damageRects`, an animation or a UI repaints the boxes that
+  ## changed instead of the whole canvas; an element that cannot touch the
+  ## window is skipped, so a small box costs the elements over it.
   svg.renderSvg(target, NormalBlend,
-    translate(vec2(-originX.float32, -originY.float32)))
+    translate(vec2(-originX.float32, -originY.float32)),
+    rect(originX.float32, originY.float32, target.width.float32, target.height.float32))
 
-proc sameElement(a, b: (Path, SvgProperties)): bool =
-  sameCommands(a[0], b[0]) and a[1] == b[1]
+proc addBox(boxes: var seq[Rect], box: Rect) =
+  ## `box` into `boxes`, joined with every box it meets (and those with the
+  ## boxes they then meet).
+  var box = box
+  var i = 0
+  while i < boxes.len:
+    if boxes[i].meets(box):
+      box = box.join(boxes[i])
+      boxes.delete(i)
+      i = 0
+    else:
+      inc i
+  boxes.add box
 
-proc localBounds(path: Path): Rect {.raises: [PixieError].} =
-  ## The untransformed bounds of a path, measured once for a shared one (the
-  ## path cache): measuring flattens every curve, which cost an animated
-  ## logo 14 ms a frame on an ESP32 when done under each new transform.
-  for (cached, bounds) in pathBounds:
-    if cached == path:
-      return bounds
-  result = path.computeBounds()
-  for (_, cached) in pathCache:
-    if cached == path:
-      pathBounds.add((path, result))
-      break
-
-proc transformedBounds(bounds: Rect, m: Mat3): Rect =
-  ## The box around a box's four corners under `m`: it holds whatever the box
-  ## held, for any affine transform.
-  let corners = [
-    m * vec2(bounds.x, bounds.y), m * vec2(bounds.x + bounds.w, bounds.y),
-    m * vec2(bounds.x, bounds.y + bounds.h), m * vec2(bounds.x + bounds.w, bounds.y + bounds.h)
-  ]
-  var
-    minX = corners[0].x
-    minY = corners[0].y
-    maxX = minX
-    maxY = minY
-  for corner in corners:
-    minX = min(minX, corner.x)
-    minY = min(minY, corner.y)
-    maxX = max(maxX, corner.x)
-    maxY = max(maxY, corner.y)
-  rect(minX, minY, maxX - minX, maxY - minY)
-
-proc paintBounds(path: Path, props: SvgProperties): Rect {.raises: [PixieError].} =
-  ## The pixels an element can touch: the path's bounds, grown by its stroke
-  ## and a pixel of antialiasing on each side. Measured untransformed (once,
-  ## for a shared path) and mapped through the transform, which can only
-  ## grow the box; flattening at the untransformed scale can put a curve a
-  ## fraction of a unit inside its true extent, so that fraction, scaled,
-  ## goes into the margin too.
-  let
-    m = props.transform
-    scale = sqrt(max(m[0, 0] * m[0, 0] + m[0, 1] * m[0, 1],
-      m[1, 0] * m[1, 0] + m[1, 1] * m[1, 1]))
-  result = transformedBounds(localBounds(path), m)
-  var margin = 1.0'f32 + 0.5'f32 * scale
-  if props.stroke.a > 0 and props.strokeWidth > 0:
-    margin += props.strokeWidth * scale * max(1'f32, props.strokeMiterLimit) / 2
-  result.x -= margin
-  result.y -= margin
-  result.w += margin * 2
-  result.h += margin * 2
+proc damageRects*(
+  previous, next: Svg, width, height: int, maxRects = 4
+): tuple[full: bool, rects: seq[tuple[x, y, w, h: int]]] {.raises: [].} =
+  ## Where rendering `next` changes a `width` x `height` target that holds
+  ## exactly what `previous` rendered there (both parsed for that size), as
+  ## at most `maxRects` boxes. The two lists of elements are matched in
+  ## order, identical with identical, the way a keyed list is reconciled:
+  ## an element in one with no match in the other (changed, added, removed)
+  ## is damage where it is. Everything outside the boxes is drawn by matched
+  ## elements in the same order, so repainting each box (renderInto with an
+  ## origin, into a view) leaves the target exactly as a whole render of
+  ## `next` would. Two changes far apart (a switch and the count it updates)
+  ## are two small boxes, not the canvas between them: boxes that meet are
+  ## joined, and past `maxRects` the two whose join adds the least area.
+  ##
+  ## The match looks `Resync` elements ahead for an element added or
+  ## removed; a longer run than that is damage too, if more of it. `full`
+  ## when a gradient differs or bounds cannot be measured. No boxes when
+  ## nothing differs.
+  if previous.isNil or next.isNil or width <= 0 or height <= 0 or
+      previous.gradients != next.gradients:
+    return (true, @[(0, 0, width, height)])
+  const Resync = 8
+  template a: untyped = previous.elements
+  template b: untyped = next.elements
+  var boxes: seq[Rect]
+  proc add(boxes: var seq[Rect], svg: Svg, i: int) {.raises: [PixieError].} =
+    if svg.elements[i][1].display and svg.elements[i][1].opacity > 0:
+      boxes.addBox(svg.paintBounds(i))
+  try:
+    var i, j = 0
+    while i < a.len or j < b.len:
+      if i < a.len and j < b.len and sameElement(a[i], b[j]):
+        inc i
+        inc j
+        continue
+      # The nearest place the two agree again: `added` elements of `next`
+      # before a[i] reappears, or `removed` of `previous` before b[j] does.
+      var added, removed = 0
+      for k in 1 .. Resync:
+        if i < a.len and j + k < b.len and sameElement(a[i], b[j + k]):
+          added = k
+        elif j < b.len and i + k < a.len and sameElement(a[i + k], b[j]):
+          removed = k
+        if added + removed > 0:
+          break
+      if added > 0:
+        for _ in 1 .. added:
+          boxes.add(next, j)
+          inc j
+      elif removed > 0:
+        for _ in 1 .. removed:
+          boxes.add(previous, i)
+          inc i
+      else:
+        if i < a.len:
+          boxes.add(previous, i)
+          inc i
+        if j < b.len:
+          boxes.add(next, j)
+          inc j
+  except:
+    return (true, @[(0, 0, width, height)])
+  while boxes.len > max(maxRects, 1):
+    var
+      best = float32.high
+      bi, bj: int
+    for i in 0 ..< boxes.len:
+      for j in i + 1 ..< boxes.len:
+        let
+          joined = boxes[i].join(boxes[j])
+          added = joined.w * joined.h - boxes[i].w * boxes[i].h - boxes[j].w * boxes[j].h
+        if added < best:
+          best = added
+          bi = i
+          bj = j
+    let joined = boxes[bi].join(boxes[bj])
+    boxes.delete(bj)
+    boxes.delete(bi)
+    boxes.addBox(joined)
+  for box in boxes:
+    let
+      x0 = clamp(floor(box.x).int, 0, width)
+      y0 = clamp(floor(box.y).int, 0, height)
+      x1 = clamp(ceil(box.x + box.w).int, 0, width)
+      y1 = clamp(ceil(box.y + box.h).int, 0, height)
+    if x1 > x0 and y1 > y0:
+      result.rects.add((x0, y0, x1 - x0, y1 - y0))
 
 proc damage*(
   previous, next: Svg, width, height: int
 ): tuple[full: bool, x, y, w, h: int] {.raises: [].} =
-  ## Where rendering `next` changes a `width` x `height` target that holds
-  ## exactly what `previous` rendered there (both parsed for that size): the
-  ## box around every element that differs, where it was and where it will
-  ## be. Everything outside the box is drawn by elements both have in common,
-  ## so repainting the box alone (renderInto with an origin, into a view)
-  ## leaves the target exactly as a whole render of `next` would.
-  ##
-  ## `full` when the two cannot be compared element by element: a different
-  ## number of elements, a gradient that differs, or bounds that cannot be
-  ## measured. An empty box (w = 0) when nothing differs.
-  if previous.isNil or next.isNil or width <= 0 or height <= 0 or
-      previous.elements.len != next.elements.len or
-      previous.gradients != next.gradients:
+  ## damageRects as one box: the box around every element that differs. An
+  ## empty box (w = 0) when nothing differs.
+  let found = damageRects(previous, next, width, height, 1)
+  if found.full:
     return (true, 0, 0, width, height)
-  var
-    minX = float32.high
-    minY = float32.high
-    maxX = float32.low
-    maxY = float32.low
-  try:
-    for i in 0 ..< next.elements.len:
-      if sameElement(previous.elements[i], next.elements[i]):
-        continue
-      for element in [previous.elements[i], next.elements[i]]:
-        let (path, props) = element
-        if not props.display or props.opacity <= 0:
-          continue
-        let bounds = paintBounds(path, props)
-        minX = min(minX, bounds.x)
-        minY = min(minY, bounds.y)
-        maxX = max(maxX, bounds.x + bounds.w)
-        maxY = max(maxY, bounds.y + bounds.h)
-  except:
-    return (true, 0, 0, width, height)
-  if maxX <= minX or maxY <= minY:
+  if found.rects.len == 0:
     return (false, 0, 0, 0, 0)
-  let
-    x0 = clamp(floor(minX).int, 0, width)
-    y0 = clamp(floor(minY).int, 0, height)
-    x1 = clamp(ceil(maxX).int, 0, width)
-    y1 = clamp(ceil(maxY).int, 0, height)
-  if x1 <= x0 or y1 <= y0:
-    return (false, 0, 0, 0, 0)
-  (false, x0, y0, x1 - x0, y1 - y0)
+  let r = found.rects[0]
+  (false, r.x, r.y, r.w, r.h)
 
 proc newImage*(svg: Svg): Image {.raises: [PixieError].} =
   ## Render SVG and return the image.

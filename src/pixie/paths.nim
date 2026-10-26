@@ -28,6 +28,8 @@ type
     shared: bool # never changes again (`share`)
     flatScale: float32 # the pixel scale `flat` was flattened at; 0 = none
     flat: seq[Polygon] # a shared path's closed shapes at `flatScale`
+    bounded: bool # `bounds` measured (a shared path's, `localBounds`)
+    bounds: Rect
 
   SomePath* = Path | string
 
@@ -2304,6 +2306,17 @@ proc share*(path: Path) {.raises: [].} =
   ## animated logo's raster on an ESP32. Changing a shared path afterwards
   ## leaves its fills drawing the old shape.
   path.shared = true
+
+proc localBounds*(path: Path): Rect {.raises: [PixieError].} =
+  ## The path's untransformed bounds, measured once for a shared one:
+  ## measuring flattens every curve, which cost an animated logo 14 ms a
+  ## frame on an ESP32 when done under each new transform.
+  if not path.shared:
+    return path.computeBounds()
+  if not path.bounded:
+    path.bounds = path.computeBounds()
+    path.bounded = true
+  path.bounds
 
 proc closedShapes(path: Path, pixelScale: float32): seq[Polygon] =
   ## commandsToShapes(true, pixelScale), from what a shared path kept when

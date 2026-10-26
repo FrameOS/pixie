@@ -73,11 +73,12 @@ animate(pfRgbx)
 animate(pfRgb565)
 
 block:
-  # Nothing changed: an empty box. A different element count, or a changed
-  # gradient: full.
+  # Nothing changed: an empty box. An element added is damage where it is
+  # (the rest still match, in order); a changed gradient: full.
   let a = parseSvg(frame(3), W, H)
   doAssert damage(a, parseSvg(frame(3), W, H), W, H) == (false, 0, 0, 0, 0)
-  doAssert damage(a, parseSvg(frame(3, "<rect width=\"4\" height=\"4\"/>"), W, H), W, H).full
+  let added = damage(a, parseSvg(frame(3, "<rect width=\"4\" height=\"4\"/>"), W, H), W, H)
+  doAssert not added.full and added.x == 0 and added.y == 0 and added.w <= 6 and added.h <= 6, $added
   let
     g1 = "<defs><linearGradient id=\"g\" gradientUnits=\"userSpaceOnUse\" x1=\"0\" y1=\"0\" x2=\"9\" y2=\"0\">" &
       "<stop offset=\"0\" stop-color=\"#000\"/><stop offset=\"1\" stop-color=\"#fff\"/></linearGradient></defs>" &
@@ -92,5 +93,94 @@ block:
     a = parseSvg(frame(5), W, H)
     b = parseSvg(frame(6), W, H)
   doAssert not damage(a, b, W, H).full
+
+
+block:
+  # damageRects: a switch in one corner and the count it updates in the
+  # other are two small boxes, repainted alone (the windowed render skips
+  # every element over neither), through three buffers in turn, and every
+  # frame still equals a whole render.
+  proc panel(i: int): string =
+    let on = i mod 2 == 1
+    var doc = &"""<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">""" &
+      &"""<rect x="0" y="0" width="{W}" height="{H}" fill="#0f172a"/>"""
+    for k in 0 ..< 6:
+      let
+        x = 8 + (k mod 3) * 50
+        y = 40 + (k div 3) * 38
+        fill = if k == 5 and on: "#fda4af" else: "#334155"
+      doc.add &"""<rect x="{x}" y="{y}" width="44" height="32" rx="6" fill="{fill}"/>"""
+      doc.add &"""<circle cx="{x + 34}" cy="{y + 10}" r="5" fill="#fff" stroke="#000" stroke-width="1"/>"""
+    doc.add &"""<rect x="120" y="6" width="{8 + (i mod 4) * 6}" height="10" fill="#94a3b8"/>"""
+    doc & "</svg>"
+  var
+    buffers = [fresh(panel(0), pfRgbx), fresh(panel(1), pfRgbx), fresh(panel(2), pfRgbx)]
+    held = [parseSvg(panel(0), W, H), parseSvg(panel(1), W, H), parseSvg(panel(2), W, H)]
+    twice = 0
+  for i in 3 ..< 24:
+    let
+      target = buffers[i mod 3]
+      next = parseSvg(panel(i), W, H)
+      found = damageRects(held[i mod 3], next, W, H)
+    doAssert not found.full
+    if found.rects.len == 2:
+      inc twice
+      let union = damage(held[i mod 3], next, W, H)
+      doAssert found.rects[0].w * found.rects[0].h + found.rects[1].w * found.rects[1].h < union.w * union.h div 2,
+        &"frame {i}: two boxes {found.rects} cover half of one {union}"
+    for r in found.rects:
+      next.renderInto(target.view(r.x, r.y, r.w, r.h), r.x, r.y)
+    held[i mod 3] = next
+    let expected = fresh(panel(i), pfRgbx)
+    for y in 0 ..< H:
+      for x in 0 ..< W:
+        let (got, want) = (target[x, y], expected[x, y])
+        doAssert abs(got.r.int - want.r.int) <= 1 and abs(got.g.int - want.g.int) <= 1 and
+          abs(got.b.int - want.b.int) <= 1, &"frame {i}: ({x}, {y}) is {got}, a whole render gives {want}"
+  doAssert twice > 0
+  # Capped: past maxRects the cheapest joins, and one box is damage's box.
+  let
+    a = parseSvg(panel(1), W, H)
+    b = parseSvg(panel(2), W, H)
+    one = damageRects(a, b, W, H, 1)
+    box = damage(a, b, W, H)
+  doAssert one.rects.len == 1 and one.rects[0] == (box.x, box.y, box.w, box.h)
+  doAssert damageRects(a, a, W, H).rects.len == 0
+
+block:
+  # A check mark that comes and goes in the middle of a list (a to-do row
+  # ticked): matched around, the rows that did not change are not damage,
+  # and every frame repainted this way equals a whole render.
+  proc rows(i: int): string =
+    result = &"""<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">""" &
+      &"""<rect x="0" y="0" width="{W}" height="{H}" fill="#f1f5f9"/>"""
+    for k in 0 ..< 5:
+      let y = 8 + k * 22
+      result.add &"""<rect x="8" y="{y}" width="140" height="18" rx="4" fill="#fff"/>"""
+      if (i + k) mod 4 == 0:
+        result.add &"""<path d="M14 {y + 9}l4 4 8-8" fill="none" stroke="#10b981" stroke-width="2"/>"""
+      result.add &"""<rect x="32" y="{y + 6}" width="{60 + k * 10}" height="6" fill="#334155"/>"""
+    result.add "</svg>"
+  var
+    buffer = fresh(rows(0), pfRgbx)
+    held = parseSvg(rows(0), W, H)
+  for i in 1 ..< 12:
+    let
+      next = parseSvg(rows(i), W, H)
+      found = damageRects(held, next, W, H)
+    doAssert not found.full, &"frame {i}"
+    var area = 0
+    for r in found.rects:
+      next.renderInto(buffer.view(r.x, r.y, r.w, r.h), r.x, r.y)
+      area += r.w * r.h
+    # Two rows' marks at most (one gone, one come), not the list between.
+    doAssert area < W * H div 8, &"frame {i}: {area} pixels for {found.rects}"
+    held = next
+    let expected = fresh(rows(i), pfRgbx)
+    for y in 0 ..< H:
+      for x in 0 ..< W:
+        let (got, want) = (buffer[x, y], expected[x, y])
+        doAssert abs(got.r.int - want.r.int) <= 1 and abs(got.g.int - want.g.int) <= 1 and
+          abs(got.b.int - want.b.int) <= 1, &"frame {i}: ({x}, {y}) is {got}, a whole render gives {want}"
 
 echo "svg damage ok"
