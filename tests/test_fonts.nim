@@ -1061,7 +1061,7 @@ block:
     targetGlyphId = -1
     glyphOffset = -1
 
-  for rune, glyphId in original.cmap.runeToGlyphId.pairs:
+  for rune, glyphId in original.cmap.mappings:
     let glyphIndex = glyphId.int
     if glyphIndex == 0 or glyphIndex + 1 >= original.glyf.offsets.len:
       continue

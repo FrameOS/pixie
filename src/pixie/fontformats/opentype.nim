@@ -1,4 +1,4 @@
-import chroma, flatty/binny, flatty/encode, math, ../common, ../paths, sets,
+import algorithm, chroma, flatty/binny, flatty/encode, math, ../common, ../paths,
     strutils, tables, unicode, vmath
 
 ## See https://docs.microsoft.com/en-us/typography/opentype/spec/
@@ -15,8 +15,11 @@ type
     version*: uint16
     numTables*: uint16
     encodingRecords*: seq[EncodingRecord]
-    runeToGlyphId*: Table[Rune, uint16]
-    glyphIdToRune*: Table[uint16, Rune]
+    # The code points the font maps, ascending, and the glyph of each: a
+    # binary search, where two hash tables (one each way, the reverse one
+    # never read) were most of the table's memory (`glyphIdOf`).
+    runes: seq[int32]
+    glyphIds: seq[uint16]
 
   HeadTable* = ref object
     majorVersion*: uint16
@@ -218,7 +221,6 @@ type
     glyphArray: seq[uint16]
     rangeCount: uint16
     rangeRecords: seq[RangeRecord]
-    coveredGlyphs: HashSet[uint16]
 
   ValueRecord = object
     xPlacement: int16
@@ -275,10 +277,14 @@ type
     classDef1: ClassDef
     classDef2: ClassDef
     coverage: Coverage
-    glyphIdToClass1: Table[uint16, uint16]
-    glyphIdToClass2: Table[uint16, uint16]
-    classPairAdjustments: Table[(uint16, uint16), int16]
-    glyphPairAdjustments: Table[(uint16, uint16), int16]
+    # The horizontal adjustments, by pair: (first glyph, second glyph) for
+    # format 1, (first class, second class) for format 2, as
+    # `first shl 16 or second`, ascending, and each one's xAdvance. Sorted
+    # arrays and the font's own coverage and class definitions take a
+    # tenth of the hash tables they replace (Ubuntu-Regular's eight pair
+    # tables: ~350 KB on a 32-bit microcontroller).
+    pairKeys: seq[uint32]
+    pairValues: seq[int16]
 
   Lookup = object
     lookupType: uint16
@@ -424,6 +430,9 @@ type
 
   OpenType* = ref object
     buf*: string
+      ## The font's bytes from `bufBase` on: only the glyf table for a font
+      ## whose outlines are its one later reader (`parseOpenType`).
+    bufBase: int
     version*: uint32
     numTables*: uint16
     searchRange*: uint16
@@ -578,8 +587,8 @@ proc parseCmapTable(buf: string, offset: int): CmapTable =
               glyphId = (c.int + idDelta) and 0xFFFF
 
             if c != 65535:
-              result.runeToGlyphId[Rune(c)] = glyphId.uint16
-              result.glyphIdToRune[glyphId.uint16] = Rune(c)
+              result.runes.add c.int32
+              result.glyphIds.add glyphId.uint16
 
       elif format == 12:
         # https://learn.microsoft.com/en-us/typography/opentype/spec/cmap#format-12-segmented-coverage
@@ -613,8 +622,8 @@ proc parseCmapTable(buf: string, offset: int): CmapTable =
               # TODO: currently only 16 bit glyph ids are supported
               raise newException(PixieError, "Found glyph outside of uint16 range: " & $glyphId)
 
-            result.runeToGlyphId[Rune(c)] = uint16(glyphId)
-            result.glyphIdToRune[uint16(glyphId)] = Rune(c)
+            result.runes.add c.int32
+            result.glyphIds.add uint16(glyphId)
 
           i += 12
 
@@ -624,6 +633,24 @@ proc parseCmapTable(buf: string, offset: int): CmapTable =
     else:
       # TODO implement other cmap platformIDs
       discard
+  # Sorted by code point; for one mapped twice (two subtables) the last
+  # mapping read wins, as it did in a table.
+  let mapped = result.runes
+  var order = newSeq[int](mapped.len)
+  for k in 0 ..< order.len: order[k] = k
+  order.sort(proc(a, b: int): int =
+    result = cmp(mapped[a], mapped[b])
+    if result == 0: result = cmp(a, b))
+  var
+    runes = newSeqOfCap[int32](order.len)
+    glyphIds = newSeqOfCap[uint16](order.len)
+  for k, at in order:
+    if k + 1 < order.len and mapped[order[k + 1]] == mapped[at]:
+      continue
+    runes.add mapped[at]
+    glyphIds.add result.glyphIds[at]
+  result.runes = runes
+  result.glyphIds = glyphIds
 
 proc parseHeadTable(buf: string, offset: int): HeadTable =
   buf.eofCheck(offset + 54)
@@ -853,10 +880,11 @@ proc parseLocaTable(
 proc parseGlyfTable(
   buf: string, offset: int, loca: LocaTable
 ): GlyfTable =
+  ## Takes over loca's offsets, made absolute, rather than keeping a copy.
   result = GlyfTable()
-  result.offsets.setLen(loca.offsets.len)
-  for glyphId in 0 ..< loca.offsets.len:
-    result.offsets[glyphId] = offset.uint32 + loca.offsets[glyphId]
+  result.offsets = move(loca.offsets)
+  for glyphId in 0 ..< result.offsets.len:
+    result.offsets[glyphId] += offset.uint32
 
 proc parseKernTable(buf: string, offset: int): KernTable =
   var i = offset
@@ -1850,9 +1878,6 @@ proc parseCoverage(buf: string, offset: int): Coverage =
 
       result.glyphArray = buf.readUint16Seq(i, result.glyphCount.int)
 
-      for ci, glyphId in result.glyphArray:
-        result.coveredGlyphs.incl(glyphId)
-
     of 2:
       result.rangeCount = buf.readUint16(i + 0).swap()
       i += 2
@@ -1861,12 +1886,6 @@ proc parseCoverage(buf: string, offset: int): Coverage =
       for j in 0 ..< result.rangeCount.int:
         result.rangeRecords[j] = parseRangeRecord(buf, i)
         i += 6
-
-      for rangeRecord in result.rangeRecords:
-        var ci = rangeRecord.startCoverageIndex.int
-        for glyphId in rangeRecord.startGlyphID .. rangeRecord.endGlyphID:
-          result.coveredGlyphs.incl(glyphId)
-          inc ci
 
     else:
       failUnsupported("coverage format")
@@ -2010,6 +2029,85 @@ proc parseClassDef(buf: string, offset: int): ClassDef =
     else:
       failUnsupported("class format")
 
+proc pairKey(first, second: uint16): uint32 {.inline.} =
+  (first.uint32 shl 16) or second.uint32
+
+proc keepPairs(pairPos: PairPos, pairs: seq[(uint32, int16)]) =
+  ## The pairs, sorted by key, as pairPos.pairKeys and pairValues; for a pair
+  ## given twice the last one wins, as it did in a table.
+  var order = newSeq[uint64](pairs.len)
+  for k in 0 ..< pairs.len:
+    order[k] = (pairs[k][0].uint64 shl 32) or k.uint64
+  order.sort()
+  pairPos.pairKeys = newSeqOfCap[uint32](order.len)
+  pairPos.pairValues = newSeqOfCap[int16](order.len)
+  for k in 0 ..< order.len:
+    let key = (order[k] shr 32).uint32
+    if k + 1 < order.len and (order[k + 1] shr 32).uint32 == key:
+      continue
+    pairPos.pairKeys.add key
+    pairPos.pairValues.add pairs[(order[k] and 0xffffffff'u64).int][1]
+
+proc adjustment(pairPos: PairPos, key: uint32, value: var int16): bool =
+  var
+    lo = 0
+    hi = pairPos.pairKeys.high
+  while lo <= hi:
+    let mid = (lo + hi) div 2
+    let at = pairPos.pairKeys[mid]
+    if at < key: lo = mid + 1
+    elif at > key: hi = mid - 1
+    else:
+      value = pairPos.pairValues[mid]
+      return true
+
+proc covers(coverage: Coverage, glyphId: uint16): bool =
+  ## Whether `glyphId` is in the coverage table: its glyphs (format 1) or
+  ## ranges (format 2) are sorted, so a binary search.
+  case coverage.coverageFormat:
+    of 1:
+      var
+        lo = 0
+        hi = coverage.glyphArray.high
+      while lo <= hi:
+        let mid = (lo + hi) div 2
+        let at = coverage.glyphArray[mid]
+        if at < glyphId: lo = mid + 1
+        elif at > glyphId: hi = mid - 1
+        else: return true
+    of 2:
+      var
+        lo = 0
+        hi = coverage.rangeRecords.high
+      while lo <= hi:
+        let mid = (lo + hi) div 2
+        let r = coverage.rangeRecords[mid]
+        if r.endGlyphID < glyphId: lo = mid + 1
+        elif r.startGlyphID > glyphId: hi = mid - 1
+        else: return true
+    else:
+      discard
+
+proc classOf(classDef: ClassDef, glyphId: uint16): uint16 =
+  ## The class `glyphId` is in, 0 for none.
+  case classDef.classFormat:
+    of 1:
+      if glyphId >= classDef.startGlyphID and
+          (glyphId - classDef.startGlyphID).int < classDef.classValueArray.len:
+        result = classDef.classValueArray[glyphId - classDef.startGlyphID]
+    of 2:
+      var
+        lo = 0
+        hi = classDef.classRangeRecords.high
+      while lo <= hi:
+        let mid = (lo + hi) div 2
+        let r = classDef.classRangeRecords[mid]
+        if r.endGlyphID < glyphId: lo = mid + 1
+        elif r.startGlyphID > glyphId: hi = mid - 1
+        else: return r.class
+    else:
+      discard
+
 proc parsePairPos(buf: string, offset: int): PairPos =
   var i = offset
 
@@ -2045,6 +2143,7 @@ proc parsePairPos(buf: string, offset: int): PairPos =
 
       result.coverage = parseCoverage(buf, offset + result.coverageOffset.int)
 
+      var pairs: seq[(uint32, int16)]
       if (result.valueFormat1 and 0b100) != 0:
         case result.coverage.coverageFormat:
           of 1:
@@ -2055,9 +2154,8 @@ proc parsePairPos(buf: string, offset: int): PairPos =
                 failUnsupported("pair set length")
               for pairValueRecord in result.pairSets[ci].pairValueRecords:
                 if pairValueRecord.valueRecord1.xAdvance != 0:
-                  let glyphPair = (glyphId, pairValueRecord.secondGlyph)
-                  result.glyphPairAdjustments[glyphPair] =
-                    pairValueRecord.valueRecord1.xAdvance
+                  pairs.add (pairKey(glyphId, pairValueRecord.secondGlyph),
+                    pairValueRecord.valueRecord1.xAdvance)
           of 2:
             for rangeRecord in result.coverage.rangeRecords:
               var ci = rangeRecord.startCoverageIndex.int
@@ -2066,14 +2164,14 @@ proc parsePairPos(buf: string, offset: int): PairPos =
                   failUnsupported("pair set length")
                 for pairValueRecord in result.pairSets[ci].pairValueRecords:
                   if pairValueRecord.valueRecord1.xAdvance != 0:
-                    let glyphPair = (glyphId, pairValueRecord.secondGlyph)
-                    result.glyphPairAdjustments[glyphPair] =
-                      pairValueRecord.valueRecord1.xAdvance
+                    pairs.add (pairKey(glyphId, pairValueRecord.secondGlyph),
+                      pairValueRecord.valueRecord1.xAdvance)
                 inc ci
           else:
             discard
-      # The pair sets were only read to build glyphPairAdjustments; the
-      # lookup never touches them again.
+      result.keepPairs(pairs)
+      # The pair sets were only read to build the pairs; the lookup never
+      # touches them again.
       result.pairSets = @[]
       result.pairSetOffsets = @[]
     of 2: # Class pairs
@@ -2105,54 +2203,29 @@ proc parsePairPos(buf: string, offset: int): PairPos =
 
       result.coverage = parseCoverage(buf, offset + result.coverageOffset.int)
 
-      proc classDefFormat1(
-        classDef: ClassDef, table: var Table[uint16, uint16]
-      ) =
-        for i in 0.uint16 ..< classDef.glyphCount:
-          if classDef.classValueArray[i] != 0:
-            table[classDef.startGlyphID + i] = classDef.classValueArray[i]
-
-      proc classDefFormat2(
-        classDef: ClassDef, table: var Table[uint16, uint16]
-      ) =
+      for classDef in [result.classDef1, result.classDef2]:
         for record in classDef.classRangeRecords:
           if record.startGlyphID > record.endGlyphID:
             failUnsupported("glyph out of bounds")
-          if record.class != 0:
-            for glyphId in record.startGlyphID .. record.endGlyphID:
-              table[glyphId] = record.class
+        if classDef.classFormat == 1 and
+            classDef.classValueArray.len < classDef.glyphCount.int:
+          failUnsupported("class value array")
 
-      case result.classDef1.classFormat:
-        of 1:
-          classDefFormat1(result.classDef1, result.glyphIdToClass1)
-        of 2:
-          classDefFormat2(result.classDef1, result.glyphIdToClass1)
-        else:
-          discard
-
-      case result.classDef2.classFormat:
-        of 1:
-          classDefFormat1(result.classDef2, result.glyphIdToClass2)
-        of 2:
-          classDefFormat2(result.classDef2, result.glyphIdToClass2)
-        else:
-          discard
-
+      var pairs: seq[(uint32, int16)]
       if (result.valueFormat1 and 0b100) != 0:
         for class1, class1Record in result.class1Records:
           for class2, class2Record in class1Record.class2Records:
             if class2Record.valueRecord1.xAdvance != 0:
-              result.classPairAdjustments[(class1.uint16, class2.uint16)] =
-                class2Record.valueRecord1.xAdvance
+              pairs.add (pairKey(class1.uint16, class2.uint16),
+                class2Record.valueRecord1.xAdvance)
+      result.keepPairs(pairs)
       # class1Count x class2Count records of two ValueRecords each is the
       # bulk of a parsed typeface (Ubuntu-Regular: 1.6 MB of its 2 MB), and
-      # everything the kerning lookup needs from them now lives in the three
-      # tables above. Drop the raw matrix and the class definitions it was
-      # read with; on a 16 MB microcontroller a typeface cached for the life
-      # of the process must not cost a fifth of the free heap.
+      # what the kerning lookup needs from them is now the pairs above and
+      # the class definitions (classOf). Drop the raw matrix; on a 16 MB
+      # microcontroller a typeface cached for the life of the process must
+      # not cost a fifth of the free heap.
       result.class1Records = @[]
-      result.classDef1 = ClassDef()
-      result.classDef2 = ClassDef()
     else:
       failUnsupported("pair pos format")
 
@@ -2180,8 +2253,7 @@ proc parseLookup(
   for subTableOffset in result.subTableOffsets:
     if result.lookupType == 2:
       let pairPos = parsePairPos(buf, offset + subTableOffset.int)
-      if pairPos.glyphPairAdjustments.len > 0 or
-        pairPos.classPairAdjustments.len > 0:
+      if pairPos.pairKeys.len > 0:
         pairPosTables.add(pairPos)
 
 proc parseLookupList(buf: string, offset: int): LookupList =
@@ -2469,11 +2541,30 @@ proc parseSbixTable(buf: string, offset, numGlyphs: int): SbixTable =
       strike.glyphDataOffsets[j] = buf.readUint32(strikeOffset + 4 + j * 4).swap()
     result.strikes.add(strike)
 
+proc glyphIdOf(cmap: CmapTable, rune: Rune): int =
+  ## The glyph the font maps `rune` to, -1 for none.
+  let r = rune.int32
+  var
+    lo = 0
+    hi = cmap.runes.high
+  while lo <= hi:
+    let mid = (lo + hi) div 2
+    let at = cmap.runes[mid]
+    if at < r: lo = mid + 1
+    elif at > r: hi = mid - 1
+    else: return cmap.glyphIds[mid].int
+  -1
+
+iterator mappings*(cmap: CmapTable): (Rune, uint16) =
+  ## Every code point the font maps and its glyph, ascending.
+  for i in 0 ..< cmap.runes.len:
+    yield (Rune(cmap.runes[i]), cmap.glyphIds[i])
+
 proc getGlyphId(opentype: OpenType, rune: Rune): uint16 =
-  result = opentype.cmap.runeToGlyphId.getOrDefault(rune, 0)
+  max(opentype.cmap.glyphIdOf(rune), 0).uint16
 
 proc hasGlyph*(opentype: OpenType, rune: Rune): bool =
-  rune in opentype.cmap.runeToGlyphId
+  opentype.cmap.glyphIdOf(rune) >= 0
 
 proc parseGlyfGlyph(
   opentype: OpenType, glyphId: uint16, recursionDepth = 0
@@ -2730,7 +2821,7 @@ proc parseGlyfGlyph(
     # Empty glyph
     return Path()
 
-  var i = glyphOffset.int
+  var i = glyphOffset.int - opentype.bufBase
   opentype.buf.eofCheck(i + 10)
 
   let
@@ -2843,7 +2934,7 @@ proc getBitmapGlyph*(
   ## Looks up an embedded color bitmap (PNG) glyph for the rune, picking the
   ## best strike for the target pixel size. Returns false if the rune has no
   ## bitmap glyph.
-  if rune notin opentype.cmap.runeToGlyphId:
+  if not opentype.hasGlyph(rune):
     return false
   let glyphId = opentype.getGlyphId(rune)
 
@@ -2920,7 +3011,7 @@ proc getBitmapGlyph*(
 
 proc hasColorGlyph*(opentype: OpenType, rune: Rune): bool {.raises: [].} =
   ## Returns true if the rune has a color (emoji) glyph.
-  if rune notin opentype.cmap.runeToGlyphId:
+  if not opentype.hasGlyph(rune):
     return false
   let glyphId = opentype.getGlyphId(rune)
 
@@ -2963,32 +3054,34 @@ proc getAdvance*(opentype: OpenType, rune: Rune): float32 {.raises: [].} =
 proc getKerningAdjustment*(
   opentype: OpenType, left, right: Rune
 ): float32 {.raises: [].} =
-  if left notin opentype.cmap.runeToGlyphId or
-    right notin opentype.cmap.runeToGlyphId:
+  let
+    leftGlyph = opentype.cmap.glyphIdOf(left)
+    rightGlyph = opentype.cmap.glyphIdOf(right)
+  if leftGlyph < 0 or rightGlyph < 0:
     return
 
   let
-    leftGlyphId = opentype.cmap.runeToGlyphId.getOrDefault(left, 0)
-    rightGlyphId = opentype.cmap.runeToGlyphId.getOrDefault(right, 0)
+    leftGlyphId = leftGlyph.uint16
+    rightGlyphId = rightGlyph.uint16
     glyphPair = (leftGlyphId, rightGlyphId)
 
   if opentype.gpos != nil:
     for pairPos in opentype.gpos.lookupList.pairPosTables:
-      if leftGlyphId notin pairPos.coverage.coveredGlyphs:
+      if not pairPos.coverage.covers(leftGlyphId):
         continue
 
+      var value: int16
       case pairPos.posFormat:
         of 1:
-          if glyphPair in pairPos.glyphPairAdjustments:
-            result = pairPos.glyphPairAdjustments.getOrDefault(glyphPair, 0).float32
+          if pairPos.adjustment(pairKey(leftGlyphId, rightGlyphId), value):
+            result = value.float32
             break
         of 2:
           let
-            leftClass = pairPos.glyphIdToClass1.getOrDefault(leftGlyphId, 0)
-            rightClass = pairPos.glyphIdToClass2.getOrDefault(rightGlyphId, 0)
-            classPair = (leftClass, rightClass)
-          if classPair in pairPos.classPairAdjustments:
-            result = pairPos.classPairAdjustments.getOrDefault(classPair, 0).float32
+            leftClass = pairPos.classDef1.classOf(leftGlyphId)
+            rightClass = pairPos.classDef2.classOf(rightGlyphId)
+          if pairPos.adjustment(pairKey(leftClass, rightClass), value):
+            result = value.float32
             break
         else:
           discard
@@ -3010,9 +3103,29 @@ proc fullName*(opentype: OpenType): string =
     if record.nameID == 6 and record.languageID == 1033:
       return record.text
 
+proc keepBuf(opentype: OpenType, buf: string) =
+  ## A glyf font reads only its glyf table after the parse, so that is all
+  ## of the file it keeps; every other font keeps the whole file.
+  if opentype.glyf == nil or opentype.cff != nil or opentype.cblc != nil or
+      opentype.sbix != nil:
+    opentype.buf = buf
+    return
+  let
+    record = opentype.tableRecords["glyf"]
+    first = record.offset.int
+    last = min(first + record.length.int, buf.len)
+  if last < first:
+    opentype.buf = buf
+    return
+  for offset in opentype.glyf.offsets:
+    if offset.int < first or offset.int > last:
+      opentype.buf = buf # A glyph outside its table: keep what it reads.
+      return
+  opentype.buf = buf[first ..< last]
+  opentype.bufBase = first
+
 proc parseOpenType*(buf: string, startLoc = 0): OpenType {.raises: [PixieError].} =
   result = OpenType()
-  result.buf = buf
 
   var i: int = startLoc
 
@@ -3084,6 +3197,7 @@ proc parseOpenType*(buf: string, startLoc = 0): OpenType {.raises: [PixieError].
       result.gpos = parseGposTable(buf, result.tableRecords["GPOS"].offset.int)
 
     result.post = parsePostTable(buf, result.tableRecords["post"].offset.int)
+    result.keepBuf(buf)
   except KeyError as e:
     raise newException(PixieError, "Missing required font table: " & e.msg)
 
