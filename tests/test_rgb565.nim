@@ -327,4 +327,22 @@ block: # a 565 image as a draw SOURCE onto RGBX
   dst.draw(src, translate(vec2(2, 2)) * scale(vec2(1.5, 1.5)))
   doAssert dst[8, 8] == src[0, 0]
 
+block: # a 565 picture drawn at its own size onto 565 is its rows, clipped at the edges
+  let src = newImage565(12, 10)
+  for y in 0 ..< 10:
+    for x in 0 ..< 12:
+      src[x, y] = rgba((x * 20).uint8, (y * 25).uint8, 90, 255)
+  for (dx, dy) in [(3, 2), (-4, -3), (10, 6)]:
+    for mode in [NormalBlend, OverwriteBlend]:
+      let dst = newImage565(16, 12)
+      dst.ditherStores = true
+      dst.fill(rgba(255, 255, 255, 255))
+      dst.draw(src, translate(vec2(dx.float32, dy.float32)), mode)
+      for y in 0 ..< 12:
+        for x in 0 ..< 16:
+          let want =
+            if x - dx in 0 ..< 12 and y - dy in 0 ..< 10: src[x - dx, y - dy]
+            else: rgba(255, 255, 255, 255).rgbx
+          doAssert dst[x, y] == want, &"{mode} at ({dx}, {dy}): ({x}, {y}) is {dst[x, y]}, not {want}"
+
 echo "test_rgb565 ok"
