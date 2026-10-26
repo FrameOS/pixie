@@ -1499,6 +1499,51 @@ proc meets(a, b: Rect): bool =
   ## nothing a second pass over the overlap would not.
   a.x <= b.x + b.w and b.x <= a.x + a.w and a.y <= b.y + b.h and b.y <= a.y + a.h
 
+proc hidesWindow(element: SvgElement, window: Rect): bool =
+  ## Whether the element paints every pixel of `window` opaquely, so nothing
+  ## drawn before it shows there: a solid square-cornered rect, or a 565
+  ## picture (which has no alpha), at full opacity, axis-aligned, around the
+  ## whole window. False whenever it cannot be sure.
+  let props = element.props
+  if not props.display or props.opacity < 1 or props.fillOpacity < 1:
+    return false
+  let m = props.transform
+  if m[0, 1] != 0 or m[1, 0] != 0:
+    return false
+  var
+    lo, hi: Vec2
+    edge = 0'f32
+  if not props.image.isNil:
+    if props.image.format != pfRgb565:
+      return false
+    let box = props.imageBox
+    lo = vec2(box.x, box.y)
+    hi = vec2(box.x + box.w, box.y + box.h)
+    if props.imageClip:
+      lo = vec2(max(lo.x, props.rectX), max(lo.y, props.rectY))
+      hi = vec2(min(hi.x, props.rectX + props.rectW), min(hi.y, props.rectY + props.rectH))
+    edge = 1 # a scaled picture blends its edge pixels with nothing
+  elif props.isRect:
+    lo = vec2(props.rectX, props.rectY)
+    hi = vec2(props.rectX + props.rectW, props.rectY + props.rectH)
+  else:
+    return false
+  let
+    a = m * lo
+    b = m * hi
+  if min(a.x, b.x) + edge > window.x or min(a.y, b.y) + edge > window.y or
+      max(a.x, b.x) - edge < window.x + window.w or
+      max(a.y, b.y) - edge < window.y + window.h:
+    return false
+  if not props.image.isNil:
+    return true
+  if props.fill.len == 0 or props.fill == "none" or props.fill.startsWith("url("):
+    return false
+  try:
+    parseHtmlColor(props.fill).a >= 1
+  except:
+    false
+
 proc renderSvg(
   svg: Svg, target: Image, firstBlendMode: BlendMode, offset = mat3(),
   window = rect(0, 0, 0, 0)
@@ -1506,11 +1551,21 @@ proc renderSvg(
   ## `offset` maps the image the SVG was parsed for onto `target`: a
   ## translation when `target` is a window of it (renderInto with an origin).
   ## `window`, when it has an area: that window, in the parsed image. An
-  ## element that cannot touch it is skipped, so repainting a small box
-  ## costs the elements over it, not every element's flattening and stroke.
+  ## element that cannot touch it is skipped, and so is everything under the
+  ## topmost one that hides it (a canvas picture over its page), so
+  ## repainting a small box costs the elements that show in it, not every
+  ## element's flattening and stroke.
   try:
-    var blendMode = firstBlendMode
-    for element in svg.elements:
+    var
+      blendMode = firstBlendMode
+      first = 0
+    if window.w > 0:
+      for i in countdown(svg.elements.high, 0):
+        if svg.elements[i].hidesWindow(window):
+          first = i
+          break
+    for i in first ..< svg.elements.len:
+      let element = svg.elements[i]
       let path = element.path
       template elementProps: untyped = element.props
       if window.w > 0 and elementProps.display and elementProps.opacity > 0:

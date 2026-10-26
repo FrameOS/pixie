@@ -270,4 +270,49 @@ block:
     for x in 0 ..< W:
       doAssert lineTarget[x, y] == lineExpected[x, y], &"line: ({x}, {y}) outside {lineBox}"
 
+block:
+  # A window a 565 picture hides (a canvas over its page) draws the picture
+  # alone: what is under it is not drawn at all, here a fill that would
+  # raise if it were. A window reaching past the picture draws everything
+  # there, and both equal a whole render.
+  let picture = newImage565(80, 60)
+  for y in 0 ..< 60:
+    for x in 0 ..< 80:
+      picture[x, y] = rgba((x * 3).uint8, (y * 4).uint8, 200, 255)
+  proc page(under: string): Svg =
+    let root = parseSvgNodes(&"""<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">""" &
+      &"""<rect x="0" y="0" width="{W}" height="{H}" fill="#0b1020"/>""" &
+      """<rect x="10" y="10" width="100" height="80" rx="8" fill="#f1f5f9"/>""" & under &
+      """<image x="20" y="20" width="80" height="60" preserveAspectRatio="none"/>""" &
+      """<circle cx="90" cy="70" r="6" fill="#ef4444"/></svg>""")
+    for child in root.children:
+      if child.tag == "image":
+        child.image = picture
+    parseSvg(root, W, H)
+  let
+    raising = page("""<rect x="30" y="30" width="40" height="30" fill="url(#nowhere)"/>""")
+    plain = page("")
+    expected = newImage(W, H)
+  plain.renderInto(expected)
+  var hidden = newImage(W, H)
+  plain.renderInto(hidden)
+  hidden.fill(rgba(0, 0, 0, 0))
+  # Inside the picture, the red dot over it included: only the picture and
+  # the dot draw.
+  raising.renderInto(hidden.view(25, 25, 70, 50), 25, 25)
+  for y in 25 ..< 75:
+    for x in 25 ..< 95:
+      doAssert hidden[x, y] == expected[x, y], &"({x}, {y}) is {hidden[x, y]}, a whole render gives {expected[x, y]}"
+  # Past the picture's edge the page shows, so it is drawn (and raises).
+  var raised = false
+  try:
+    raising.renderInto(hidden.view(15, 25, 30, 20), 15, 25)
+  except PixieError:
+    raised = true
+  doAssert raised
+  plain.renderInto(hidden.view(15, 15, 90, 70), 15, 15)
+  for y in 15 ..< 85:
+    for x in 15 ..< 105:
+      doAssert hidden[x, y] == expected[x, y], &"({x}, {y}) is {hidden[x, y]}, a whole render gives {expected[x, y]}"
+
 echo "svg damage ok"
