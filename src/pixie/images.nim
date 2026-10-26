@@ -717,6 +717,18 @@ proc blendRect(a, b: Image, pos: Ivec2, blendMode: BlendMode) =
     xEnd = min(b.width, a.width - px)
     yEnd = min(b.height, a.height - py)
 
+  if b.format == pfRgb565 and blendMode in {NormalBlend, OverwriteBlend}:
+    # A 565 picture is opaque, so drawn normally it overwrites: onto 565,
+    # its rows copied as they are (a canvas a frame shows at its own size);
+    # onto RGBX, each pixel expanded, with nothing to blend.
+    for y in yStart ..< yEnd:
+      if a.format == pfRgb565:
+        copyMem(a.rowAddr(xStart + px, y + py), b.rowAddr(xStart, y),
+          (xEnd - xStart) * 2)
+      else:
+        blendLineAny(a, xStart + px, y + py, b, xStart, y, xEnd - xStart, OverwriteBlend)
+    return
+
   if a.format != pfRgbx or b.format != pfRgbx:
     # Any 565 on either side: the raw-pointer kernels below assume 4-byte
     # pixels, so go through the accessors. The mask clears stay the same.

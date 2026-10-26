@@ -85,6 +85,29 @@ proc parameterCount(kind: PathCommandKind): int =
   of SCubic, RSCubic, Quad, RQuad: 4
   of Arc, RArc: 7
 
+proc hasJoins*(path: Path): bool {.raises: [].} =
+  ## Whether a stroke of the path joins two segments anywhere: a subpath of
+  ## more than one straight segment, a closed one, or a curve (a cusp turns
+  ## as sharply as any corner). A single straight line has no join, whatever
+  ## its stroke-linejoin says.
+  var
+    i = 0
+    segments = 0
+  while i < path.commands.len:
+    let kind = path.commands[i].PathCommandKind
+    inc i
+    case kind:
+    of Move, RMove:
+      segments = 0
+    of Line, HLine, VLine, RLine, RHLine, RVLine:
+      inc segments
+      if segments > 1:
+        return true
+    else:
+      return true
+    i += kind.parameterCount
+  false
+
 proc `$`*(path: Path): string {.raises: [].} =
   ## Turn path int into a string.
   var i: int
