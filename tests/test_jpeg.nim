@@ -212,7 +212,7 @@ block:
     for rows in [1, 2, 3, 7]:
       setJpegStripMcuRows(rows)
       doAssert decodeJpeg(data).pixelsEqual(whole), path & " in strips of " & $rows
-    for fit in [fitStretch, fitCover, fitContain, fitCenter]:
+    for fit in ScaledDecodeFit:
       for (w, h) in [
         (max(1, dims.width * 5 div 6), max(1, dims.height * 5 div 6)),
         (dims.width * 3 div 2 + 1, max(1, dims.height div 3)),
@@ -232,11 +232,12 @@ block:
             path & " " & $fit & " " & $w & "x" & $h & " in strips of " & $rows
   setJpegStripMcuRows(0)
 
-proc centerIsOneToOne() =
-  # fitCenter draws the source 1:1 in the middle: into a smaller target, the
-  # middle of the source at full resolution (a 4032x3024 photo on a 1600x1200
-  # panel samples a 1600x1200 window, not the whole photo); into a larger
-  # one, the whole source, the target's borders left as they were.
+proc oneToOneFits() =
+  # fitCenter and the anchored fits draw the source 1:1: into a smaller
+  # target, the part of the source that shows at full resolution (a
+  # 4032x3024 photo on a 1600x1200 panel samples a 1600x1200 window, not the
+  # whole photo); into a larger one, the whole source where the fit pins it,
+  # the target's borders left as they were.
   #
   # Against the 1:1 decode of the whole photo: exact where colour is not
   # subsampled. Subsampled colour is sampled from the window's own grid, the
@@ -252,35 +253,41 @@ proc centerIsOneToOne() =
       whole = decodeJpeg(data)
       (w, h) = (whole.width, whole.height)
       native = decodeJpegScaled(data, w, h, fitStretch)
-    var worst, total, count = 0
-    proc compare(a, b: ColorRGBX) =
-      let d = max(max(abs(a.r.int - b.r.int), abs(a.g.int - b.g.int)), abs(a.b.int - b.b.int))
-      worst = max(worst, d)
-      total += d
-      inc count
-    let
-      (sw, sh) = (max(1, w * 2 div 3), max(1, h div 2))
-      small = newImage(sw, sh)
-    small.fill(marker)
-    decodeJpegScaledInto(data, small, fitCenter)
-    let (x0, y0) = ((w - sw) div 2, (h - sh) div 2)
-    for y in 0 ..< sh:
-      for x in 0 ..< sw:
-        compare(small[x, y], native[x0 + x, y0 + y])
-    let big = newImage(w + 11, h + 7)
-    big.fill(marker)
-    decodeJpegScaledInto(data, big, fitCenter)
-    let (dx, dy) = (11 div 2, 7 div 2)
-    for y in 0 ..< h:
-      for x in 0 ..< w:
-        compare(big[dx + x, dy + y], native[x, y])
-    doAssert big[0, 0] == marker and big[big.width - 1, big.height - 1] == marker and
-      big[dx - 1, dy + h div 2] == marker, path & ": center leaves the target's borders alone"
-    if exact:
-      doAssert worst == 0, path & ": center is the 1:1 picture, off by " & $worst
-    else:
-      doAssert total div max(1, count) <= 6, path & ": center is the 1:1 picture, off by " &
-        $(total div max(1, count)) & " on average"
+    for fit in OneToOneFits:
+      let anchor = fit.oneToOneAnchor()
+      var worst, total, count = 0
+      proc compare(a, b: ColorRGBX) =
+        let d = max(max(abs(a.r.int - b.r.int), abs(a.g.int - b.g.int)), abs(a.b.int - b.b.int))
+        worst = max(worst, d)
+        total += d
+        inc count
+      let
+        (sw, sh) = (max(1, w * 2 div 3), max(1, h div 2))
+        small = newImage(sw, sh)
+      small.fill(marker)
+      decodeJpegScaledInto(data, small, fit)
+      let (x0, y0) = ((w - sw) * anchor.x div 2, (h - sh) * anchor.y div 2)
+      for y in 0 ..< sh:
+        for x in 0 ..< sw:
+          compare(small[x, y], native[x0 + x, y0 + y])
+      let big = newImage(w + 11, h + 7)
+      big.fill(marker)
+      decodeJpegScaledInto(data, big, fit)
+      let (dx, dy) = (11 * anchor.x div 2, 7 * anchor.y div 2)
+      for y in 0 ..< h:
+        for x in 0 ..< w:
+          compare(big[dx + x, dy + y], native[x, y])
+      var outside = 0
+      for y in 0 ..< big.height:
+        for x in 0 ..< big.width:
+          if (x < dx or x >= dx + w or y < dy or y >= dy + h) and big[x, y] != marker:
+            inc outside
+      doAssert outside == 0, path & " " & $fit & ": the target's borders are left alone"
+      if exact:
+        doAssert worst == 0, path & " " & $fit & ": the 1:1 picture, off by " & $worst
+      else:
+        doAssert total div max(1, count) <= 6, path & " " & $fit & ": the 1:1 picture, off by " &
+          $(total div max(1, count)) & " on average"
 
 proc stripsThroughAStream() =
   # The same through a stream. A stream that can rewind is read once per
@@ -325,7 +332,7 @@ proc stripsThroughAStream() =
   setJpegStripMcuRows(0)
 
 stripsThroughAStream()
-centerIsOneToOne()
+oneToOneFits()
 
 block:
   # With no override the budget sizes the strip: a budget that holds the
@@ -430,7 +437,7 @@ block:
       data = readFile(path)
       dims = decodeJpegDimensions(data)
       progressive = decodeJpegInfo(data).progressive
-    for fit in [fitStretch, fitCover, fitContain, fitCenter]:
+    for fit in ScaledDecodeFit:
       for (w, h) in [
         (max(1, dims.width * 5 div 6), max(1, dims.height * 5 div 6)),
         (dims.width * 3 div 2 + 1, max(1, dims.height div 3)),
