@@ -163,7 +163,7 @@ block: # pull sources decode identically to buffered ones
   ]:
     let data = readFile(file)
     for (tw, th) in [(89, 47), (320, 240), (401, 333)]:
-      for fit in [fitStretch, fitCover, fitContain]:
+      for fit in [fitStretch, fitCover, fitContain, fitCenter]:
         let expected = newImage(tw, th)
         decodeBmpScaledInto(data, expected, fit)
         for readSize in [7, 4096, 1 shl 20]:

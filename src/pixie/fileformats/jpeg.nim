@@ -753,6 +753,21 @@ proc decodeSOF0(state: var DecoderState) =
       # full-source grid had the same cap through its oriented-dims min.
       effectiveTargetWidth = min(effectiveTargetWidth, state.winOW)
       effectiveTargetHeight = min(effectiveTargetHeight, state.winOH)
+    elif state.scaledFit == fitCenter:
+      # Center draws the source 1:1, so sample only what lands on the target
+      # (the middle of a larger photo, a smaller one whole) at its own
+      # resolution: a 4032x3024 photo centered on a 1600x1200 panel decodes
+      # into a 1600x1200 grid, not a full-size image.
+      let
+        oriented = state.orientedDimensions()
+        w = min(oriented.width, effectiveTargetWidth)
+        h = min(oriented.height, effectiveTargetHeight)
+      state.winOX = (oriented.width - w) div 2
+      state.winOY = (oriented.height - h) div 2
+      state.winOW = w
+      state.winOH = h
+      effectiveTargetWidth = w
+      effectiveTargetHeight = h
 
     # Clamp the sampling resolution to what the memory budget allows,
     # trading sharpness for a decode that succeeds. Count exactly what the
@@ -2237,6 +2252,19 @@ proc scaledFitRects(
         max(1'i64, oriented.height.int64)).int)
       result.dstX = (targetWidth - fitW) div 2
       result.dstW = fitW
+  of fitCenter:
+    # 1:1, centered (same integer math as the SOF window).
+    let
+      w = min(oriented.width, targetWidth)
+      h = min(oriented.height, targetHeight)
+    result.srcX = (oriented.width - w) div 2
+    result.srcY = (oriented.height - h) div 2
+    result.srcW = w
+    result.srcH = h
+    result.dstX = (targetWidth - w) div 2
+    result.dstY = (targetHeight - h) div 2
+    result.dstW = w
+    result.dstH = h
 
 proc fillGeometry(state: DecoderState, width, height: int): FillGeometry {.raises: [PixieError].} =
   ## Geometry — the crop and where it lands — is decided in image space; the

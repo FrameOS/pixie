@@ -36,6 +36,8 @@ type
     fitStretch ## fill the whole target, ignoring aspect ratio
     fitCover   ## fill the whole target, cropping the source centered
     fitContain ## fit the whole source centered, leaving target borders untouched
+    fitCenter  ## the source 1:1, centered: the middle of a larger one, a
+               ## smaller one whole, leaving target borders untouched
 
   PixelFormat* = enum
     ## How an image stores its pixels. Everything in pixie composites in
@@ -162,6 +164,18 @@ proc scaledFitRects*(
         max(1'i64, srcHeight.int64)).int)
       result.dstX = (targetWidth - fitW) div 2
       result.dstW = fitW
+  of fitCenter:
+    let
+      w = min(srcWidth, targetWidth)
+      h = min(srcHeight, targetHeight)
+    result.srcX = (srcWidth - w) div 2
+    result.srcY = (srcHeight - h) div 2
+    result.srcW = w
+    result.srcH = h
+    result.dstX = (targetWidth - w) div 2
+    result.dstY = (targetHeight - h) div 2
+    result.dstW = w
+    result.dstH = h
 
 template data*(image: Image): ptr UncheckedArray[ColorRGBX] =
   ## The pixels this image addresses — its own, or its owner's when it is a
