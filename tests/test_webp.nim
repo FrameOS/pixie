@@ -144,7 +144,7 @@ block:
     let
       data = readFile(path)
       reference = decodeWebp(data)
-    for fit in [fitStretch, fitCover, fitContain, fitCenter]:
+    for fit in ScaledDecodeFit:
       let
         targetWidth = max(1, reference.width div 3)
         targetHeight = max(1, reference.height div 2)

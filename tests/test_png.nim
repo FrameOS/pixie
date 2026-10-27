@@ -134,7 +134,7 @@ block: # streamed scaled decodes match the buffered fillImage path
     for x in 0 ..< source.width:
       source.unsafe[x, y] = rgbx(uint8((x * 7) mod 256), uint8((y * 5) mod 256), uint8((x + y) mod 256), 255)
   let encoded = encodePng(source.width, source.height, 4, source.data[0].addr, source.dataLen * 4)
-  for fit in [fitStretch, fitCover, fitContain, fitCenter]:
+  for fit in ScaledDecodeFit:
     for (w, h) in [(50, 40), (123, 77), (300, 90), (33, 200)]:
       let streamed = decodePngScaled(encoded, w, h, fit)
       let buffered = decodePng(encoded).convertToImage(w, h, fit)
@@ -282,7 +282,7 @@ block: # pull sources (file-backed) decode identically to buffered ones
 
   for idatChunkSize in [1, 3, 61, 8192, 1 shl 30]:
     let rechunked = rechunkIdat(encoded, idatChunkSize)
-    for fit in [fitStretch, fitCover, fitContain, fitCenter]:
+    for fit in ScaledDecodeFit:
       let expected = newImage(40, 25)
       decodePngScaledInto(rechunked, expected, fit)
       for readSize in [1, 7, 1000, 1 shl 20]:
