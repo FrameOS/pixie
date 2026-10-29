@@ -2160,7 +2160,7 @@ proc angleToMiterLimit*(angle: float32): float32 {.inline.} =
   1 / sin(angle / 2)
 
 proc strokeShapes(
-  shapes: seq[Polygon],
+  shapes: openArray[Polygon],
   strokeWidth: float32,
   lineCap: LineCap,
   lineJoin: LineJoin,
@@ -2363,7 +2363,11 @@ proc parseSomePath(
     else:
       path.commandsToShapes(closeSubpaths, pixelScale)
 
-const paintStripMinRows = 4
+const
+  paintStripMinRows = 4
+  strokeBatchPoints = 1024
+    ## How many points of an opaque stroke's path are outlined and filled at
+    ## a time (strokePath).
 
 proc shapeBounds(path: SomePath, transform: Mat3): Rect {.raises: [PixieError].} =
   ## The box around a path's outline under `transform`, in the target's
@@ -2520,19 +2524,39 @@ proc strokePath*(
 
   if paint.kind == SolidPaint:
     if paint.color.a > 0 or paint.blendMode == OverwriteBlend:
-      var strokeShapes = strokeShapes(
-        parseSomePath(path, false, transform.pixelScale()),
-        strokeWidth,
-        lineCap,
-        lineJoin,
-        miterLimit,
-        dashes,
-        pixelScale(transform)
-      )
-      strokeShapes.transform(transform)
       var color = paint.color
       color.a *= paint.opacity
-      image.fillShapes(strokeShapes, color, NonZero, paint.blendMode)
+      let
+        pixelScale = transform.pixelScale()
+        shapes = parseSomePath(path, false, pixelScale)
+        # An opaque color blended normally is outlined and filled a batch of
+        # subpaths at a time: what one batch paints, the next painting again
+        # leaves as it was (bar the soft edge where two batches cross). A
+        # stroke outlines every point (a round join is a circle) and the fill
+        # holds every edge of the outline at once, so a long path (a map's
+        # roads, thousands of subpaths) outlined whole needed megabytes that
+        # a frame does not have. A translucent stroke stays one fill: two
+        # batches over the same pixels would show where they cross.
+        batches = color.a >= 1 and paint.blendMode == NormalBlend
+      var
+        first = 0
+        points = 0
+      for i in 0 ..< shapes.len:
+        points += shapes[i].len
+        if i == shapes.high or (batches and points >= strokeBatchPoints):
+          var outline = strokeShapes(
+            shapes.toOpenArray(first, i),
+            strokeWidth,
+            lineCap,
+            lineJoin,
+            miterLimit,
+            dashes,
+            pixelScale
+          )
+          outline.transform(transform)
+          image.fillShapes(outline, color, NonZero, paint.blendMode)
+          first = i + 1
+          points = 0
     return
 
   var bounds = shapeBounds(path, transform)
