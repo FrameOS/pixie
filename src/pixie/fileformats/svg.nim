@@ -1000,10 +1000,19 @@ proc parseSvgElement(
         b = m * vec2(x + w, y + h)
         box = rect(min(a.x, b.x), min(a.y, b.y), abs(b.x - a.x), abs(b.y - a.y))
       props.clip = if props.clip.w < 0: box else: box.intersect(props.clip)
-      # Its user box, read as the document's is: the viewBox, else its size.
-      let view = parseSvgViewBox(node, 0, 0)
-      props.transform = m * translate(vec2(x, y)) *
-        scale(vec2(w / view.width, h / view.height)) * translate(vec2(-view.minX, -view.minY))
+      # Its user box, read as the document's is (the viewBox, else its
+      # size), onto (x, y, w, h): m times a scale and a move, written out
+      # (nine products where three 3x3 ones were 81).
+      let
+        view = parseSvgViewBox(node, 0, 0)
+        sx = w / view.width
+        sy = h / view.height
+        tx = x - view.minX * sx
+        ty = y - view.minY * sy
+      for r in 0 .. 2:
+        props.transform[0, r] = m[0, r] * sx
+        props.transform[1, r] = m[1, r] * sy
+        props.transform[2, r] = m[0, r] * tx + m[1, r] * ty + m[2, r]
     propertiesStack.add(props)
     for child in node.children:
       child.parseSvgElement(svg, propertiesStack, elements)
