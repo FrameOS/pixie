@@ -82,6 +82,10 @@ type
     image: Image
     imageBox: Rect
     imageClip: bool
+    # The viewport of a nested `<svg>` it is inside (and of every one around
+    # that), in the parsed image's pixels: nothing is drawn outside it. An
+    # axis-aligned box; w < 0: none. Inherited.
+    clip: Rect
 
   SvgGradient = object
     kind: PaintKind         # LinearGradientPaint or RadialGradientPaint
@@ -155,6 +159,7 @@ proc initSvgProperties(): SvgProperties =
   result.strokeOpacity = 1
   result.fontSize = 16 # CSS initial value
   result.fontWeight = 400
+  result.clip = rect(0, 0, -1, -1)
 
 proc parseSvgFontSize(value: string, inherited: float32): float32 =
   ## font-size in CSS units, resolved to pixels. An unparseable size inherits
@@ -913,6 +918,13 @@ proc parseSvgImage(node: SvgNode, props: SvgProperties): (Path, SvgProperties) =
   result[0] = newPath()
   result[0].rect(x, y, w, h)
 
+proc intersect(a, b: Rect): Rect =
+  ## The part of `a` inside `b`, or an empty box (w = 0) where they miss.
+  let
+    x = max(a.x, b.x)
+    y = max(a.y, b.y)
+  rect(x, y, max(min(a.x + a.w, b.x + b.w) - x, 0), max(min(a.y + a.h, b.y + b.h) - y, 0))
+
 proc parseSvgElement(
   node: SvgNode, svg: Svg, propertiesStack: var seq[SvgProperties],
   elements: var seq[SvgElement]
@@ -931,8 +943,38 @@ proc parseSvgElement(
       if child.tag in ["linearGradient", "radialGradient"]:
         child.parseSvgGradient(svg)
 
-  of "g":
-    let props = node.parseSvgProperties(propertiesStack[^1])
+  of "g", "svg":
+    var props = node.parseSvgProperties(propertiesStack[^1])
+    if node.tag == "svg":
+      # A nested viewport: its content drawn from (x, y), its viewBox (when
+      # it has one) fitted to width x height, and nothing of it outside that
+      # box, whose corners an axis-aligned transform keeps a rectangle of
+      # the image (a UI's scrolled list, its clipped picture). A size of 0
+      # draws nothing, as in SVG.
+      let
+        x = parseSvgCoordinate(node.attr("x"))
+        y = parseSvgCoordinate(node.attr("y"))
+        w = parseSvgCoordinate(node.attr("width"))
+        h = parseSvgCoordinate(node.attr("height"))
+        m = props.transform
+      if w <= 0 or h <= 0:
+        return
+      let
+        a = m * vec2(x, y)
+        b = m * vec2(x + w, y + h)
+        box = rect(min(a.x, b.x), min(a.y, b.y), abs(b.x - a.x), abs(b.y - a.y))
+      props.clip = if props.clip.w < 0: box else: box.intersect(props.clip)
+      var view: array[4, float32]
+      let viewBox = node.attr("viewBox")
+      var count = 0
+      for part in strutils.splitWhitespace(viewBox.replace(",", " ")):
+        if count < 4:
+          view[count] = parseFloat(part)
+        inc count
+      props.transform = m * translate(vec2(x, y))
+      if count == 4 and view[2] > 0 and view[3] > 0:
+        props.transform = props.transform *
+          scale(vec2(w / view[2], h / view[3])) * translate(vec2(-view[0], -view[1]))
     propertiesStack.add(props)
     for child in node.children:
       child.parseSvgElement(svg, propertiesStack, elements)
@@ -1486,6 +1528,8 @@ proc paintBounds(element: SvgElement): Rect {.raises: [PixieError].} =
   ## damageRects at the changed ones of the frame before as well.
   if element.bounds.w < 0:
     element.bounds = paintBounds(element.path, element.props)
+    if element.props.clip.w >= 0:
+      element.bounds = element.bounds.intersect(element.props.clip)
   element.bounds
 
 proc join(a, b: Rect): Rect =
@@ -1509,6 +1553,10 @@ proc hidesWindow(element: SvgElement, window: Rect): bool =
     return false
   let m = props.transform
   if m[0, 1] != 0 or m[1, 0] != 0:
+    return false
+  if props.clip.w >= 0 and (props.clip.x > window.x or props.clip.y > window.y or
+      props.clip.x + props.clip.w < window.x + window.w or
+      props.clip.y + props.clip.h < window.y + window.h):
     return false
   var
     lo, hi: Vec2
@@ -1578,6 +1626,20 @@ proc renderSvg(
           continue
       var props = elementProps
       props.transform = offset * props.transform
+      var target = target
+      if props.clip.w >= 0:
+        # Inside a nested viewport: drawn into the view of the target that
+        # is the viewport, and nothing at all when they miss.
+        let
+          a = offset * vec2(props.clip.x, props.clip.y)
+          x0 = clamp(round(a.x).int, 0, target.width)
+          y0 = clamp(round(a.y).int, 0, target.height)
+          x1 = clamp(round(a.x + props.clip.w).int, 0, target.width)
+          y1 = clamp(round(a.y + props.clip.h).int, 0, target.height)
+        if x1 <= x0 or y1 <= y0:
+          continue
+        target = target.view(x0, y0, x1 - x0, y1 - y0)
+        props.transform = translate(vec2(-x0.float32, -y0.float32)) * props.transform
       if not props.image.isNil:
         if props.display and props.opacity > 0:
           target.drawSvgImage(props)
@@ -1673,7 +1735,7 @@ proc coversOpaque*(svg: Svg, width, height: int): bool {.raises: [].} =
   if svg.isNil or svg.elements.len == 0 or width <= 0 or height <= 0:
     return false
   let props = svg.elements[0].props
-  if not props.isRect or not props.display:
+  if not props.isRect or not props.display or props.clip.w >= 0:
     return false
   if props.opacity < 1 or props.fillOpacity < 1:
     return false
@@ -1779,7 +1841,10 @@ proc damageRects*(
   proc add(boxes: var seq[Rect], svg: Svg, i: int) {.raises: [PixieError].} =
     let element = svg.elements[i]
     if element.props.display and element.props.opacity > 0:
-      boxes.addBox(element.paintBounds())
+      # An element scrolled out of its viewport paints nothing anywhere.
+      let bounds = element.paintBounds()
+      if bounds.w > 0 and bounds.h > 0:
+        boxes.addBox(bounds)
   try:
     var i, j = 0
     while i < a.len or j < b.len:

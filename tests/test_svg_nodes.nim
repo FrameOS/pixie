@@ -148,3 +148,57 @@ block:
   doAssert found[0].image == picture and found[0].box == rect(4, 6, 20, 10) and found[0].clip.w < 0
   doAssert found[0].transform * vec2(4, 6) == vec2(8, 12) # parsed at twice the size
   echo "svg pictures ok"
+
+block: # A nested <svg> is a viewport: drawn from its corner, clipped to it
+  let
+    inner = el("svg", {"x": "4", "y": "2", "width": "6", "height": "5", "viewBox": "10 20 6 5"},
+      # A 20x20 square from (10, 20): only the viewport's 6x5 of it shows.
+      el("rect", {"x": "10", "y": "20", "width": "20", "height": "20", "fill": "#ff0000"}))
+    image = newImage(parseSvg(el("svg", {"width": "16", "height": "12"}, inner), 16, 12))
+  for y in 0 ..< 12:
+    for x in 0 ..< 16:
+      let inside = x >= 4 and x < 10 and y >= 2 and y < 7
+      doAssert (image[x, y] == rgbx(255, 0, 0, 255)) == inside, $x & "," & $y
+
+block: # Scrolled: the viewBox moves the content, the clip stays
+  let
+    content = el("rect", {"x": "0", "y": "0", "width": "8", "height": "4", "fill": "#00ff00"})
+    scrolled = el("svg", {"x": "0", "y": "4", "width": "8", "height": "4", "viewBox": "0 2 8 4"}, content)
+    image = newImage(parseSvg(el("svg", {"width": "8", "height": "12"}, scrolled), 8, 12))
+  # The rect's lower half (y 2..3) at the viewport's top (y 4..5), nothing else.
+  for y in 0 ..< 12:
+    doAssert (image[3, y] == rgbx(0, 255, 0, 255)) == (y >= 4 and y < 6), $y
+
+block: # Nested viewports clip to both; bounds and damage stay inside the clip
+  let
+    deep = el("svg", {"x": "0", "y": "0", "width": "20", "height": "20"},
+      el("rect", {"x": "0", "y": "0", "width": "20", "height": "20", "fill": "#0000ff"}))
+    outer = el("svg", {"x": "2", "y": "3", "width": "5", "height": "4"}, deep)
+    svg = parseSvg(el("svg", {"width": "20", "height": "20"}, outer), 20, 20)
+    image = newImage(svg)
+  for y in 0 ..< 20:
+    for x in 0 ..< 20:
+      # The deep viewport is at (2, 3) in the image: the outer one's corner.
+      let inside = x >= 2 and x < 7 and y >= 3 and y < 7
+      doAssert (image[x, y] == rgbx(0, 0, 255, 255)) == inside, $x & "," & $y
+  doAssert not svg.coversOpaque(20, 20)
+  let
+    empty = parseSvg(el("svg", {"width": "20", "height": "20"}), 20, 20)
+    found = damageRects(empty, svg, 20, 20)
+  doAssert not found.full and found.rects == @[(2, 3, 5, 4)], $found
+
+block: # A window repaint draws a clipped element as the whole render does
+  let
+    list = el("svg", {"x": "1", "y": "1", "width": "10", "height": "6", "viewBox": "0 3 10 6"},
+      el("rect", {"x": "0", "y": "0", "width": "10", "height": "5", "fill": "#ff0000"}),
+      el("rect", {"x": "0", "y": "5", "width": "10", "height": "5", "fill": "#00ff00"}))
+    svg = parseSvg(el("svg", {"width": "12", "height": "8"}, list), 12, 8)
+    whole = newImage(12, 8)
+  svg.renderInto(whole)
+  let parts = newImage(12, 8)
+  svg.renderInto(parts.view(0, 0, 6, 8), 0, 0)
+  svg.renderInto(parts.view(6, 0, 6, 8), 6, 0)
+  doAssert same(whole, parts)
+  doAssert whole[5, 1] == rgbx(255, 0, 0, 255) # y 3 of the content: red
+  doAssert whole[5, 3] == rgbx(0, 255, 0, 255) # y 5: green
+  doAssert whole[5, 7] == rgbx(0, 0, 0, 0)     # below the viewport
