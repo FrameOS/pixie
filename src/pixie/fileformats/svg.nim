@@ -918,6 +918,42 @@ proc parseSvgImage(node: SvgNode, props: SvgProperties): (Path, SvgProperties) =
   result[0] = newPath()
   result[0].rect(x, y, w, h)
 
+proc parseSvgViewBox(
+  root: SvgNode, width, height: int
+): tuple[minX, minY, width, height: float32] =
+  ## The user coordinate box the document is drawn in. `viewBox` when there is
+  ## one (four numbers, whitespace and/or commas between them, decimals
+  ## allowed). Otherwise the root's own width/height: an SVG without a viewBox
+  ## maps user units 1:1 onto that viewport, so those ARE its box — a document
+  ## a JS app hand-builds as `<svg width="600" height="480">` used to fail here
+  ## with `invalid integer` the moment it was rasterized at any other size.
+  ## Otherwise the size the caller asked for, so a bare document still renders
+  ## unscaled at that size. Only a document with none of the three is refused,
+  ## and by name.
+  let viewBox = root.attr("viewBox").strip()
+  if viewBox.len > 0:
+    let box = strutils.splitWhitespace(viewBox.replace(",", " "))
+    if box.len != 4:
+      raise newException(PixieError, "Invalid SVG viewBox: " & viewBox)
+    result = (
+      parseFloat(box[0]).float32, parseFloat(box[1]).float32,
+      parseFloat(box[2]).float32, parseFloat(box[3]).float32
+    )
+    if result.width <= 0 or result.height <= 0:
+      raise newException(PixieError, "Invalid SVG viewBox: " & viewBox)
+    return
+  # A percentage has nothing to be a percentage of without a viewBox.
+  let
+    rootWidth = root.attr("width").strip()
+    rootHeight = root.attr("height").strip()
+    w = if rootWidth.endsWith("%"): -1f32 else: parseSvgCoordinate(rootWidth, -1)
+    h = if rootHeight.endsWith("%"): -1f32 else: parseSvgCoordinate(rootHeight, -1)
+  if w > 0 and h > 0:
+    return (0f32, 0f32, w, h)
+  if width > 0 and height > 0:
+    return (0f32, 0f32, width.float32, height.float32)
+  raise newException(PixieError, "SVG has no viewBox and no width/height")
+
 proc intersect(a, b: Rect): Rect =
   ## The part of `a` inside `b`, or an empty box (w = 0) where they miss.
   let
@@ -964,17 +1000,10 @@ proc parseSvgElement(
         b = m * vec2(x + w, y + h)
         box = rect(min(a.x, b.x), min(a.y, b.y), abs(b.x - a.x), abs(b.y - a.y))
       props.clip = if props.clip.w < 0: box else: box.intersect(props.clip)
-      var view: array[4, float32]
-      let viewBox = node.attr("viewBox")
-      var count = 0
-      for part in strutils.splitWhitespace(viewBox.replace(",", " ")):
-        if count < 4:
-          view[count] = parseFloat(part)
-        inc count
-      props.transform = m * translate(vec2(x, y))
-      if count == 4 and view[2] > 0 and view[3] > 0:
-        props.transform = props.transform *
-          scale(vec2(w / view[2], h / view[3])) * translate(vec2(-view[0], -view[1]))
+      # Its user box, read as the document's is: the viewBox, else its size.
+      let view = parseSvgViewBox(node, 0, 0)
+      props.transform = m * translate(vec2(x, y)) *
+        scale(vec2(w / view.width, h / view.height)) * translate(vec2(-view.minX, -view.minY))
     propertiesStack.add(props)
     for child in node.children:
       child.parseSvgElement(svg, propertiesStack, elements)
@@ -1113,42 +1142,6 @@ proc parseSvgElement(
 
   else:
     raise newException(PixieError, "Unsupported SVG tag: " & node.tag)
-
-proc parseSvgViewBox(
-  root: SvgNode, width, height: int
-): tuple[minX, minY, width, height: float32] =
-  ## The user coordinate box the document is drawn in. `viewBox` when there is
-  ## one (four numbers, whitespace and/or commas between them, decimals
-  ## allowed). Otherwise the root's own width/height: an SVG without a viewBox
-  ## maps user units 1:1 onto that viewport, so those ARE its box — a document
-  ## a JS app hand-builds as `<svg width="600" height="480">` used to fail here
-  ## with `invalid integer` the moment it was rasterized at any other size.
-  ## Otherwise the size the caller asked for, so a bare document still renders
-  ## unscaled at that size. Only a document with none of the three is refused,
-  ## and by name.
-  let viewBox = root.attr("viewBox").strip()
-  if viewBox.len > 0:
-    let box = strutils.splitWhitespace(viewBox.replace(",", " "))
-    if box.len != 4:
-      raise newException(PixieError, "Invalid SVG viewBox: " & viewBox)
-    result = (
-      parseFloat(box[0]).float32, parseFloat(box[1]).float32,
-      parseFloat(box[2]).float32, parseFloat(box[3]).float32
-    )
-    if result.width <= 0 or result.height <= 0:
-      raise newException(PixieError, "Invalid SVG viewBox: " & viewBox)
-    return
-  # A percentage has nothing to be a percentage of without a viewBox.
-  let
-    rootWidth = root.attr("width").strip()
-    rootHeight = root.attr("height").strip()
-    w = if rootWidth.endsWith("%"): -1f32 else: parseSvgCoordinate(rootWidth, -1)
-    h = if rootHeight.endsWith("%"): -1f32 else: parseSvgCoordinate(rootHeight, -1)
-  if w > 0 and h > 0:
-    return (0f32, 0f32, w, h)
-  if width > 0 and height > 0:
-    return (0f32, 0f32, width.float32, height.float32)
-  raise newException(PixieError, "SVG has no viewBox and no width/height")
 
 proc parseSvg*(
   root: SvgNode, width = 0, height = 0, reuse = false
